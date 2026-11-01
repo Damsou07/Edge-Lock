@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -13,12 +13,16 @@ pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_TEXTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_HEADER_BYTES: u64 = 1024 * 1024;
+const MAX_EDGE_WORKING_BYTES: u64 = 64 * 1024 * 1024;
+const INDEX_READER_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GeometryStats {
     pub mesh_objects: u64,
     pub vertices: u64,
+    #[serde(default)]
+    pub edges: Option<u64>,
     pub faces: u64,
     pub triangles: u64,
 }
@@ -508,9 +512,340 @@ fn statistics(document: &Document) -> Result<GlbStats> {
     })
 }
 
-/// Inspect a self-contained GLB without allocating its binary buffers or decoding textures.
+/// Validate structure without reading indices or computing optional topology statistics.
+pub fn validate_glb(path: &Path) -> Result<()> {
+    statistics(&read_document(path)?)?;
+    Ok(())
+}
+
+/// Inspect a self-contained GLB, streaming indices within a bounded topology budget.
 pub fn inspect_glb(path: &Path) -> Result<GlbStats> {
-    statistics(&read_document(path)?)
+    let document = read_document(path)?;
+    let mut stats = statistics(&document)?;
+    stats.geometry.edges = count_scene_edges(path, &document)?;
+    Ok(stats)
+}
+
+/// A scalar stream retains only a small read buffer, including interleaved accessors.
+struct ScalarReader {
+    file: BufReader<File>,
+    component_bytes: usize,
+    stride: u64,
+    started: bool,
+}
+
+impl ScalarReader {
+    fn new(
+        path: &Path,
+        document: &Document,
+        data: &Value,
+        component: u64,
+        interleaved: bool,
+    ) -> Result<Self> {
+        let view = document.views[index(
+            &data["bufferView"],
+            document.views.len(),
+            "indices.bufferView",
+        )?];
+        let component_bytes = match component {
+            5121 => 1,
+            5123 => 2,
+            5125 => 4,
+            _ => return Err(invalid("GLB : composant d'indice invalide")),
+        };
+        let offset = checked_add(
+            checked_add(document.bin_offset, view.offset)?,
+            optional_number(data, "byteOffset", 0)?,
+        )?;
+        let mut file = BufReader::with_capacity(INDEX_READER_BYTES, File::open(path)?);
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Self {
+            file,
+            component_bytes,
+            stride: if interleaved {
+                view.stride.unwrap_or(component_bytes as u64)
+            } else {
+                component_bytes as u64
+            },
+            started: false,
+        })
+    }
+
+    fn next(&mut self) -> Result<u32> {
+        if self.started {
+            self.file
+                .seek_relative((self.stride - self.component_bytes as u64) as i64)?;
+        }
+        self.started = true;
+        let mut bytes = [0; 4];
+        self.file.read_exact(&mut bytes[..self.component_bytes])?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+}
+
+struct SparseIndices {
+    indices: ScalarReader,
+    values: ScalarReader,
+    remaining: u64,
+    current: Option<(u64, u32)>,
+    previous: Option<u64>,
+    count: u64,
+}
+
+impl SparseIndices {
+    fn advance(&mut self) -> Result<()> {
+        self.current = if self.remaining == 0 {
+            None
+        } else {
+            let index = self.indices.next()? as u64;
+            if index >= self.count || self.previous.is_some_and(|previous| index <= previous) {
+                return Err(invalid(
+                    "GLB : indices sparse hors limites ou non croissants",
+                ));
+            }
+            self.previous = Some(index);
+            self.remaining -= 1;
+            Some((index, self.values.next()?))
+        };
+        Ok(())
+    }
+}
+
+struct IndexReader {
+    base: Option<ScalarReader>,
+    sparse: Option<SparseIndices>,
+    ordinal: u64,
+    indexed: bool,
+    vertex_count: u64,
+}
+
+impl IndexReader {
+    fn new(path: &Path, document: &Document, primitive: &Value, vertex_count: u64) -> Result<Self> {
+        let mut reader = Self {
+            base: None,
+            sparse: None,
+            ordinal: 0,
+            indexed: false,
+            vertex_count,
+        };
+        let Some(accessor_index) = primitive.get("indices") else {
+            return Ok(reader);
+        };
+        reader.indexed = true;
+        let accessor = &array(&document.json, "accessors")?
+            [index(accessor_index, document.accessors.len(), "indices")?];
+        let component = number(accessor, "componentType")?;
+        if accessor.get("bufferView").is_some() {
+            reader.base = Some(ScalarReader::new(
+                path, document, accessor, component, true,
+            )?);
+        }
+        if let Some(sparse) = accessor.get("sparse") {
+            let mut overrides = SparseIndices {
+                indices: ScalarReader::new(
+                    path,
+                    document,
+                    &sparse["indices"],
+                    number(&sparse["indices"], "componentType")?,
+                    false,
+                )?,
+                values: ScalarReader::new(path, document, &sparse["values"], component, false)?,
+                remaining: number(sparse, "count")?,
+                current: None,
+                previous: None,
+                count: number(accessor, "count")?,
+            };
+            overrides.advance()?;
+            reader.sparse = Some(overrides);
+        }
+        Ok(reader)
+    }
+
+    fn next(&mut self) -> Result<u32> {
+        let mut value = if !self.indexed {
+            self.ordinal as u32
+        } else if let Some(base) = self.base.as_mut() {
+            base.next()?
+        } else {
+            0
+        };
+        if let Some(sparse) = self.sparse.as_mut()
+            && let Some((ordinal, replacement)) = sparse.current
+            && ordinal == self.ordinal
+        {
+            value = replacement;
+            sparse.advance()?;
+        }
+        self.ordinal += 1;
+        if value as u64 >= self.vertex_count {
+            return Err(invalid("GLB : indice de sommet hors limites"));
+        }
+        Ok(value)
+    }
+}
+
+fn edge_upper_bound(mode: u64, count: u64) -> u64 {
+    match mode {
+        0 => 0,
+        1 => count / 2,
+        2 if count > 1 => count,
+        2 | 3 => count.saturating_sub(1),
+        4 => count / 3 * 3,
+        5 | 6 => count.saturating_sub(2) * 3,
+        _ => 0, // Modes have already been validated by statistics.
+    }
+}
+
+fn count_mesh_edges(
+    path: &Path,
+    document: &Document,
+    mesh: &Value,
+    working_budget: u64,
+) -> Result<Option<u64>> {
+    let primitives = array(mesh, "primitives")?;
+    let mut upper_bound = 0;
+    for primitive in primitives {
+        let position = index(
+            &primitive["attributes"]["POSITION"],
+            document.accessors.len(),
+            "POSITION",
+        )?;
+        let count = if let Some(indices) = primitive.get("indices") {
+            document.accessors[index(indices, document.accessors.len(), "indices")?].count
+        } else {
+            document.accessors[position].count
+        };
+        upper_bound = checked_add(
+            upper_bound,
+            edge_upper_bound(optional_number(primitive, "mode", 4)?, count),
+        )?;
+    }
+    // Three readers (base, sparse offsets, sparse values) coexist with the edge buffer.
+    let available = working_budget.saturating_sub(3 * INDEX_READER_BYTES as u64);
+    if upper_bound > available / std::mem::size_of::<[u32; 3]>() as u64 {
+        return Ok(None);
+    }
+    let mut edges = Vec::<[u32; 3]>::new();
+    if edges.try_reserve_exact(upper_bound as usize).is_err() {
+        return Ok(None);
+    }
+    for primitive in primitives {
+        let position = index(
+            &primitive["attributes"]["POSITION"],
+            document.accessors.len(),
+            "POSITION",
+        )?;
+        let vertices = document.accessors[position].count;
+        let count = if let Some(indices) = primitive.get("indices") {
+            document.accessors[index(indices, document.accessors.len(), "indices")?].count
+        } else {
+            vertices
+        };
+        let mode = optional_number(primitive, "mode", 4)?;
+        if mode == 0 {
+            continue;
+        }
+        let mut reader = IndexReader::new(path, document, primitive, vertices)?;
+        let mut add = |a: u32, b: u32| {
+            if a != b {
+                edges.push([position as u32, a.min(b), a.max(b)]);
+            }
+        };
+        match mode {
+            1 => {
+                for _ in 0..count / 2 {
+                    add(reader.next()?, reader.next()?);
+                }
+            }
+            2 | 3 if count > 0 => {
+                let first = reader.next()?;
+                let mut previous = first;
+                for _ in 1..count {
+                    let next = reader.next()?;
+                    add(previous, next);
+                    previous = next;
+                }
+                if mode == 2 && count > 1 {
+                    add(previous, first);
+                }
+            }
+            4 => {
+                for _ in 0..count / 3 {
+                    let (a, b, c) = (reader.next()?, reader.next()?, reader.next()?);
+                    add(a, b);
+                    add(b, c);
+                    add(c, a);
+                }
+            }
+            5 | 6 if count >= 3 => {
+                let mut a = reader.next()?;
+                let mut b = reader.next()?;
+                for _ in 2..count {
+                    let c = reader.next()?;
+                    add(a, b);
+                    add(b, c);
+                    add(c, a);
+                    if mode == 5 {
+                        a = b;
+                    }
+                    b = c;
+                }
+            }
+            _ => {}
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    Ok(Some(edges.len() as u64))
+}
+
+fn count_scene_edges(path: &Path, document: &Document) -> Result<Option<u64>> {
+    let meshes = array(&document.json, "meshes")?;
+    let nodes = array(&document.json, "nodes")?;
+    let scenes = array(&document.json, "scenes")?;
+    let mut stack = if scenes.is_empty() {
+        let mut children = vec![false; nodes.len()];
+        for node in nodes {
+            for child in array(node, "children")? {
+                children[index(child, nodes.len(), "enfant")?] = true;
+            }
+        }
+        children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, child)| (!child).then_some(i))
+            .collect::<Vec<_>>()
+    } else {
+        let scene = &scenes[optional_number(&document.json, "scene", 0)? as usize];
+        array(scene, "nodes")?
+            .iter()
+            .map(|node| index(node, nodes.len(), "scene.nodes"))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut instances = vec![0u64; meshes.len()];
+    while let Some(node) = stack.pop() {
+        if let Some(mesh) = nodes[node].get("mesh") {
+            let i = index(mesh, meshes.len(), "mesh")?;
+            instances[i] += 1;
+        }
+        for child in array(&nodes[node], "children")? {
+            stack.push(index(child, nodes.len(), "enfant")?);
+        }
+    }
+    drop(stack);
+    let working_budget =
+        MAX_EDGE_WORKING_BYTES - (instances.len() * std::mem::size_of::<u64>()) as u64;
+    let mut total = 0;
+    for (mesh, instances) in meshes.iter().zip(instances) {
+        if instances == 0 {
+            continue;
+        }
+        let Some(count) = count_mesh_edges(path, document, mesh, working_budget)? else {
+            return Ok(None);
+        };
+        total = checked_add(total, checked_mul(count, instances)?)?;
+    }
+    Ok(Some(total))
 }
 
 /// Additional resource limits for the embedded viewer. Export itself has no preview size cap.

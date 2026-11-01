@@ -45,6 +45,9 @@ pub fn run() {
                         }
                     },
                 );
+            if let Some(library) = &library {
+                let _ = edge_lock_core::preview::cleanup_temporary(library.root());
+            }
             app.manage(ManagedState(Arc::new(AppState {
                 settings: Mutex::new(settings),
                 settings_file,

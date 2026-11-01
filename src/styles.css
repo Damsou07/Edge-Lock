@@ -1420,6 +1420,8 @@ legend {
 }
 .preview-caption .text-button {
   font-size: 9px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .asset-metrics {
   display: grid;
@@ -1459,10 +1461,56 @@ legend {
 }
 .inspection-note {
   display: flex;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 6px 14px;
   margin: 11px 2px;
   font-size: 8px;
   color: #647d9a;
+}
+.inspection-provenance {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+.preview-source-choice {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px;
+  margin-top: 10px;
+  border: 1px solid #344154;
+  border-radius: 7px;
+  background: #171f2b;
+}
+.preview-source-choice label {
+  display: grid;
+  flex: 1;
+  min-width: 160px;
+  gap: 7px;
+  font-size: 11px;
+  color: #a8bcd7;
+}
+.preview-notice {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.preview-notice p {
+  margin-top: 5px;
+}
+.preview-degraded {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #705b36;
+  border-radius: 7px;
+  color: #c6ac7b;
+  background: #2b251a;
+}
+.preview-degraded svg {
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 .workspace-panel {
   border: 1px solid #2f3b4c;
@@ -1748,6 +1796,10 @@ legend {
 .inspection-warnings code {
   font-size: 9px;
   overflow-wrap: anywhere;
+}
+.inspection-warnings h2 {
+  margin-bottom: 5px;
+  font-size: 11px;
 }
 .asset-bottom-panel {
   margin-top: 24px;

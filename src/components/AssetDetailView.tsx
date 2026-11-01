@@ -149,6 +149,9 @@ export function AssetDetailView({
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [previewCandidates, setPreviewCandidates] = useState<string[]>([]);
+  const [previewFile, setPreviewFile] = useState("");
   const [inspectionBusy, setInspectionBusy] = useState(false);
   const [changesBusy, setChangesBusy] = useState(false);
   const [externalChanged, setExternalChanged] = useState(false);
@@ -261,6 +264,9 @@ export function AssetDetailView({
     setPreview(null);
     setInspection(null);
     setPreviewBusy(false);
+    setPreviewError("");
+    setPreviewCandidates([]);
+    setPreviewFile("");
     setInspectionBusy(false);
     setFileLimit(100);
   }, [selection]);
@@ -331,6 +337,36 @@ export function AssetDetailView({
       (file) => file.kind === "file" && /\.(blend|glb)$/i.test(file.path),
     ) ?? [];
   const showFailure = (reason: unknown) => onError(errorMessage(reason));
+  const sourceInspection =
+    inspection ??
+    (preview?.sourceKind === "generatedGlb" ? preview.inspection : null);
+  const displayInspection = sourceInspection ?? preview?.inspection;
+  const warnings = [
+    ...new Set([
+      ...(inspection?.warnings ?? []),
+      ...(preview?.inspection.warnings ?? []),
+    ]),
+  ];
+  const dependencies = [
+    ...new Map(
+      [
+        ...(inspection?.dependencies ?? []),
+        ...(preview?.inspection.dependencies ?? []),
+      ]
+        .filter(
+          (dependency) =>
+            dependency.renderRelevant !== false &&
+            !["internal", "packed", "embedded", "ok"].includes(
+              dependency.status,
+            ),
+        )
+        .map((dependency) => [dependency.path, dependency]),
+    ).values(),
+  ];
+  const previewDegraded = preview?.inspection.dependencies.some(
+    (dependency) =>
+      dependency.renderRelevant !== false && dependency.status === "missing",
+  );
 
   const inspect = async () => {
     const target = selection;
@@ -348,22 +384,80 @@ export function AssetDetailView({
       if (currentSelection.current === target) setInspectionBusy(false);
     }
   };
-  const generatePreview = async () => {
+  const loadPreviewFiles = async (target: string) => {
+    if (snapshotId) return files;
+    const updated = await api.getVariant(variantId);
+    if (currentSelection.current !== target) return null;
+    setVariantDetail(updated);
+    return updated.files;
+  };
+  const generatePreview = async (selectedFile = previewFile) => {
     const target = selection;
     setPreviewBusy(true);
+    setPreviewError("");
+    setPreviewFile(selectedFile);
     try {
+      if (selectedFile && !snapshotId) {
+        const currentFiles = await loadPreviewFiles(target);
+        if (!currentFiles) return;
+        if (
+          !currentFiles.some(
+            (file) => file.kind === "file" && file.path === selectedFile,
+          )
+        ) {
+          selectedFile = "";
+          setPreviewFile("");
+        }
+      }
       const result = await runJob<PreviewResult>({
         kind: "preview",
         variantId,
         snapshotId,
+        ...(selectedFile ? { previewFile: selectedFile } : {}),
       });
       if (currentSelection.current === target) {
         setPreview(result);
-        setInspection(result.inspection);
+        if (result.sourceKind === "generatedGlb") setInspection(null);
+        setPreviewCandidates([]);
         setExternalChanged(false);
       }
     } catch (reason) {
-      showFailure(reason);
+      if (currentSelection.current !== target) return;
+      const error = reason as AppError | null;
+      const candidates = error?.details?.candidates;
+      if (
+        error?.code === "preview_ambiguous" &&
+        Array.isArray(candidates) &&
+        candidates.length > 0 &&
+        candidates.every((candidate) => typeof candidate === "string")
+      ) {
+        setPreviewCandidates(candidates);
+        setPreviewFile("");
+      } else {
+        if (error?.code === "invalid" && selectedFile && !snapshotId)
+          setPreviewFile("");
+        setPreviewError(errorMessage(reason));
+      }
+    } finally {
+      if (currentSelection.current === target) setPreviewBusy(false);
+    }
+  };
+  const changePreviewFile = async () => {
+    const target = selection;
+    setPreviewBusy(true);
+    setPreviewError("");
+    try {
+      const currentFiles = await loadPreviewFiles(target);
+      if (!currentFiles) return;
+      const candidates = currentFiles
+        .filter((file) => file.kind === "file" && /\.glb$/i.test(file.path))
+        .map((file) => file.path);
+      setPreviewFile("");
+      setPreviewCandidates(candidates);
+      if (candidates.length === 0) await generatePreview("");
+    } catch (reason) {
+      if (currentSelection.current === target)
+        setPreviewError(errorMessage(reason));
     } finally {
       if (currentSelection.current === target) setPreviewBusy(false);
     }
@@ -394,6 +488,9 @@ export function AssetDetailView({
       configEdited.current = false;
       setPreview(null);
       setInspection(null);
+      setPreviewError("");
+      setPreviewCandidates([]);
+      setPreviewFile("");
       setLocalRefresh((value) => value + 1);
     } catch (reason) {
       showFailure(reason);
@@ -617,12 +714,17 @@ export function AssetDetailView({
                 <h2>Votre asset, sous tous les angles.</h2>
                 <p>
                   {previewBusy
-                    ? "Blender prépare un aperçu local…"
+                    ? "Préparation de l’aperçu local…"
                     : "Explorez le modèle et ses animations sans quitter votre bibliothèque."}
                 </p>
                 <button
                   className="button secondary"
-                  disabled={!variant || previewBusy || configurationDirty}
+                  disabled={
+                    !variant ||
+                    previewBusy ||
+                    configurationDirty ||
+                    previewCandidates.length > 0
+                  }
                   onClick={() => void generatePreview()}
                 >
                   <Icon
@@ -640,11 +742,20 @@ export function AssetDetailView({
             )}
             {preview && (
               <div className="preview-caption">
-                <span>
+                <span title={preview.sourceFile}>
                   {externalChanged
                     ? "Le dossier a changé : actualisez l’aperçu."
-                    : preview.sourceLabel}
+                    : `${preview.sourceLabel} · ${preview.sourceFile}`}
                 </span>
+                {preview.sourceKind === "assetGlb" && (
+                  <button
+                    className="text-button"
+                    disabled={previewBusy || configurationDirty}
+                    onClick={() => void changePreviewFile()}
+                  >
+                    Changer le GLB
+                  </button>
+                )}
                 <button
                   className="text-button"
                   disabled={previewBusy || configurationDirty}
@@ -660,6 +771,55 @@ export function AssetDetailView({
               </div>
             )}
           </div>
+          {previewCandidates.length > 0 && (
+            <form
+              className="preview-source-choice"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void generatePreview();
+              }}
+            >
+              <label>
+                GLB de prévisualisation
+                <select
+                  value={previewFile}
+                  disabled={previewBusy}
+                  onChange={(event) => setPreviewFile(event.target.value)}
+                >
+                  <option value="">Choisir un fichier GLB</option>
+                  {previewCandidates.map((candidate) => (
+                    <option key={candidate} value={candidate}>
+                      {candidate}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="button secondary small-button"
+                disabled={!previewFile || previewBusy || configurationDirty}
+              >
+                Utiliser ce GLB
+              </button>
+            </form>
+          )}
+          {previewError && (
+            <div className="inline-error preview-notice" role="alert">
+              <strong>Aperçu indisponible</strong>
+              <p>{previewError}</p>
+              <p>
+                Le fichier source reste accessible depuis l’espace de travail.
+              </p>
+            </div>
+          )}
+          {previewDegraded && (
+            <div className="preview-notice preview-degraded" role="status">
+              <Icon name="warning" size={16} />
+              <span>
+                Aperçu dégradé : certaines ressources de rendu sont absentes.
+                Consultez la section Dépendances.
+              </span>
+            </div>
+          )}
           <div className="asset-metrics">
             <div>
               <Icon name="database" />
@@ -684,7 +844,7 @@ export function AssetDetailView({
               <span>Triangles</span>
               <strong>
                 {formatCount(
-                  inspection?.geometry.triangles ??
+                  displayInspection?.geometry.triangles ??
                     (snapshotId ? null : variant?.triangles),
                 )}
               </strong>
@@ -692,17 +852,47 @@ export function AssetDetailView({
             <div>
               <Icon name="cube" />
               <span>Objets maillés</span>
-              <strong>{formatCount(inspection?.geometry.meshObjects)}</strong>
+              <strong>
+                {formatCount(displayInspection?.geometry.meshObjects)}
+              </strong>
             </div>
           </div>
-          {inspection && (
+          {displayInspection && (
             <div className="inspection-note">
-              <span>{formatCount(inspection.geometry.vertices)} sommets</span>
-              <span>{formatCount(inspection.geometry.faces)} faces</span>
               <span>
-                {inspection.blenderVersion.startsWith("GLB")
-                  ? inspection.blenderVersion
-                  : `Blender ${inspection.blenderVersion}`}
+                {formatCount(displayInspection.geometry.vertices)} sommets
+              </span>
+              <span
+                title={
+                  displayInspection.geometry.edges == null
+                    ? "Le nombre d’arêtes n’est pas disponible pour cette analyse."
+                    : undefined
+                }
+              >
+                {formatCount(displayInspection.geometry.edges)} arêtes
+              </span>
+              <span>{formatCount(displayInspection.geometry.faces)} faces</span>
+              <span>
+                {displayInspection.blenderVersion.startsWith("GLB")
+                  ? displayInspection.blenderVersion
+                  : `Blender ${displayInspection.blenderVersion}`}
+              </span>
+              <span
+                className="inspection-provenance"
+                title={
+                  sourceInspection
+                    ? "Dernière analyse de la source ; utilisez Analyser pour l’actualiser."
+                    : undefined
+                }
+              >
+                {sourceInspection
+                  ? "Analyse de la source"
+                  : "Géométrie de l’aperçu"}
+                {" · "}
+                {inspection
+                  ? (selectedSnapshot?.config.primaryFile ??
+                    variantDetail?.variant.config.primaryFile)
+                  : preview?.sourceFile}
               </span>
             </div>
           )}
@@ -796,7 +986,7 @@ export function AssetDetailView({
             <div className="config-fields">
               <label>
                 Scène
-                {inspection ? (
+                {sourceInspection ? (
                   <select
                     disabled={!!snapshotId}
                     value={activeConfig.scene ?? ""}
@@ -809,7 +999,7 @@ export function AssetDetailView({
                     }
                   >
                     <option value="">Scène active</option>
-                    {inspection.scenes.map((scene) => (
+                    {sourceInspection.scenes.map((scene) => (
                       <option key={scene} value={scene}>
                         {scene}
                       </option>
@@ -831,7 +1021,7 @@ export function AssetDetailView({
               </label>
               <label>
                 Collection
-                {inspection ? (
+                {sourceInspection ? (
                   <select
                     disabled={!!snapshotId}
                     value={activeConfig.collection ?? ""}
@@ -843,7 +1033,7 @@ export function AssetDetailView({
                     }
                   >
                     <option value="">Scène entière</option>
-                    {inspection.collections.map((collection) => (
+                    {sourceInspection.collections.map((collection) => (
                       <option key={collection} value={collection}>
                         {collection}
                       </option>
@@ -924,35 +1114,38 @@ export function AssetDetailView({
           </button>
         </aside>
       </div>
-      {inspection &&
-        (inspection.warnings.length > 0 ||
-          inspection.dependencies.some(
-            (dependency) =>
-              !["internal", "packed", "embedded", "ok"].includes(
-                dependency.status,
-              ),
-          )) && (
-          <div className="inspection-warnings">
-            <Icon name="warning" />
-            <div>
-              {inspection.warnings.map((warning) => (
-                <p key={warning}>{warning}</p>
-              ))}
-              {inspection.dependencies
-                .filter(
-                  (dependency) =>
-                    !["internal", "packed", "embedded", "ok"].includes(
-                      dependency.status,
-                    ),
-                )
-                .map((dependency) => (
-                  <p key={dependency.path}>
-                    <code>{dependency.path}</code> — {dependency.status}
-                  </p>
-                ))}
-            </div>
+      {warnings.length > 0 && (
+        <section
+          className="inspection-warnings"
+          aria-label="Informations d’analyse"
+        >
+          <Icon name="warning" />
+          <div>
+            <h2>Informations d’analyse</h2>
+            {warnings.map((warning) => (
+              <p key={warning}>{warning}</p>
+            ))}
           </div>
-        )}
+        </section>
+      )}
+      {dependencies.length > 0 && (
+        <section className="inspection-warnings" aria-label="Dépendances">
+          <Icon name="warning" />
+          <div>
+            <h2>Dépendances</h2>
+            {dependencies.map((dependency) => (
+              <p key={dependency.path}>
+                <code>{dependency.path}</code> —{" "}
+                {dependency.status === "missing"
+                  ? "manquante"
+                  : dependency.status === "external"
+                    ? "externe"
+                    : dependency.status}
+              </p>
+            ))}
+          </div>
+        </section>
+      )}
       <div className="asset-bottom-panel">
         <div
           className="asset-tabs"

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
@@ -6,11 +6,19 @@ import { defaultExportConfig } from "../contracts";
 import type {
   AssetDetail,
   ChangeSet,
+  Inspection,
   JobRequest,
+  PreviewResult,
   VariantDetail,
 } from "../contracts";
 import type { RunJob } from "../lib/useJobs";
 import { AssetDetailView } from "./AssetDetailView";
+
+vi.mock("./ModelViewer", () => ({
+  default: ({ url }: { url: string }) => (
+    <div aria-label="Aperçu 3D interactif" data-url={url} />
+  ),
+}));
 
 vi.mock("../api", () => ({
   api: {
@@ -78,6 +86,21 @@ const changes: ChangeSet = {
   configChanged: false,
   workingBytes: 15,
 };
+const sourceInspection: Inspection = {
+  geometry: { meshObjects: 1, vertices: 8, edges: 12, faces: 6, triangles: 12 },
+  scenes: ["Scene"],
+  collections: ["Asset"],
+  dependencies: [],
+  warnings: [],
+  blenderVersion: "5.1.1",
+};
+const generatedPreview: PreviewResult = {
+  url: "http://edge-preview.localhost/generated",
+  inspection: sourceInspection,
+  sourceLabel: "Aperçu généré depuis drone.blend",
+  sourceFile: "drone.blend",
+  sourceKind: "generatedGlb",
+};
 const onError = vi.fn();
 const run = vi.fn<(request: JobRequest) => Promise<unknown>>();
 
@@ -92,6 +115,7 @@ beforeEach(() => {
   });
   vi.mocked(api.onWorkspaceChanged).mockResolvedValue(() => {});
   vi.mocked(api.chooseExportPath).mockResolvedValue("C:\\Export\\drone.glb");
+  vi.mocked(api.openBlender).mockResolvedValue(undefined);
   run.mockImplementation(async (request: JobRequest) =>
     request.kind === "changes" ? changes : null,
   );
@@ -267,5 +291,488 @@ describe("versions et travail en cours", () => {
       }),
     );
     expect(api.updateConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("aperçu indépendant et dépendances", () => {
+  it("affiche les arêtes et ignore les dépendances secondaires dans les alertes", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          inspection: {
+            ...sourceInspection,
+            dependencies: [
+              {
+                path: "C:\\Windows\\Fonts\\msyhbd.ttc",
+                status: "external",
+                kind: "font",
+                renderRelevant: false,
+              },
+              {
+                path: "essentials_brushes-gp_draw.blend",
+                status: "missing",
+                kind: "brush",
+                renderRelevant: false,
+              },
+            ],
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("12 arêtes")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "Dépendances" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Aperçu dégradé/)).not.toBeInTheDocument();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("ouvre le modèle et signale une texture essentielle absente dans Dépendances", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          inspection: {
+            ...sourceInspection,
+            dependencies: [
+              {
+                path: "textures/albedo.png",
+                status: "missing",
+                kind: "image",
+                renderRelevant: true,
+              },
+            ],
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Aperçu dégradé/)).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "Dépendances" })).getByText(
+        "textures/albedo.png",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("choisit un GLB ambigu sans modifier la source puis réutilise ce choix", async () => {
+    vi.mocked(api.getVariant).mockResolvedValue({
+      ...variant,
+      files: [
+        ...variant.files,
+        { path: "drone.glb", kind: "file", hash: "glb-1", size: 10 },
+        { path: "other.glb", kind: "file", hash: "glb-2", size: 10 },
+      ],
+    });
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview") {
+        if (!request.previewFile)
+          throw {
+            code: "preview_ambiguous",
+            message: "Plusieurs GLB sont disponibles.",
+            details: { candidates: ["drone.glb", "other.glb"] },
+          };
+        return {
+          ...generatedPreview,
+          sourceKind: "assetGlb",
+          sourceFile: request.previewFile,
+        };
+      }
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
+      "other.glb",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Utiliser ce GLB" }),
+    );
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toBeInTheDocument();
+    expect(api.updateConfig).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+    ).toHaveValue("drone.blend");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenLastCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: null,
+        previewFile: "other.glb",
+      }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Changer le GLB" }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
+      "drone.glb",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Utiliser ce GLB" }),
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenLastCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: null,
+        previewFile: "drone.glb",
+      }),
+    );
+    expect(api.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("conserve une erreur d’aperçu locale et l’accès au fichier Blender", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview")
+        throw { code: "external", message: "Blender n’a pas produit de GLB." };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Blender n’a pas produit de GLB.",
+    );
+    const open = screen.getByRole("button", { name: "Ouvrir dans Blender" });
+    expect(open).toBeEnabled();
+    await userEvent.click(open);
+    expect(api.openBlender).toHaveBeenCalledWith("variant-1");
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("préserve l’analyse de la source lorsqu’un GLB original sert d’aperçu", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "inspect") return sourceInspection;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          sourceKind: "assetGlb",
+          sourceFile: "drone.glb",
+          inspection: {
+            ...sourceInspection,
+            scenes: [],
+            collections: [],
+            blenderVersion: "GLB 2.0",
+            geometry: {
+              meshObjects: 1,
+              vertices: 4,
+              edges: 5,
+              faces: 2,
+              triangles: 2,
+            },
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    expect(await screen.findByText("12 arêtes")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("12 arêtes")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Scène" })).toHaveTextContent(
+      "Scene",
+    );
+    expect(screen.getByText(/Analyse de la source/)).toBeInTheDocument();
+  });
+
+  it("affiche un compte d’arêtes indisponible sans bloquer un ancien résultat", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          inspection: {
+            ...sourceInspection,
+            geometry: { ...sourceInspection.geometry, edges: null },
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(await screen.findByText("— arêtes")).toBeInTheDocument();
+    expect(screen.getByLabelText("Aperçu 3D interactif")).toBeInTheDocument();
+  });
+
+  it("actualise les métriques de la source avec un nouvel aperçu généré", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "inspect") return sourceInspection;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          inspection: {
+            ...sourceInspection,
+            geometry: { ...sourceInspection.geometry, edges: 24 },
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    await screen.findByText("12 arêtes");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(await screen.findByText("24 arêtes")).toBeInTheDocument();
+  });
+
+  it("ignore un aperçu terminé après le changement de version", async () => {
+    let finishPreview: (value: PreviewResult) => void = () => {};
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview")
+        return new Promise<PreviewResult>((resolve) => {
+          finishPreview = resolve;
+        });
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Consulter/ }),
+    );
+    await screen.findByText("Cette version");
+    await act(async () => finishPreview(generatedPreview));
+    expect(
+      screen.queryByLabelText("Aperçu 3D interactif"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("12 arêtes")).not.toBeInTheDocument();
+  });
+
+  it("abandonne le choix d’un GLB supprimé dans le travail courant", async () => {
+    let deleted = false;
+    vi.mocked(api.getVariant).mockImplementation(async () => ({
+      ...variant,
+      files: deleted
+        ? variant.files
+        : [
+            ...variant.files,
+            { path: "drone.glb", kind: "file", hash: "glb-1", size: 10 },
+            { path: "other.glb", kind: "file", hash: "glb-2", size: 10 },
+          ],
+    }));
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview") {
+        if (deleted) {
+          if (request.previewFile)
+            throw { code: "invalid", message: "GLB supprimé" };
+          return generatedPreview;
+        }
+        if (!request.previewFile)
+          throw {
+            code: "preview_ambiguous",
+            details: { candidates: ["drone.glb", "other.glb"] },
+          };
+        return {
+          ...generatedPreview,
+          sourceKind: "assetGlb",
+          sourceFile: request.previewFile,
+        };
+      }
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
+      "other.glb",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Utiliser ce GLB" }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    deleted = true;
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenLastCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: null,
+      }),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTitle("drone.blend")).toBeInTheDocument();
+    expect(api.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("conserve le choix GLB d’une version immuable après suppression dans le travail courant", async () => {
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...variant.snapshots[0]!,
+      entries: [
+        ...variant.snapshots[0]!.entries,
+        { path: "saved-a.glb", kind: "file", hash: "one", size: 10 },
+        { path: "saved-b.glb", kind: "file", hash: "two", size: 10 },
+      ],
+    });
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview") {
+        if (!request.previewFile)
+          throw {
+            code: "preview_ambiguous",
+            details: { candidates: ["saved-a.glb", "saved-b.glb"] },
+          };
+        return {
+          ...generatedPreview,
+          sourceKind: "assetGlb",
+          sourceFile: request.previewFile,
+        };
+      }
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Consulter/ }),
+    );
+    await screen.findByText("Cette version");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
+      "saved-b.glb",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Utiliser ce GLB" }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenLastCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: "snapshot-1",
+        previewFile: "saved-b.glb",
+      }),
+    );
+    expect(api.getVariant).toHaveBeenCalledTimes(1);
+  });
+
+  it("nomme le .blend effectivement analysé lorsque le GLB principal a disparu", async () => {
+    vi.mocked(api.getVariant).mockResolvedValue({
+      ...variant,
+      variant: {
+        ...variant.variant,
+        config: { ...variant.variant.config, primaryFile: "deleted.glb" },
+      },
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : request.kind === "preview"
+          ? generatedPreview
+          : null,
+    );
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(await screen.findByText(/Analyse de la source/)).toHaveTextContent(
+      "drone.blend",
+    );
+    expect(screen.getByText(/Analyse de la source/)).not.toHaveTextContent(
+      "deleted.glb",
+    );
+  });
+
+  it("préserve l’analyse Blender après un changement externe et un aperçu GLB original", async () => {
+    let workspaceChanged: (variantId: string) => void = () => {};
+    vi.mocked(api.onWorkspaceChanged).mockImplementation(async (callback) => {
+      workspaceChanged = callback;
+      return () => {};
+    });
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "inspect") return sourceInspection;
+      if (request.kind === "preview")
+        return {
+          ...generatedPreview,
+          sourceKind: "assetGlb",
+          sourceFile: "drone.glb",
+          inspection: {
+            ...sourceInspection,
+            scenes: [],
+            collections: [],
+            blenderVersion: "GLB 2.0",
+            geometry: { ...sourceInspection.geometry, edges: 5 },
+          },
+        };
+      return null;
+    });
+    renderDetail();
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    await screen.findByText("12 arêtes");
+    await act(async () => workspaceChanged("variant-1"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    expect(screen.getByText("12 arêtes")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Scène" })).toHaveTextContent(
+      "Scene",
+    );
+    expect(screen.getByText(/Analyse de la source/)).toHaveTextContent(
+      "drone.blend",
+    );
   });
 });

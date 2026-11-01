@@ -601,6 +601,25 @@ impl Library {
         destination: &Path,
         ctx: &OperationContext,
     ) -> Result<Snapshot> {
+        self.capture_working_inner(variant_id, destination, ctx, true)
+    }
+
+    pub(crate) fn capture_preview(
+        &self,
+        variant_id: &str,
+        destination: &Path,
+        ctx: &OperationContext,
+    ) -> Result<Snapshot> {
+        self.capture_working_inner(variant_id, destination, ctx, false)
+    }
+
+    fn capture_working_inner(
+        &self,
+        variant_id: &str,
+        destination: &Path,
+        ctx: &OperationContext,
+        update_config: bool,
+    ) -> Result<Snapshot> {
         let _guard = self.write_guard()?;
         self.validate_destination(destination)?;
         let variant = read_variant(&*self.db()?, &self.root, variant_id)?;
@@ -612,9 +631,13 @@ impl Library {
             staging: temp.path().to_path_buf(),
         };
         let entries = ephemeral.capture(Path::new(&variant.workspace_path), true, ctx)?;
-        let config = resolve_config(variant.config.clone(), &entries)?;
+        let config = if update_config {
+            resolve_config(variant.config.clone(), &entries)?
+        } else {
+            variant.config.clone()
+        };
         ephemeral.materialize(&entries, destination, ctx)?;
-        if config != variant.config {
+        if update_config && config != variant.config {
             self.db()?.execute(
                 "UPDATE variants SET config=?1,triangles=NULL WHERE id=?2",
                 params![serde_json::to_string(&config)?, variant_id],

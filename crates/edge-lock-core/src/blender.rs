@@ -27,6 +27,13 @@ pub struct BlenderVersion {
 pub struct Dependency {
     pub path: String,
     pub status: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub render_relevant: bool,
+    /// Logical source location (possibly a UDIM/sequence pattern), never a temporary copy.
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +65,8 @@ struct Request<'a> {
     config: &'a ExportConfig,
     #[serde(serialize_with = "serialize_optional_blender_path")]
     destination: Option<&'a Path>,
+    #[serde(serialize_with = "serialize_optional_blender_path")]
+    logical_workspace: Option<&'a Path>,
 }
 
 fn blender_path(path: &Path) -> std::result::Result<String, &'static str> {
@@ -95,6 +104,15 @@ fn serialize_optional_blender_path<S: serde::Serializer>(
         .transpose()
         .map_err(S::Error::custom)?
         .serialize(serializer)
+}
+
+fn absolute_logical_path(path: &Path) -> Result<&Path> {
+    if !path.is_absolute() {
+        return Err(CoreError::Invalid(
+            "Le dossier logique de l'asset doit être absolu.".into(),
+        ));
+    }
+    Ok(path)
 }
 
 #[derive(Deserialize)]
@@ -258,6 +276,7 @@ impl BlenderRunner {
             blend_file: &blend_file,
             config: &config,
             destination: None,
+            logical_workspace: None,
         };
         self.run(&request, context)?;
         if !blend_file.is_file() {
@@ -284,6 +303,7 @@ impl BlenderRunner {
             blend_file: &blend_file,
             config,
             destination: None,
+            logical_workspace: None,
         };
         self.run(&request, context)?
             .ok_or_else(|| CoreError::External("Inspection Blender absente.".into()))
@@ -292,6 +312,65 @@ impl BlenderRunner {
     pub fn export_glb(
         &self,
         workspace: &Path,
+        config: &ExportConfig,
+        destination: &Path,
+        context: &OperationContext,
+    ) -> Result<Inspection> {
+        self.export_operation("export", workspace, None, config, destination, context)
+    }
+
+    /// Discover preview dependencies without evaluating mesh geometry.
+    /// Paths resolve against the logical asset location rather than its temporary copy.
+    pub fn inspect_preview(
+        &self,
+        workspace: &Path,
+        logical_workspace: &Path,
+        config: &ExportConfig,
+        context: &OperationContext,
+    ) -> Result<Inspection> {
+        context.check_cancelled()?;
+        let workspace = fs::canonicalize(workspace)?;
+        let logical_workspace = absolute_logical_path(logical_workspace)?;
+        let blend_file = primary_blend(&workspace, config)?;
+        self.run(
+            &Request {
+                protocol_version: 1,
+                operation: "inspectPreview",
+                workspace: &workspace,
+                blend_file: &blend_file,
+                config,
+                destination: None,
+                logical_workspace: Some(logical_workspace),
+            },
+            context,
+        )?
+        .ok_or_else(|| CoreError::External("Inspection de l'aperçu Blender absente.".into()))
+    }
+
+    /// Generate a best-effort preview without relaxing the strict export contract.
+    pub fn preview_glb(
+        &self,
+        workspace: &Path,
+        logical_workspace: &Path,
+        config: &ExportConfig,
+        destination: &Path,
+        context: &OperationContext,
+    ) -> Result<Inspection> {
+        self.export_operation(
+            "preview",
+            workspace,
+            Some(logical_workspace),
+            config,
+            destination,
+            context,
+        )
+    }
+
+    fn export_operation(
+        &self,
+        operation: &str,
+        workspace: &Path,
+        logical_workspace: Option<&Path>,
         config: &ExportConfig,
         destination: &Path,
         context: &OperationContext,
@@ -311,6 +390,7 @@ impl BlenderRunner {
             ));
         }
         let workspace = fs::canonicalize(workspace)?;
+        let logical_workspace = logical_workspace.map(absolute_logical_path).transpose()?;
         let blend_file = primary_blend(&workspace, config)?;
         let parent = destination
             .parent()
@@ -323,15 +403,16 @@ impl BlenderRunner {
         );
         let request = Request {
             protocol_version: 1,
-            operation: "export",
+            operation,
             workspace: &workspace,
             blend_file: &blend_file,
             config,
             destination: Some(&destination),
+            logical_workspace,
         };
         let result = self.run(&request, context).and_then(|inspection| {
             context.check_cancelled()?;
-            crate::glb::inspect_glb(&destination)?;
+            crate::glb::validate_glb(&destination)?;
             inspection
                 .ok_or_else(|| CoreError::External("Résultat d'export Blender absent.".into()))
         });
@@ -351,7 +432,7 @@ impl BlenderRunner {
         let output = directory.path().join("response.json");
         fs::write(&worker, WORKER)?;
         fs::write(&input, serde_json::to_vec(request)?)?;
-        for name in ["config", "scripts", "extensions"] {
+        for name in ["config", "scripts", "extensions", "temp"] {
             fs::create_dir(directory.path().join(name))?;
         }
         let mut command = hidden_command(&self.executable);
@@ -359,6 +440,9 @@ impl BlenderRunner {
             .current_dir(directory.path())
             .env("BLENDER_USER_CONFIG", directory.path().join("config"))
             .env("BLENDER_USER_SCRIPTS", directory.path().join("scripts"))
+            .env("TEMP", directory.path().join("temp"))
+            .env("TMP", directory.path().join("temp"))
+            .env("TMPDIR", directory.path().join("temp"))
             .env(
                 "BLENDER_USER_EXTENSIONS",
                 directory.path().join("extensions"),

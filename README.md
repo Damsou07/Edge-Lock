@@ -21,11 +21,17 @@ Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieur
 
 ## Aperçu et export
 
-L’aperçu 3D fournit navigation orbitale et lecture des animations GLB. L’analyse affiche objets maillés, sommets, faces et triangles. Les calculs sont lancés à la demande ; la bibliothèque ne prétend pas connaître la géométrie d’un fichier encore non analysé.
+L’aperçu 3D fournit navigation orbitale et lecture des animations GLB. Il privilégie un GLB déjà présent dans l’asset : choix explicite d’aperçu, GLB principal, GLB portant le nom du `.blend`, puis unique GLB disponible. Si plusieurs candidats restent possibles, un sélecteur permet de choisir sans changer le fichier principal. Sans GLB, Blender produit automatiquement un aperçu en arrière-plan dans le cache local, sans sauvegarder le `.blend` ni écraser un GLB original.
+
+L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. Les calculs sont lancés à la demande.
 
 Pour un `.blend`, choisir le fichier principal, éventuellement une scène et une collection racine. Les sous-collections sont incluses. L’application des modificateurs à l’export est désactivée par défaut pour préserver les shape keys et animations compatibles avec glTF. Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
 
-Un export peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les dépendances externes ou absentes sont signalées ; les exports Blender avec de telles dépendances sont refusés. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur.
+Les dépendances externes ou manquantes ne bloquent pas l’aperçu. La section **Dépendances** signale les ressources utiles au rendu ; les polices et brosses inutilisées ne déclenchent pas d’alerte. Une texture manquante peut être remplacée uniquement en mémoire pour afficher un modèle dégradé. Un échec de conversion laisse le fichier Blender accessible.
+
+Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. Il suit le contenu des sources utiles, y compris textures externes et bibliothèques liées ; modifier un rapport ou une capture ne régénère pas l’aperçu. Les temporaires d’aperçu identifiés comme appartenant à l’application sont nettoyés après interruption. Les tâches sont sérialisées et le budget commun des caches reste de 2 Gio.
+
+Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les exports Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut donc influencer un aperçu historique.
 
 Le fichier GLB final est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner l’asset. Les GLB qui exigent des ressources externes ou des extensions non prises en charge sont refusés par l’inspecteur.
 

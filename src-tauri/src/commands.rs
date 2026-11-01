@@ -70,6 +70,7 @@ pub async fn open_library(path: String, state: State<'_, ManagedState>) -> AppRe
             return Ok(current.info()?);
         }
         let library = Arc::new(Library::open(PathBuf::from(path))?);
+        let _ = edge_lock_core::preview::cleanup_temporary(library.root());
         let info = library.info()?;
         let mut changed = lock(&state.settings)?.clone();
         changed.library_path = Some(info.root.clone());

@@ -117,14 +117,21 @@ export interface Bootstrap {
 export interface Geometry {
   meshObjects: number;
   vertices: number;
+  edges?: number | null;
   faces: number;
   triangles: number;
+}
+export interface Dependency {
+  path: string;
+  status: string;
+  kind?: string;
+  renderRelevant?: boolean;
 }
 export interface Inspection {
   geometry: Geometry;
   scenes: string[];
   collections: string[];
-  dependencies: { path: string; status: string }[];
+  dependencies: Dependency[];
   warnings: string[];
   blenderVersion: string;
 }
@@ -132,10 +139,13 @@ export interface PreviewResult {
   url: string;
   inspection: Inspection;
   sourceLabel: string;
+  sourceFile: string;
+  sourceKind: "assetGlb" | "generatedGlb";
 }
 export interface AppError {
   code: string;
   message: string;
+  details?: { candidates?: string[] } | null;
 }
 export type JobRequest =
   | { kind: "import"; source: string; name: string; config: ExportConfig }
@@ -144,7 +154,12 @@ export type JobRequest =
   | { kind: "variant"; snapshotId: string; name: string }
   | { kind: "changes"; variantId: string }
   | { kind: "inspect"; variantId: string; snapshotId?: string | null }
-  | { kind: "preview"; variantId: string; snapshotId?: string | null }
+  | {
+      kind: "preview";
+      variantId: string;
+      snapshotId?: string | null;
+      previewFile?: string;
+    }
   | {
       kind: "export";
       variantId: string;

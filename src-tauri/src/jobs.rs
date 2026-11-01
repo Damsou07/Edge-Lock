@@ -3,6 +3,7 @@ use edge_lock_core::{
     ExportConfig, Library, OperationContext, Snapshot,
     blender::{BlenderRunner, Inspection},
     glb,
+    preview::{self, PreviewOutcome, PreviewRequest},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,6 +48,7 @@ pub enum JobRequest {
     Preview {
         variant_id: String,
         snapshot_id: Option<String>,
+        preview_file: Option<String>,
     },
     Export {
         variant_id: String,
@@ -243,21 +245,43 @@ fn run(
         JobRequest::Preview {
             variant_id,
             snapshot_id,
+            preview_file,
         } => {
-            let material = prepare(library, variant_id, snapshot_id.as_deref(), ctx)?;
-            let (path, inspection) = derived_glb(state, library, &material, ctx)?;
-            glb::guard_preview(&path)?;
-            if snapshot_id.is_none() {
-                library.set_geometry(variant_id, inspection.geometry.triangles)?;
+            let blender_path = lock(&state.settings)?.blender_path.clone();
+            let artifact = match preview::prepare_preview(
+                library,
+                PreviewRequest {
+                    variant_id,
+                    snapshot_id: snapshot_id.as_deref(),
+                    preview_file: preview_file.as_deref(),
+                    blender_path: blender_path.as_deref().map(Path::new),
+                },
+                ctx,
+            )? {
+                PreviewOutcome::Ready(artifact) => artifact,
+                PreviewOutcome::Choose(candidates) => {
+                    let mut error = AppError::new(
+                        "preview_ambiguous",
+                        "Plusieurs GLB sont disponibles. Choisissez le fichier d’aperçu.",
+                    );
+                    error.details = Some(json!({ "candidates": candidates }));
+                    return Err(error);
+                }
+            };
+            if snapshot_id.is_none() && artifact.updates_geometry {
+                library.set_geometry(variant_id, artifact.inspection.geometry.triangles)?;
             }
             let token = uuid::Uuid::new_v4().simple().to_string();
             {
                 let mut previews = lock(&state.previews)?;
                 previews.clear();
-                previews.insert(token.clone(), path);
+                previews.insert(token.clone(), artifact.path.clone());
             }
+            trim_cache(&library.root().join("cache"), &artifact.path, state);
             Ok(
-                json!({ "url": format!("http://edge-preview.localhost/{token}"), "inspection": inspection, "sourceLabel": if snapshot_id.is_some() { "Version enregistrée" } else { "Travail enregistré sur disque" } }),
+                json!({ "url": format!("http://edge-preview.localhost/{token}"), "inspection": artifact.inspection,
+                    "sourceLabel": if snapshot_id.is_some() { "Version enregistrée" } else { "Travail enregistré sur disque" },
+                    "sourceFile": artifact.source_file, "sourceKind": artifact.source_kind }),
             )
         }
         JobRequest::Export {
@@ -396,7 +420,7 @@ fn derived_glb(
         && fs::symlink_metadata(&metadata)?.len() <= 4 * 1024 * 1024
         && !is_link(&fs::symlink_metadata(&cached)?)
         && !is_link(&fs::symlink_metadata(&metadata)?)
-        && glb::inspect_glb(&cached).is_ok()
+        && glb::validate_glb(&cached).is_ok()
         && let Ok(inspection) = serde_json::from_slice::<Inspection>(&fs::read(&metadata)?)
     {
         return Ok((cached, inspection));
@@ -417,7 +441,7 @@ fn derived_glb(
             blender_version: "GLB 2.0".into(),
         }
     };
-    glb::inspect_glb(&staged)?;
+    glb::validate_glb(&staged)?;
     ctx.check_cancelled()?;
     let cache_temp = tempfile::NamedTempFile::new_in(&cache)?;
     copy_stream(&staged, cache_temp.path(), ctx)?;
@@ -430,7 +454,7 @@ fn derived_glb(
     meta_temp
         .persist(&metadata)
         .map_err(|e| AppError::new("io", e))?;
-    trim_cache(&cache, &cached, state);
+    trim_cache(&library.root().join("cache"), &cached, state);
     Ok((cached, inspection))
 }
 
@@ -448,7 +472,7 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 
 fn managed_cache_dir(root: &Path) -> AppResult<PathBuf> {
     let mut path = root.to_owned();
-    for component in ["cache", "previews"] {
+    for component in ["cache", "exports"] {
         path.push(component);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => {}
@@ -471,19 +495,22 @@ fn trim_cache(cache: &Path, keep: &Path, state: &AppState) {
         .lock()
         .map(|p| p.values().cloned().collect())
         .unwrap_or_default();
-    let Ok(entries) = fs::read_dir(cache) else {
-        return;
-    };
+    let entries = [
+        cache.to_path_buf(),
+        cache.join("previews"),
+        cache.join("exports"),
+    ]
+    .into_iter()
+    .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && !is_link(&m)))
+    .filter_map(|p| fs::read_dir(p).ok())
+    .flatten();
     let mut files: Vec<_> = entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
-            let meta = e.metadata().ok()?;
-            (path.extension().is_some_and(|e| e == "glb")).then_some((
-                path,
-                meta.len(),
-                meta.modified().ok(),
-            ))
+            let meta = fs::symlink_metadata(&path).ok()?;
+            (meta.is_file() && !is_link(&meta) && path.extension().is_some_and(|e| e == "glb"))
+                .then_some((path, meta.len(), meta.modified().ok()))
         })
         .collect();
     let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();

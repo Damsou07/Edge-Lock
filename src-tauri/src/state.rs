@@ -11,12 +11,15 @@ use std::{
 pub struct AppError {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 impl AppError {
     pub fn new(code: &str, message: impl ToString) -> Self {
         Self {
             code: code.into(),
             message: message.to_string(),
+            details: None,
         }
     }
 }

@@ -1,6 +1,6 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Toutes les données de test sont synthétiques et isolées des bibliothèques personnelles. Les résultats ci-dessous ont été observés le 1er novembre 2026 sur le poste Windows de développement.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les fixtures sont synthétiques, à l’exception d’une copie importée de Sniper Kitsune dans une bibliothèque jetable ; ses 72 fichiers personnels ont été contrôlés par hash et date avant/après, sans modification. Les résultats ci-dessous ont été observés le 1er novembre 2026 sur le poste Windows de développement.
 
 ## Contrôles reproductibles
 
@@ -20,7 +20,7 @@ Les bibliothèques Rust sont créées avec `tempfile`. Le bac à sable AppContai
 
 ## Tests du cœur
 
-La suite `cargo test --workspace` réussit : **33 tests Rust**, dont 19 tests de stockage, 1 arrêt brutal en sous-processus, 1 test de sécurité des chemins, 5 tests GLB, 1 validation Blender sans processus externe et 6 tests de l’adaptateur desktop. Les doctests réussissent également (aucun exemple exécutable). `cargo clippy --workspace --all-targets -- -D warnings` et `cargo fmt --all --check` réussissent sur l’état final, en édition Rust 2024.
+La suite `cargo test --workspace` réussit : **46 tests Rust**, dont 19 tests de stockage, 1 arrêt brutal en sous-processus, 12 tests GLB, 3 tests d’aperçu sans Blender, 2 validations du runner sans processus externe, 3 tests internes du cœur et 6 tests de l’adaptateur desktop. Les doctests réussissent également (aucun exemple exécutable). `cargo clippy --workspace --all-targets -- -D warnings` et `cargo fmt --all --check` réussissent, en édition Rust 2024.
 
 Les tests couvrent : copie sans modification de l’origine, fichiers binaires et Unicode, dossiers vides, déduplication, historique, variantes indépendantes, archivage, taxonomie sans cycles, filtrage par descendants, configuration versionnée, annulation, fichiers modifiés pendant capture, fichiers verrouillés Windows, échec de publication d’objet, objet corrompu et refus d’écrasement.
 
@@ -32,20 +32,24 @@ La migration 0→1 est testée sur une base synthétique comportant des réglage
 
 Les protections de chemins et l’inspecteur GLB ont leurs propres tests : données tronquées, plages hors limites, cycles, ressources externes, extensions non prises en charge, comptes des instances/animations et textures disproportionnées.
 
+Les nouvelles régressions ont été écrites avant leur implémentation et observées en échec, puis exécutées à nouveau après correction. La revue a notamment ajouté un cas rouge pour le GLB principal supprimé : le repli sur l’unique `.blend` conserve désormais la configuration persistante.
+
 ## Blender réel
 
-Les **5 tests d’intégration Blender passent sur Blender 5.1.1 et Blender 5.2.3 LTS**. La distribution portable officielle 5.2.3 a été vérifiée par SHA avant utilisation. Les tests créent leurs propres projets et ressources ; ils n’ouvrent pas le projet Blender personnel de l’utilisateur.
+Les **12 scénarios exigeant Blender réussissent sur Blender 5.1.1** : huit intégrations du worker et quatre intégrations du cache. Ils créent leurs propres projets et ressources. Les anciens scénarios avaient également été validés sur Blender 5.2.3 LTS ; la nouvelle suite complète n’a pas été réexécutée sur cette version.
 
 ```powershell
 $env:EDGE_LOCK_TEST_BLENDER = 'C:\chemin\vers\blender.exe'
-cargo test -p edge-lock-core --test blender_integration -- --include-ignored
+cargo test -p edge-lock-core --test blender_integration --test preview -- --include-ignored
 ```
 
-Les scénarios comprennent création réelle d’un projet, export d’une collection avec sous-collection, textures incorporées, rig, shape keys et animations, conservation du source, détection d’une texture externe, refus d’export non autonome, neutralisation des scripts embarqués, timeout et annulation. Les tests sont ignorés par la commande Rust ordinaire parce qu’un exécutable Blender doit être choisi explicitement.
+Les scénarios comprennent création réelle d’un projet, export d’une collection avec sous-collection, textures incorporées, rig, shape keys et animations, conservation du source, détection d’une texture externe, refus d’export strict non autonome, neutralisation des scripts embarqués, timeout et annulation. Les régressions d’aperçu couvrent police/brosse inutilisée, texture absente et remplacement en mémoire, références externes relatives, bibliothèques imbriquées et arêtes exactes.
+
+Le cache est testé pour la réutilisation sans Blender, les rapports ignorés, les changements de textures externes, la corruption, l’isolation historique, le repli après suppression du GLB principal et une source modifiée pendant la conversion. Ce dernier cas vérifie une nouvelle tentative et la publication d’un seul GLB stable. Une annulation après création du temporaire laisse sources, métadonnées et objets inchangés. Les tests exigeant Blender sont ignorés par la commande Rust ordinaire parce qu’un exécutable doit être choisi explicitement.
 
 ## Interface
 
-Les **30 tests frontend passent**, répartis entre quatre fichiers. Ils couvrent notamment import, dépôt de dossier, configuration, navigation, erreurs, événements et validation des ressources de la visionneuse. Le typage TypeScript, ESLint, Prettier et le build Vite réussissent. La visionneuse est également exercée dans la véritable WebView2, comme décrit ci-dessous ; les tests unitaires seuls ne prouvent pas le rendu GPU.
+Les **42 tests frontend passent**, répartis entre quatre fichiers. Ils couvrent notamment import, dépôt de dossier, configuration, navigation, erreurs, événements et validation des ressources de la visionneuse. Les nouveaux cas vérifient les dépendances non bloquantes, la dégradation, les erreurs locales d’aperçu, le choix GLB et sa suppression externe, les arêtes et la provenance, la conservation de l’analyse Blender et les résultats obsolètes après changement de sélection. Le typage TypeScript, ESLint, Prettier et le build Vite réussissent. La visionneuse est également exercée dans la véritable WebView2 ; les tests unitaires seuls ne prouvent pas le rendu GPU.
 
 ## Mesures de performance
 
@@ -73,26 +77,29 @@ Le script `scripts/e2e.mjs` pilote une vraie WebView2 via `tauri-driver` et un M
 node scripts/e2e.mjs
 ```
 
-Les rapports et captures sont écrits dans le dossier temporaire annoncé par le script. L’exécution finale a **réussi les sept parcours** :
+Les rapports et captures sont écrits dans le dossier temporaire annoncé par le script. L’exécution a **réussi huit parcours**, dont Sniper Kitsune :
 
 - Événement Tauri de dépôt : formulaire prérempli, aucune copie avant confirmation. Le test injecte l’événement natif ; il ne simule pas un geste de souris depuis l’Explorateur.
 - Import Unicode, conservation du source et des dossiers vides.
 - Aperçu WebGL local, rotation, zoom, recentrage et lecture/pause d’animation.
 - Détection des modifications, version manuelle et variante indépendante depuis une ancienne version.
 - Export historique vérifié, refus d’écrasement sans consentement et travail courant préservé.
+- Sniper Kitsune : GLB original avec exécutable Blender indisponible, conversion réelle depuis une copie sans GLB, police externe et brosse manquante secondaires, cache froid/chaud et deux demandes simultanées, arêtes et rendu WebGL.
 - Blender réel via Tauri : sélection automatique du principal, collection mesurée à 12 triangles, aperçu, export, source inchangée et création native d’un projet.
 - Redémarrage : classement, variantes et historique conservés.
 
-Le rapport de cette session est `.test-data/desktop-70kkKK/report.json` (`status: passed`). Les dossiers `.test-data` sont locaux et exclus du dépôt. Pour inclure le scénario Blender, fournir `EDGE_LOCK_E2E_BLENDER` (exécutable) et `EDGE_LOCK_E2E_BLEND_SOURCE` (dossier d’une fixture jetable avec `main.blend`, texture, collection et animation). Le script refuse les binaires release afin de garantir l’isolation des réglages.
+Le rapport final de cette correction est `.test-data/desktop-x9r4gB/report.json` (`status: passed`), après reconstruction du binaire debug et des assets frontend définitifs. Les dossiers `.test-data` sont locaux et exclus du dépôt. Pour inclure le scénario Blender, fournir `EDGE_LOCK_E2E_BLENDER` (exécutable) et `EDGE_LOCK_E2E_BLEND_SOURCE` (dossier d’une fixture jetable avec `main.blend`, texture, collection et animation). Pour Kitsune, ajouter `EDGE_LOCK_E2E_KITSUNE_SOURCE` (dossier contenant son `.blend` et son GLB original). Le script importe une copie avant tout retrait de GLB et vérifie les hashes de la source personnelle ; il refuse les binaires release afin de garantir l’isolation des réglages.
+
+Sur ce poste, Kitsune a fourni **41 112 sommets, 77 982 arêtes et 37 701 faces** depuis Blender. Mesures finales du parcours IPC, pendant une compilation release parallèle : GLB original 869 ms, conversion 11 120 ms, cache chaud 250 ms. Le premier passage avait mesuré 665 / 7 959 / 247 ms. Ces durées ne sont pas une garantie de performances sur d’autres scènes ou machines. Les captures `06-kitsune-original-glb.png` et `07-kitsune-generated-glb.png` des deux passages ont été examinées.
 
 **La construction Tauri release et la génération NSIS ont réussi.** Les métadonnées des deux fichiers produits indiquent `Edge Lock`, version fichier et produit **0.1.0**. L’exécutable applicatif est bien PE x64 (`0x8664`). Le lanceur NSIS est un bootstrap PE x86 qui embarque cette application x64.
 
 | Fichier | Taille | SHA-256 |
 | --- | --- | --- |
-| `target/release/edge-lock.exe` | 17 174 528 octets | `B06EC6DCA842CAD4978BCB5E1F8524092581DC1B6A9A8ED7A77470A9DC1A6FE2` |
-| `target/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe` | 7 278 507 octets | `403AE9A479F4F32C67DA949358F1ACF89C8CD1B53665E010C32A9F16A0EB3565` |
+| `target/release/edge-lock.exe` | 17 414 144 octets | `2343482292E8FB1E3FD0D3E76B4D8E3BB348773BB960E02581547F27C78603DA` |
+| `target/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe` | 7 342 480 octets | `F70661A9A9E8B704EADF2A600887F1B7DFE280AA955E697206401C7A5E9F841D` |
 
-Le rapport local d’inspection est `.test-data/release-verification.json`. L’installateur n’est pas signé avec un certificat de signature de code.
+Le rapport local d’inspection est `.test-data/dependency-release-verification.json`. Le premier packaging a échoué sur la résolution réseau dans le sandbox ; le build standard relancé hors sandbox a téléchargé l’outil NSIS puis réussi. L’installateur n’est pas signé avec un certificat de signature de code.
 
 Le script `scripts/test-installer.ps1` est prévu pour Windows Sandbox ou une VM jetable. Il vérifie installation, version de l’exécutable installé, réinstallation et intégrité des hashes d’une copie de bibliothèque. Avec `-PreviousInstallerPath`, il peut aussi vérifier le passage depuis un installateur antérieur fourni.
 

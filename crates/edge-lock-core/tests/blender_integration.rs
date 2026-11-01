@@ -56,6 +56,28 @@ fn rejects_ambiguous_or_escaping_primary_file_before_launch() {
     ));
 }
 
+#[test]
+fn preview_logical_workspace_can_be_missing_but_must_be_absolute() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("main.blend"), b"fixture").unwrap();
+    let runner = BlenderRunner::new(PathBuf::from("nonexistent-blender-executable"));
+    let config = ExportConfig::default();
+    let context = OperationContext::default();
+    assert!(matches!(
+        runner.inspect_preview(directory.path(), Path::new("relative"), &config, &context),
+        Err(CoreError::Invalid(_))
+    ));
+    assert!(matches!(
+        runner.inspect_preview(
+            directory.path(),
+            &directory.path().join("missing-original"),
+            &config,
+            &context
+        ),
+        Err(CoreError::External(_))
+    ));
+}
+
 fn fixture(root: &Path, external_texture: bool, embedded_script: bool) -> PathBuf {
     let workspace = root.join("asset échantillon");
     fs::create_dir_all(workspace.join("textures")).unwrap();
@@ -157,6 +179,248 @@ bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'))
     workspace
 }
 
+fn edit_fixture(root: &Path, workspace: &Path, script: &str) {
+    let script_path = root.join("edit-fixture.py");
+    fs::write(&script_path, script).unwrap();
+    let mut command = Command::new(executable());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command
+        .current_dir(root)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--disable-autoexec",
+            "--offline-mode",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(script_path)
+        .arg("--")
+        .arg(workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture edit failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn previews_external_and_missing_textures_without_modifying_sources() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), true, false);
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let runner = BlenderRunner::new(executable());
+    let context = OperationContext::default();
+    let config = ExportConfig::default();
+    let inspection = runner
+        .inspect_preview(&workspace, &workspace, &config, &context)
+        .unwrap();
+    assert!(inspection.dependencies.iter().any(|d| {
+        d.kind == "image"
+            && d.render_relevant
+            && d.source_path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("external.png"))
+    }));
+    let output = root.path().join("external-preview.glb");
+    runner
+        .preview_glb(&workspace, &workspace, &config, &output, &context)
+        .unwrap();
+    assert!(guard_preview(&output).is_ok());
+    fs::remove_file(root.path().join("external.png")).unwrap();
+    let output = root.path().join("missing-preview.glb");
+    let inspection = runner
+        .preview_glb(&workspace, &workspace, &config, &output, &context)
+        .unwrap();
+    assert!(
+        inspection
+            .dependencies
+            .iter()
+            .any(|d| d.kind == "image" && d.render_relevant && d.status == "missing")
+    );
+    assert!(inspection.warnings.iter().any(|w| w.contains("dégrad")));
+    assert!(guard_preview(&output).is_ok());
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn previews_ignore_unused_font_and_missing_brush_library() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), false, false);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'), use_scripts=False)
+font=next((p for p in (Path('C:/Windows/Fonts/msyhbd.ttc'),Path('C:/Windows/Fonts/arial.ttf'),Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')) if p.is_file()),None)
+assert font is not None, 'No fixture font found'
+unused=bpy.data.fonts.load(str(font)); unused.use_fake_user=True
+brush=bpy.data.brushes.new('Unused Brush', mode='SCULPT')
+library=root.parent/'essentials_brushes-gp_draw.blend'
+bpy.data.libraries.write(str(library), {brush}, fake_user=True)
+bpy.data.brushes.remove(brush)
+with bpy.data.libraries.load(str(library),link=True) as (source,destination): destination.brushes=source.brushes
+for brush in destination.brushes: brush.use_fake_user=True
+bpy.context.scene.tool_settings.sculpt.eraser_brush=destination.brushes[0]
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+library.unlink()
+"#,
+    );
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let runner = BlenderRunner::new(executable());
+    let output = root.path().join("secondary-preview.glb");
+    let inspection = runner
+        .preview_glb(
+            &workspace,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    assert!(
+        inspection
+            .dependencies
+            .iter()
+            .any(|d| d.kind == "font" && !d.render_relevant)
+    );
+    assert!(
+        inspection
+            .dependencies
+            .iter()
+            .any(|d| d.kind == "library" && d.status == "missing" && !d.render_relevant),
+        "{:?}",
+        inspection.dependencies
+    );
+    assert!(inspection.warnings.is_empty(), "{:?}", inspection.warnings);
+    assert!(guard_preview(&output).is_ok());
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn preview_rebases_external_relative_texture_from_a_staged_copy() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), true, false);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+bpy.data.images['Albedo'].filepath='//../external.png'
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+    );
+    let staged = root.path().join("temporary/deep/source");
+    fs::create_dir_all(&staged).unwrap();
+    fs::copy(workspace.join("main.blend"), staged.join("main.blend")).unwrap();
+    let runner = BlenderRunner::new(executable());
+    let output = root.path().join("relative-preview.glb");
+    let inspection = runner
+        .preview_glb(
+            &staged,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    let image = inspection
+        .dependencies
+        .iter()
+        .find(|d| d.kind == "image" && d.render_relevant)
+        .unwrap();
+    assert_eq!(image.status, "external");
+    assert_eq!(
+        fs::canonicalize(image.source_path.as_ref().unwrap()).unwrap(),
+        fs::canonicalize(root.path().join("external.png")).unwrap()
+    );
+    assert!(guard_preview(&output).is_ok());
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn preview_reloads_nested_external_relative_linked_geometry() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), true, false);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); external=root.parent/'external'; (external/'nested').mkdir(parents=True)
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.ops.mesh.primitive_cube_add()
+cube=bpy.context.object; cube.name='LinkedCube'
+geometry=bpy.data.collections.new('Geometry'); bpy.context.scene.collection.children.link(geometry)
+for collection in list(cube.users_collection): collection.objects.unlink(cube)
+geometry.objects.link(cube)
+image=bpy.data.images.load(str(root.parent/'external.png')); image.filepath='//../../external.png'
+material=bpy.data.materials.new('Linked Material'); material.use_nodes=True
+node=material.node_tree.nodes.new('ShaderNodeTexImage'); node.image=image
+material.node_tree.links.new(node.outputs['Color'],material.node_tree.nodes['Principled BSDF'].inputs['Base Color'])
+cube.data.materials.append(material)
+bpy.context.preferences.filepaths.save_version=0
+bpy.ops.wm.save_as_mainfile(filepath=str(external/'nested/geometry.blend'),check_existing=False)
+bpy.ops.wm.read_factory_settings(use_empty=True)
+parent=bpy.data.collections.new('Parent'); bpy.context.scene.collection.children.link(parent)
+with bpy.data.libraries.load(str(external/'nested/geometry.blend'),link=True) as (source,destination): destination.collections=source.collections
+for collection in destination.collections: parent.children.link(collection)
+bpy.data.libraries[0].filepath='//nested/geometry.blend'
+bpy.ops.wm.save_as_mainfile(filepath=str(external/'parent.blend'),check_existing=False)
+bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+with bpy.data.libraries.load(str(external/'parent.blend'),link=True) as (source,destination): destination.collections=['Parent']
+bpy.context.scene.collection.children.link(destination.collections[0])
+next(lib for lib in bpy.data.libraries if Path(lib.filepath).name=='parent.blend').filepath='//../external/parent.blend'
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+    );
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let staged = root.path().join("temporary/deep/source");
+    fs::create_dir_all(&staged).unwrap();
+    fs::copy(workspace.join("main.blend"), staged.join("main.blend")).unwrap();
+    let output = root.path().join("linked-preview.glb");
+    let inspection = BlenderRunner::new(executable())
+        .preview_glb(
+            &staged,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    assert_eq!(inspection.geometry.mesh_objects, 3);
+    for filename in ["parent.blend", "geometry.blend"] {
+        assert!(
+            inspection.dependencies.iter().any(|d| d.kind == "library"
+                && d.render_relevant
+                && d.status == "external"
+                && d.source_path
+                    .as_deref()
+                    .is_some_and(|p| p.ends_with(filename))),
+            "{:?}",
+            inspection.dependencies
+        );
+    }
+    assert!(guard_preview(&output).is_ok());
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
 #[test]
 #[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
 fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
@@ -173,6 +437,7 @@ fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
     let inspection = runner.inspect(&workspace, &config, &context).unwrap();
     assert_eq!(inspection.geometry.mesh_objects, 1);
     assert_eq!(inspection.geometry.vertices, 8);
+    assert_eq!(inspection.geometry.edges, Some(12));
     assert_eq!(inspection.geometry.faces, 6);
     assert_eq!(inspection.geometry.triangles, 12);
     assert!(inspection.collections.contains(&"Asset".into()));
