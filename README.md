@@ -1,0 +1,73 @@
+# Edge Lock
+
+Edge Lock est une application desktop Windows pour centraliser des dossiers d’assets 3D, enregistrer leurs versions et conserver plusieurs variantes indépendantes. Le MVP fonctionne localement, avec Rust, Tauri 2, React et SQLite.
+
+## Installation Windows
+
+L’installateur **0.1.0 x64** construit localement se trouve dans `target/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque est choisie au premier lancement et reste séparée de l’application. WebView2 est requis. Blender est facultatif pour gérer et versionner les dossiers et les GLB, mais requis pour les opérations sur les `.blend`.
+
+Le binaire et l’installateur ont été construits et leur version vérifiée. L’installation et la mise à niveau en VM jetable restent à valider ; voir [le bilan de validation](docs/validation.md).
+
+## Utilisation
+
+1. Choisir un dossier vide pour créer une bibliothèque, ou ouvrir une bibliothèque Edge Lock existante. Utiliser un disque local ; une seule instance peut ouvrir une même bibliothèque.
+2. Dans les réglages, sélectionner `blender.exe`. Blender est nécessaire pour créer un projet `.blend`, analyser un `.blend` et le convertir en GLB. Un GLB autonome fonctionne sans Blender.
+3. **Importer un dossier** copie son contenu intégral dans la bibliothèque et crée une première version. Utiliser le sélecteur ou déposer un dossier dans la fenêtre, puis confirmer l’import. Le dossier d’origine est conservé. Un unique `.blend` devient automatiquement principal ; à défaut de `.blend`, un unique `.glb` est choisi. En présence de plusieurs `.blend`, choisir explicitement le fichier à utiliser.
+4. **Nouveau projet** crée `main.blend` avec Blender et des dossiers pour textures, références, rapports et captures. Le projet est immédiatement géré par Edge Lock.
+5. Ouvrir le dossier ou le fichier Blender depuis la fiche d’asset. Copier le chemin du dossier pour le transmettre à un agent IA. Enregistrer les modifications dans Blender, puis utiliser **Créer une version** avec un message.
+6. Choisir une ancienne version pour l’inspecter, l’exporter ou **Créer une variante**. Chaque variante possède son propre dossier stable ; créer une variante ne remplace pas le travail courant.
+
+Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieurs tags et plusieurs projets de jeu. Recherche, filtres, tri, archivage et historique paginé permettent de parcourir la bibliothèque. L’archivage conserve les fichiers et les versions.
+
+## Aperçu et export
+
+L’aperçu 3D fournit navigation orbitale et lecture des animations GLB. L’analyse affiche objets maillés, sommets, faces et triangles. Les calculs sont lancés à la demande ; la bibliothèque ne prétend pas connaître la géométrie d’un fichier encore non analysé.
+
+Pour un `.blend`, choisir le fichier principal, éventuellement une scène et une collection racine. Les sous-collections sont incluses. L’application des modificateurs à l’export est désactivée par défaut pour préserver les shape keys et animations compatibles avec glTF. Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
+
+Un export peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les dépendances externes ou absentes sont signalées ; les exports Blender avec de telles dépendances sont refusés. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur.
+
+Le fichier GLB final est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner l’asset. Les GLB qui exigent des ressources externes ou des extensions non prises en charge sont refusés par l’inspecteur.
+
+## Stockage et limites du MVP
+
+- Versions immuables avec déduplication des fichiers identiques par BLAKE3. Ce n’est pas un dépôt Git ; il n’existe ni fusion, ni rebase, ni synchronisation distante.
+- Un `.blend` modifié est stocké intégralement à nouveau. Les textures inchangées sont partagées dans l’historique. Chaque variante dispose toutefois d’une copie physique de travail.
+- Tous les fichiers ordinaires du dossier sont conservés, y compris références, rapports, captures et sauvegardes `.blend1`. Les dossiers vides sont conservés. Les liens symboliques, junctions et fichiers spéciaux sont refusés.
+- Les snapshots sont manuels et portent sur les données déjà enregistrées sur disque. Les écritures concurrentes détectées font réessayer puis échouer la capture ; le MVP ne peut pas figer atomiquement un dossier modifié par un programme externe.
+- Une bibliothèque active à la fois, Windows comme plateforme validée, aucun serveur ni compte. Bibliothèques réseau et dossiers synchronisés à chaud non pris en charge.
+- Aucune suppression définitive ni récupération automatique d’espace historique. L’historique local ne remplace pas une sauvegarde sur un autre support.
+
+Voir [le format de stockage et la sauvegarde](docs/storage.md), [l’architecture](docs/architecture.md) et [les validations réellement exécutées](docs/validation.md).
+
+## Développement
+
+Prérequis : Windows, outils de compilation C++ MSVC et SDK Windows, WebView2, Rust via rustup, Node.js et npm. Les versions de référence sont Rust **1.99.1** (`rust-toolchain.toml`) et Node **26.13.0** (`.node-version`). `Cargo.lock` et `package-lock.json` fixent les dépendances résolues. Blender est installé séparément.
+
+```powershell
+npm ci
+npm run tauri dev
+```
+
+Si la distribution Node portable préparée pour ce dépôt est présente, on peut la sélectionner uniquement pour le terminal courant :
+
+```powershell
+$env:Path = "$PWD\.tools\node-v26.13.0-win-x64;$env:Path"
+```
+
+Vérifications et production de l’application :
+
+```powershell
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+npm test
+npm run lint
+npm run format:check
+npm run build
+npm run tauri build
+```
+
+`npm run dev` seul lance uniquement l’interface web ; les opérations de bibliothèque nécessitent l’application Tauri. La construction Tauri produit l’exécutable dans `target/release/` et l’installateur NSIS dans `target/release/bundle/nsis/`. L’installateur vise l’utilisateur courant. Les données sont stockées dans la bibliothèque choisie, séparément du dossier d’installation.
+
+Les tests Blender, desktop WebView2, performance et installation isolée demandent des prérequis supplémentaires ; leurs commandes et limites sont détaillées dans [docs/validation.md](docs/validation.md).

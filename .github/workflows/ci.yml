@@ -1,0 +1,158 @@
+name: Windows validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Tests, desktop and installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CI: true
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the pinned Node.js LTS
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          # rustup reads rust-toolchain.toml, including rustfmt and clippy.
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: windows-msvc
+          cache-on-failure: true
+
+      - name: Install frontend dependencies from the lockfile
+        run: npm ci
+
+      - name: Check frontend formatting
+        run: npm run format:check
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Check TypeScript contracts
+        run: npm run typecheck
+
+      - name: Test frontend behavior
+        run: npm test
+
+      - name: Build frontend assets
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test Rust storage and application contracts
+        run: cargo test --workspace --locked
+
+      - name: Build the real desktop test application
+        # The Tauri build embeds dist in the debug binary. Plain cargo build
+        # would otherwise leave a development URL requiring a running Vite server.
+        run: npm run tauri -- build --debug --no-bundle --ci
+
+      - name: Install the pinned Tauri WebDriver
+        run: cargo install tauri-driver --version 2.1.0 --locked --root .tools/tauri-driver
+
+      - name: Install Edge WebDriver matching the WebView2 runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taskRuntimeRoots = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\EdgeWebView\Application'),
+            (Join-Path $env:ProgramFiles 'Microsoft\EdgeWebView\Application'),
+            (Join-Path $env:LOCALAPPDATA 'Microsoft\EdgeWebView\Application')
+          )
+          $taskRuntime = $taskRuntimeRoots |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory } |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'msedgewebview2.exe')) } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-not $taskRuntime) { throw 'WebView2 Runtime is required on the Windows runner.' }
+          $taskVersion = $taskRuntime.Name
+          $taskDriverDir = Join-Path $env:GITHUB_WORKSPACE '.tools\webdriver'
+          New-Item -ItemType Directory -Path $taskDriverDir -Force | Out-Null
+          $taskArchive = Join-Path $env:RUNNER_TEMP 'edge-lock-edgedriver.zip'
+          Invoke-WebRequest -Uri "https://msedgedriver.microsoft.com/$taskVersion/edgedriver_win64.zip" -OutFile $taskArchive -MaximumRetryCount 3
+          Expand-Archive -LiteralPath $taskArchive -DestinationPath $taskDriverDir -Force
+          $taskDriverExe = Join-Path $taskDriverDir 'msedgedriver.exe'
+          $taskReportedVersion = & $taskDriverExe --version
+          if ($LASTEXITCODE -ne 0 -or $taskReportedVersion -notmatch '(\d+\.\d+\.\d+)\.\d+') { throw 'Unable to verify Edge WebDriver version.' }
+          $taskDriverPrefix = $Matches[1]
+          $taskRuntimePrefix = ($taskVersion -split '\.')[0..2] -join '.'
+          if ($taskDriverPrefix -ne $taskRuntimePrefix) { throw "Driver/runtime mismatch: $taskReportedVersion / $taskVersion" }
+          Write-Host "WebView2 $taskVersion; $taskReportedVersion"
+          # Freeze the runtime choice for this test so an Evergreen update
+          # cannot select a different installed runtime after driver download.
+          "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=$($taskRuntime.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run real Windows desktop scenarios
+        run: npm run test:desktop
+
+      - name: Build the release NSIS installer
+        # Sequential with debug/E2E and other Cargo invocations by design.
+        run: npm run tauri -- build --bundles nsis --ci
+
+      - name: Verify installation and reinstallation on the disposable runner
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taskInstaller = Get-ChildItem -LiteralPath 'target/release/bundle/nsis' -Filter '*.exe' -File | Select-Object -First 1
+          $taskDesktopFixture = Get-ChildItem -LiteralPath '.test-data' -Directory -Filter 'desktop-*' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $taskInstaller -or -not $taskDesktopFixture) { throw 'Installer or disposable desktop fixture is missing.' }
+          & ./scripts/test-installer.ps1 -InstallerPath $taskInstaller.FullName -FixtureLibraryPath (Join-Path $taskDesktopFixture.FullName 'library') -DisposableEnvironment |
+            Tee-Object -FilePath '.test-data/installer-report.json'
+
+      - name: Save desktop diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-test-diagnostics
+          path: |
+            .test-data/desktop-*/*.png
+            .test-data/desktop-*/report.json
+            .test-data/desktop-*/driver.log
+            .test-data/installer-report.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Save the verified Windows installer
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: edge-lock-windows-x64
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/edge-lock.exe
+          if-no-files-found: error
+          retention-days: 14

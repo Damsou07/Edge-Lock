@@ -1,0 +1,814 @@
+import { useCallback, useEffect, useState } from "react";
+import { api } from "./api";
+import type {
+  Asset,
+  AssetFilter,
+  AssetPage,
+  Bootstrap,
+  Category,
+  JobRequest,
+  Taxonomy,
+} from "./contracts";
+import { Icon } from "./components/Icon";
+import { Jobs } from "./components/Jobs";
+import {
+  CreateAssetModal,
+  SettingsModal,
+  TaxonomyModal,
+} from "./components/AssetForms";
+import { AssetDetailView } from "./components/AssetDetailView";
+import {
+  errorMessage,
+  formatBytes,
+  formatCount,
+  formatDate,
+} from "./lib/format";
+import { useJobs } from "./lib/useJobs";
+
+const initialFilter: AssetFilter = {
+  search: "",
+  categoryId: null,
+  gameId: null,
+  tag: null,
+  sort: "updated",
+  archived: false,
+  offset: 0,
+  limit: 36,
+};
+const emptyTaxonomy: Taxonomy = { categories: [], games: [], tags: [] };
+
+function CategoryTree({
+  categories,
+  parentId = null,
+  selected,
+  onSelect,
+  depth = 0,
+}: {
+  categories: Category[];
+  parentId?: string | null;
+  selected: string | null;
+  onSelect: (id: string) => void;
+  depth?: number;
+}) {
+  if (depth > 12) return null;
+  return categories
+    .filter((category) => category.parentId === parentId)
+    .map((category) => (
+      <div key={category.id}>
+        <button
+          className={`nav-item category-item ${selected === category.id ? "active" : ""}`}
+          style={{ paddingLeft: 15 + depth * 16 }}
+          onClick={() => onSelect(category.id)}
+        >
+          <Icon name="folder" size={16} />
+          <span>{category.name}</span>
+        </button>
+        <CategoryTree
+          categories={categories}
+          parentId={category.id}
+          selected={selected}
+          onSelect={onSelect}
+          depth={depth + 1}
+        />
+      </div>
+    ));
+}
+
+function AssetCard({
+  asset,
+  onSelect,
+  list,
+}: {
+  asset: Asset;
+  onSelect: (id: string) => void;
+  list: boolean;
+}) {
+  return (
+    <button
+      className={`asset-card ${list ? "asset-row" : ""}`}
+      onClick={() => onSelect(asset.id)}
+    >
+      <div className="asset-thumbnail">
+        <div className="asset-wireframe">
+          <Icon name="cube" size={list ? 26 : 64} />
+        </div>
+        <span className="asset-type">3D ASSET</span>
+        {asset.archived && <span className="archived-badge">Archivé</span>}
+      </div>
+      <div className="asset-card-content">
+        <div className="asset-title">
+          <h3>{asset.name}</h3>
+          <Icon name="chevron" size={15} />
+        </div>
+        <div className="asset-tags">
+          {asset.tags.length ? (
+            asset.tags.slice(0, 3).map((tag) => <span key={tag}>{tag}</span>)
+          ) : (
+            <span className="untagged">Sans tag</span>
+          )}
+        </div>
+        <div className="asset-card-stats">
+          <span>
+            <Icon name="database" size={13} />
+            {formatBytes(asset.workingBytes)}
+          </span>
+          <span title="Triangles">
+            <Icon name="mesh" size={13} />
+            {formatCount(asset.triangles)}
+          </span>
+        </div>
+      </div>
+      <div className="asset-card-footer">
+        <span>
+          <Icon name="branch" size={13} />
+          {asset.variantCount}{" "}
+          {asset.variantCount > 1 ? "variantes" : "variante"}
+        </span>
+        <span>{formatDate(asset.updatedAt)}</span>
+      </div>
+    </button>
+  );
+}
+
+export default function App() {
+  const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [opening, setOpening] = useState(false);
+  const [taxonomy, setTaxonomy] = useState<Taxonomy>(emptyTaxonomy);
+  const [filter, setFilter] = useState<AssetFilter>(initialFilter);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState<AssetPage>({ items: [], total: 0 });
+  const [assetsLoading, setAssetsLoading] = useState(false);
+  const [view, setView] = useState<"grid" | "list">("grid");
+  const [selected, setSelected] = useState<string | null>(null);
+  const [modal, setModal] = useState<
+    "import" | "create" | "settings" | "category" | "game" | null
+  >(null);
+  const [importSource, setImportSource] = useState("");
+  const [generation, setGeneration] = useState(0);
+  const { jobs, runJob: runBaseJob, dismiss } = useJobs();
+  const library = bootstrap?.library;
+  const refresh = useCallback(() => setGeneration((value) => value + 1), []);
+  const runJob = useCallback(
+    async <T = unknown,>(request: JobRequest): Promise<T> => {
+      const result = await runBaseJob<T>(request);
+      if (
+        [
+          "import",
+          "create",
+          "variant",
+          "snapshot",
+          "inspect",
+          "preview",
+        ].includes(request.kind)
+      ) {
+        try {
+          setBootstrap(await api.bootstrap());
+        } catch (reason) {
+          setError(errorMessage(reason));
+        }
+        refresh();
+      }
+      return result;
+    },
+    [runBaseJob, refresh],
+  );
+
+  useEffect(() => {
+    let active = true;
+    void api
+      .bootstrap()
+      .then((value) => {
+        if (active) {
+          setBootstrap(value);
+          if (value.startupError) setError(value.startupError);
+        }
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+  useEffect(() => {
+    const timer = setTimeout(
+      () => setFilter((previous) => ({ ...previous, search, offset: 0 })),
+      220,
+    );
+    return () => clearTimeout(timer);
+  }, [search]);
+  useEffect(() => {
+    if (!library) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void api
+      .onFolderDrop((paths) => {
+        const path = paths[0];
+        if (!active || !path) return;
+        if (paths.length !== 1) {
+          setError("Déposez un seul dossier à la fois.");
+          return;
+        }
+        if (modal) {
+          setError("Fermez le formulaire ouvert avant de déposer un dossier.");
+          return;
+        }
+        setError("");
+        setImportSource(path);
+        setModal("import");
+      })
+      .then((cleanup) => {
+        if (active) unlisten = cleanup;
+        else cleanup();
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [library, modal]);
+  useEffect(() => {
+    if (!library) return;
+    let active = true;
+    void api
+      .getTaxonomy()
+      .then((value) => {
+        if (active) setTaxonomy(value);
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [library, generation]);
+  useEffect(() => {
+    if (!library) return;
+    let active = true;
+    setAssetsLoading(true);
+    void api
+      .listAssets(filter)
+      .then((value) => {
+        if (active) setPage(value);
+      })
+      .catch((reason) => {
+        if (active) setError(errorMessage(reason));
+      })
+      .finally(() => {
+        if (active) setAssetsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [library, filter, generation]);
+
+  const openLibrary = async () => {
+    setError("");
+    setOpening(true);
+    try {
+      const path = await api.chooseFolder();
+      if (path) {
+        const value = await api.openLibrary(path);
+        setBootstrap((previous) => ({
+          settings: {
+            libraryPath: path,
+            blenderPath: previous?.settings.blenderPath ?? null,
+          },
+          library: value,
+          startupError: null,
+          version: previous?.version ?? "0.1.0",
+        }));
+        setSelected(null);
+        setFilter(initialFilter);
+        setSearch("");
+        refresh();
+      }
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setOpening(false);
+    }
+  };
+  const changeFilter = (patch: Partial<AssetFilter>) => {
+    setFilter((previous) => ({ ...previous, ...patch, offset: 0 }));
+    setSelected(null);
+  };
+  const resetFilters = () => {
+    setSearch("");
+    setFilter(initialFilter);
+    setSelected(null);
+  };
+  const selectedCategory = taxonomy.categories.find(
+    (item) => item.id === filter.categoryId,
+  );
+  const selectedGame = taxonomy.games.find((item) => item.id === filter.gameId);
+  const heading =
+    selectedCategory?.name ??
+    selectedGame?.name ??
+    (filter.archived ? "Archives" : "Tous les assets");
+  const hasFilters = !!(
+    filter.search ||
+    filter.categoryId ||
+    filter.gameId ||
+    filter.tag ||
+    filter.archived
+  );
+  const hasRunningJobs = jobs.some(
+    (job) => job.status === "running" || job.status === "queued",
+  );
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <a
+          className="brand"
+          href="#"
+          onClick={(event) => {
+            event.preventDefault();
+            resetFilters();
+          }}
+        >
+          <img src="/edge-lock-icon.png" alt="" />
+          <div>
+            <strong>EDGE LOCK</strong>
+            <span>YOUR CREATIVE VAULT</span>
+          </div>
+        </a>
+        <div className="library-switch">
+          <Icon name="database" size={17} />
+          <div>
+            <strong>Bibliothèque locale</strong>
+            <span>
+              {library
+                ? library.root.split(/[\\/]/).filter(Boolean).at(-1)
+                : "Aucun dossier ouvert"}
+            </span>
+          </div>
+          <span className={`connection-dot ${library ? "connected" : ""}`} />
+        </div>
+        <nav className="sidebar-nav" aria-label="Navigation principale">
+          <div className="nav-section-label">BIBLIOTHÈQUE</div>
+          <button
+            className={`nav-item ${!filter.categoryId && !filter.gameId && !filter.archived && !selected ? "active" : ""}`}
+            onClick={resetFilters}
+          >
+            <Icon name="grid" />
+            <span>Tous les assets</span>
+            {library && (
+              <span className="nav-count">
+                {!hasFilters ? page.total : library.assetCount}
+              </span>
+            )}
+          </button>
+          <div className="nav-section-heading">
+            <span>CATÉGORIES</span>
+            <button
+              className="icon-button"
+              aria-label="Créer une catégorie"
+              disabled={!library}
+              onClick={() => setModal("category")}
+            >
+              <Icon name="plus" size={15} />
+            </button>
+          </div>
+          <CategoryTree
+            categories={taxonomy.categories}
+            selected={filter.categoryId}
+            onSelect={(id) =>
+              changeFilter({ categoryId: id, gameId: null, archived: false })
+            }
+          />
+          {!taxonomy.categories.length && (
+            <p className="sidebar-hint">Donnez une place à chaque création.</p>
+          )}
+          <div className="nav-section-heading">
+            <span>PROJETS DE JEU</span>
+            <button
+              className="icon-button"
+              aria-label="Créer un projet de jeu"
+              disabled={!library}
+              onClick={() => setModal("game")}
+            >
+              <Icon name="plus" size={15} />
+            </button>
+          </div>
+          {taxonomy.games.map((game) => (
+            <button
+              key={game.id}
+              className={`nav-item ${filter.gameId === game.id ? "active" : ""}`}
+              onClick={() =>
+                changeFilter({
+                  gameId: game.id,
+                  categoryId: null,
+                  archived: false,
+                })
+              }
+            >
+              <Icon name="game" size={17} />
+              <span>{game.name}</span>
+            </button>
+          ))}
+          {!taxonomy.games.length && (
+            <p className="sidebar-hint">Retrouvez les assets de vos jeux.</p>
+          )}
+          <div className="nav-divider" />
+          <button
+            className={`nav-item ${filter.archived ? "active" : ""}`}
+            onClick={() =>
+              changeFilter({ archived: true, gameId: null, categoryId: null })
+            }
+          >
+            <Icon name="archive" size={17} />
+            <span>Archives</span>
+          </button>
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="storage-card">
+            <Icon name="database" size={17} />
+            <div>
+              <strong>
+                {library
+                  ? `${formatBytes(library.physicalBytes)} sur disque`
+                  : "Votre espace, vos fichiers."}
+              </strong>
+              <span>
+                {library
+                  ? "Total de la bibliothèque"
+                  : "Stockage local · Aucun cloud"}
+              </span>
+            </div>
+          </div>
+          <button className="nav-item" onClick={() => setModal("settings")}>
+            <Icon name="settings" size={17} />
+            <span>Réglages</span>
+            <span className="version">v{bootstrap?.version ?? "0.1.0"}</span>
+          </button>
+        </div>
+      </aside>
+      <main className="main-area">
+        <header className="topbar">
+          <div className="breadcrumb">
+            <Icon name="folder" size={16} />
+            <span>Bibliothèque</span>
+            <Icon name="chevron" size={13} />
+            <strong>{selected ? "Fiche de l’asset" : heading}</strong>
+          </div>
+          <div className="local-status">
+            <span className="live-dot" />
+            Tout reste sur votre ordinateur
+          </div>
+        </header>
+        {error && (
+          <div className="error-banner" role="alert">
+            <Icon name="warning" />
+            <span>{error}</span>
+            <button
+              className="icon-button"
+              aria-label="Masquer l’erreur"
+              onClick={() => setError("")}
+            >
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+        )}
+        {library?.recoveryNotices.map((notice) => (
+          <div className="notice-banner" key={notice}>
+            <Icon name="history" size={16} />
+            {notice}
+          </div>
+        ))}
+        {loading ? (
+          <div className="page-loader">
+            <Icon name="refresh" size={28} className="spinning" />
+            <p>Ouverture de votre espace…</p>
+          </div>
+        ) : !library ? (
+          <section className="onboarding">
+            <div className="onboarding-art">
+              <img src="/edge-lock-icon.png" alt="Cube Edge Lock" />
+              <div className="art-caption">
+                <span className="live-dot" />
+                UN ESPACE POUR CRÉER
+              </div>
+            </div>
+            <div className="onboarding-content">
+              <span className="eyebrow">BIENVENUE DANS EDGE LOCK</span>
+              <h1>
+                Vos créations,
+                <br />
+                au même endroit.
+              </h1>
+              <p>
+                Centralisez vos assets 3D, gardez chaque version et explorez vos
+                variantes. Vos fichiers restent de vrais dossiers, prêts pour
+                Blender.
+              </p>
+              <div className="onboarding-points">
+                <span>
+                  <Icon name="branch" />
+                  Des variantes indépendantes
+                </span>
+                <span>
+                  <Icon name="history" />
+                  Un historique qui préserve votre travail
+                </span>
+                <span>
+                  <Icon name="database" />
+                  Une bibliothèque entièrement locale
+                </span>
+              </div>
+              <button
+                className="button primary large"
+                disabled={opening}
+                onClick={() => void openLibrary()}
+              >
+                <Icon
+                  name={opening ? "refresh" : "folder"}
+                  className={opening ? "spinning" : ""}
+                />
+                {opening ? "Ouverture…" : "Choisir un dossier"}
+                <Icon name="arrow" size={16} />
+              </button>
+              <p className="onboarding-note">
+                Choisissez un dossier vide pour commencer, ou une bibliothèque
+                Edge Lock existante.
+              </p>
+            </div>
+          </section>
+        ) : selected ? (
+          <AssetDetailView
+            id={selected}
+            taxonomy={taxonomy}
+            generation={generation}
+            onBack={() => setSelected(null)}
+            onChanged={refresh}
+            onError={setError}
+            runJob={runJob}
+          />
+        ) : (
+          <section className="library-content">
+            <div className="page-heading">
+              <div>
+                <span className="eyebrow">VOTRE ESPACE DE CRÉATION</span>
+                <h1>
+                  {heading}
+                  <span className="heading-count">{page.total}</span>
+                </h1>
+                <p>
+                  {selectedGame
+                    ? "Les créations qui donnent vie à votre univers."
+                    : "Chaque asset. Chaque version. Toujours à portée de main."}
+                </p>
+              </div>
+              <div className="heading-actions">
+                <button
+                  className="button secondary"
+                  onClick={() => setModal("import")}
+                >
+                  <Icon name="import" />
+                  Importer
+                </button>
+                <button
+                  className="button primary"
+                  onClick={() => setModal("create")}
+                >
+                  <Icon name="plus" />
+                  Nouvel asset
+                </button>
+              </div>
+            </div>
+            <div className="library-toolbar">
+              <div className="search-field">
+                <Icon name="search" size={18} />
+                <input
+                  type="search"
+                  aria-label="Rechercher des assets"
+                  value={search}
+                  placeholder="Rechercher un asset…"
+                  onChange={(event) => setSearch(event.target.value)}
+                />
+                {search && (
+                  <button
+                    className="icon-button"
+                    aria-label="Effacer la recherche"
+                    onClick={() => setSearch("")}
+                  >
+                    <Icon name="close" size={14} />
+                  </button>
+                )}
+              </div>
+              <select
+                aria-label="Filtrer par tag"
+                value={filter.tag ?? ""}
+                onChange={(event) =>
+                  changeFilter({ tag: event.target.value || null })
+                }
+              >
+                <option value="">Tous les tags</option>
+                {taxonomy.tags.map((tag) => (
+                  <option value={tag} key={tag}>
+                    {tag}
+                  </option>
+                ))}
+              </select>
+              <select
+                aria-label="Trier les assets"
+                value={filter.sort}
+                onChange={(event) =>
+                  changeFilter({
+                    sort: event.target.value as AssetFilter["sort"],
+                  })
+                }
+              >
+                <option value="updated">Récemment modifiés</option>
+                <option value="name">Nom A → Z</option>
+                <option value="size">Taille du dossier</option>
+                <option value="triangles">Nombre de triangles</option>
+              </select>
+              <div
+                className="view-switch"
+                role="group"
+                aria-label="Mode d’affichage"
+              >
+                <button
+                  className={view === "grid" ? "selected" : ""}
+                  aria-label="Vue grille"
+                  aria-pressed={view === "grid"}
+                  onClick={() => setView("grid")}
+                >
+                  <Icon name="grid" size={17} />
+                </button>
+                <button
+                  className={view === "list" ? "selected" : ""}
+                  aria-label="Vue liste"
+                  aria-pressed={view === "list"}
+                  onClick={() => setView("list")}
+                >
+                  <Icon name="list" size={18} />
+                </button>
+              </div>
+            </div>
+            {hasFilters && (
+              <div className="active-filters">
+                <span>
+                  {page.total} {page.total === 1 ? "résultat" : "résultats"}
+                </span>
+                {filter.tag && (
+                  <span className="tag-chip">
+                    <Icon name="tag" size={12} />
+                    {filter.tag}
+                  </span>
+                )}
+                <button className="text-button" onClick={resetFilters}>
+                  Réinitialiser les filtres
+                </button>
+              </div>
+            )}
+            <div
+              className={
+                assetsLoading ? "asset-results is-loading" : "asset-results"
+              }
+              aria-busy={assetsLoading}
+            >
+              {page.items.length ? (
+                <div className={view === "grid" ? "asset-grid" : "asset-list"}>
+                  {page.items.map((asset) => (
+                    <AssetCard
+                      asset={asset}
+                      key={asset.id}
+                      list={view === "list"}
+                      onSelect={setSelected}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state">
+                  <div className="empty-icon">
+                    <Icon name={hasFilters ? "search" : "cube"} size={34} />
+                  </div>
+                  <span className="eyebrow">
+                    {hasFilters ? "UN PEU PLUS LOIN ?" : "TOUT COMMENCE ICI"}
+                  </span>
+                  <h2>
+                    {hasFilters
+                      ? "Aucun asset trouvé"
+                      : "La place de votre prochaine création."}
+                  </h2>
+                  <p>
+                    {hasFilters
+                      ? "Essayez un autre nom, un autre tag ou retirez les filtres."
+                      : "Importez un dossier existant ou créez votre premier asset. Ses fichiers et son historique seront réunis ici."}
+                  </p>
+                  <button
+                    className="button secondary"
+                    onClick={
+                      hasFilters ? resetFilters : () => setModal("import")
+                    }
+                  >
+                    <Icon name={hasFilters ? "refresh" : "import"} />
+                    {hasFilters
+                      ? "Réinitialiser les filtres"
+                      : "Importer mon premier asset"}
+                  </button>
+                </div>
+              )}
+            </div>
+            {page.total > filter.limit && (
+              <div className="pagination">
+                <span>
+                  {filter.offset + 1}–
+                  {Math.min(filter.offset + filter.limit, page.total)} sur{" "}
+                  {page.total}
+                </span>
+                <button
+                  className="button secondary small-button"
+                  disabled={filter.offset === 0}
+                  onClick={() =>
+                    setFilter((previous) => ({
+                      ...previous,
+                      offset: Math.max(0, previous.offset - previous.limit),
+                    }))
+                  }
+                >
+                  Précédent
+                </button>
+                <button
+                  className="button secondary small-button"
+                  disabled={filter.offset + filter.limit >= page.total}
+                  onClick={() =>
+                    setFilter((previous) => ({
+                      ...previous,
+                      offset: previous.offset + previous.limit,
+                    }))
+                  }
+                >
+                  Suivant
+                </button>
+              </div>
+            )}
+            <div className="library-footer">
+              <span>
+                <Icon name="check" size={13} />
+                Dossiers accessibles dans l’Explorateur et Blender
+              </span>
+              <button
+                className="text-button"
+                disabled={opening || hasRunningJobs}
+                onClick={() => void openLibrary()}
+              >
+                Ouvrir une autre bibliothèque
+              </button>
+            </div>
+          </section>
+        )}
+      </main>
+      <Jobs jobs={jobs} dismiss={dismiss} onError={setError} />
+      {(modal === "import" || modal === "create") && (
+        <CreateAssetModal
+          mode={modal}
+          initialSource={modal === "import" ? importSource : ""}
+          runJob={runJob}
+          onClose={() => {
+            setModal(null);
+            setImportSource("");
+          }}
+        />
+      )}
+      {(modal === "category" || modal === "game") && (
+        <TaxonomyModal
+          kind={modal}
+          taxonomy={taxonomy}
+          onClose={() => setModal(null)}
+          onSaved={refresh}
+        />
+      )}
+      {modal === "settings" && (
+        <SettingsModal
+          settings={
+            bootstrap?.settings ?? { libraryPath: null, blenderPath: null }
+          }
+          libraryPath={library?.root ?? null}
+          version={bootstrap?.version ?? "0.1.0"}
+          onClose={() => setModal(null)}
+          onChanged={(path) =>
+            setBootstrap((previous) =>
+              previous
+                ? {
+                    ...previous,
+                    settings: { ...previous.settings, blenderPath: path },
+                  }
+                : previous,
+            )
+          }
+        />
+      )}
+    </div>
+  );
+}
