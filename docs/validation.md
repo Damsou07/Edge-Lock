@@ -1,8 +1,79 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les fixtures sont synthétiques, à l’exception d’une copie importée de Sniper Kitsune dans une bibliothèque jetable ; ses 72 fichiers personnels ont été contrôlés par hash et date avant/après, sans modification. Les résultats ci-dessous ont été observés le 1er novembre 2026 sur le poste Windows de développement.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le bilan du 2 novembre 2026 concerne les aperçus automatiques texturés et les vignettes. Le bilan du 1er novembre est conservé plus bas comme historique ; ses mesures, binaires et hashes ne décrivent pas la nouvelle livraison.
 
-## Contrôles reproductibles
+## Actualisation — 2 novembre 2026
+
+### Vérifications exécutées
+
+- **70 tests frontend passent dans huit fichiers**, avec les régressions d’aperçu automatique, de changement de sélection, de configuration, de priorité des tâches, de vignettes, d’annulation et de nettoyage des ressources.
+- **56 tests Rust passent dans la suite ordinaire.** Les intégrations nécessitant Blender restent séparées de cette commande.
+- **12 intégrations Blender 5.1.1 passent**, exécutées explicitement avec `--ignored` : huit scénarios du worker et quatre scénarios du cache.
+- Les **deux tests Node** des fixtures `scripts/e2e-fixtures.test.mjs` passent : PNG dans un buffer et PNG en data URI, avec UV et matériau relié à l’image.
+- ESLint, TypeScript, Prettier, `cargo clippy --workspace --all-targets -- -D warnings` et `cargo fmt --all --check` passent.
+- Les builds Vite, Tauri **debug** et **release**, ainsi que la génération de l’installateur NSIS, passent. Les versions et architectures des artefacts produits ont été vérifiées.
+
+### Rendu texturé dans la véritable WebView2
+
+Un défaut de textures a été reproduit : le modèle apparaissait blanc parce que la CSP n’autorisait pas `blob:` dans `connect-src`, utilisé pour charger les images incorporées au GLB. La correction autorise aussi les images embarquées en `data:`, acceptées par l’inspecteur et chargées par le même mécanisme. Le parcours desktop vérifie les couleurs d’une texture PNG rouge et verte dans les captures de la vignette et de l’aperçu automatique, pour les deux modes d’incorporation.
+
+Le rapport final local `.test-data/desktop-aNs9mN/report.json` porte `status: passed` pour **onze parcours**. Il couvre import et dépôt, rendu texturé buffer/data URI, commandes de la visionneuse, dix allers-retours bibliothèque/fiche, galerie de 50 assets, versions et variantes, export protégé, Blender réel et redémarrage. La vignette texturée reste disponible après redémarrage et son cache est réutilisé sans réécriture.
+
+| Capture | Pixels verts détectés | Pixels rouges détectés |
+| --- | --- | --- |
+| Vignette statique | 2 040 | 1 621 |
+| Aperçu automatique dans la fiche | 9 854 | 7 598 |
+| Vignette et fiche avec texture en data URI | 2 040 / 9 854 | 1 621 / 7 598 |
+| Vignette après redémarrage | 2 040 | 1 623 |
+
+Le contrôle initial de l’ancien `HEAD`, avant implémentation, a également réussi ses **six parcours** : `.test-data/desktop-tnizdz/report.json`. Ce contrôle vérifie le fonctionnement de départ ; il ne constitue pas un benchmark avant/après sur des modèles réels. Ces rapports et leurs captures restent locaux et sont exclus du dépôt.
+
+### Temps et ressources observés
+
+Ces mesures proviennent des fixtures synthétiques du rapport `desktop-aNs9mN`, sur ce poste Windows. Les temps incluent la navigation et le polling WebDriver. Le premier aperçu de la fiche peut réutiliser un GLB déjà préparé par la galerie ; la conversion Blender à froid est mesurée séparément.
+
+| Mesure | Résultat observé |
+| --- | --- |
+| Première vignette visible | 1,271 s |
+| Premier aperçu automatique de la fiche | 1,006 s |
+| Ouverture de fiche à chaud, médiane sur dix cycles | 0,952 s |
+| Ouverture de fiche à chaud, percentile 95 | 0,965 s |
+| Retour galerie à chaud, médiane sur dix cycles | 0,708 s |
+| Retour galerie à chaud, percentile 95 | 0,714 s |
+| Galerie de 50 assets : page de 36 cartes, liste à froid / chaud | 298 / 297 ms |
+| Les huit vignettes visibles prêtes à froid / en cache | 6,503 / 0,520 s |
+| Blender : première conversion et vignette depuis la galerie | 4,959 s |
+| Blender : job d’aperçu en cache | 0,229 s |
+
+Le benchmark de galerie importe 50 copies du même petit GLB texturé dans une bibliothèque jetable. Seules les huit cartes visibles sur la première page de 36 sont préparées : les 50 images ne sont pas préchargées. Le chargement chaud affiche les PNG avant la fin de la revalidation des sources ; aucun contexte WebGL n’est créé sur ce passage. Les fixtures sont archivées ensuite, sans suppression de leurs fichiers ni de leur historique. Le scénario Blender utilise un projet synthétique distinct et lance la génération depuis la galerie avant l’analyse explicite. Ces mesures ne préjugent pas des performances de modèles lourds.
+
+Sur les dix cycles, le maximum est **un contexte WebGL simultané** dans la fiche ; la galerie conserve **zéro contexte**. Aucune URL `blob:` ne reste active et les dix URL de modèles contrôlées deviennent inaccessibles après libération. Le nombre total d’entrées du registre de ressources n’est pas exposé par l’API ; il n’est pas déduit de ces seuls contrôles d’URL.
+
+Le tas JavaScript utilisé mesuré par `performance.memory` passe de **17,68 Mo à 14,70 Mo**, sans GC forcé. Cette observation ne mesure ni la RAM totale de WebView2 ni la mémoire GPU, et ne suffit pas à conclure à l’absence de toute fuite mémoire sur une longue session.
+
+L’interface a aussi été contrôlée à une largeur CSS de **1 024 px** : aucun débordement horizontal du document ou du panneau principal, aperçu large de 501 px et métriques réparties sur deux colonnes. Les captures de la fiche et de son bas, ainsi que le rapport, sont dans `.test-data/desktop-aNs9mN/compact/`.
+
+### Artefacts reconstruits et inspectés
+
+L’exécutable release préexistant était ouvert sur le poste et Windows refusait son remplacement. La construction a donc été réalisée avec `CARGO_TARGET_DIR=target/automatic-preview`, en réutilisant une copie du cache de compilation et en préservant cette instance. Le nouveau binaire et l’installateur ont pour nom de produit **Edge Lock** et pour versions fichier et produit **0.1.0**. L’application est PE x64 (`0x8664`) ; le bootstrap NSIS est PE x86 (`0x014C`) et embarque cette application x64.
+
+| Artefact | Taille en octets | SHA-256 |
+| --- | --- | --- |
+| `target/automatic-preview/release/edge-lock.exe` | 16 575 488 | `E8FB4827D0E19945699D677F6D775D61C020DF85A309E1E99331A908FB0B0483` |
+| `target/automatic-preview/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe` | 6 320 829 | `41E7EA8588579D3E9BE2D698040D37EF57733944A4E66FB94567848308145DC5` |
+
+Le rapport local d’inspection est `.test-data/automatic-preview-release-verification.json`. Aucun installateur n’a été exécuté sur l’installation personnelle.
+
+### Validations restant à compléter pour cette livraison
+
+- Comparaison avant/après sur plusieurs modèles réels représentatifs : non exécutée.
+- Installation et mise à niveau en VM jetable ou Windows Sandbox : non exécutées.
+
+## Bilan historique — 1er novembre 2026
+
+Les résultats de cette section ont été observés le 1er novembre 2026 sur le poste Windows de développement. Les fixtures étaient synthétiques, à l’exception d’une copie importée de Sniper Kitsune dans une bibliothèque jetable ; ses 72 fichiers personnels ont été contrôlés par hash et date avant/après, sans modification. Les commandes et procédures sont conservées pour reproductibilité ; les comptes de tests, mesures et artefacts ci-dessous sont historiques.
+
+### Contrôles reproductibles historiques
 
 ```powershell
 npm ci
@@ -18,7 +89,7 @@ npm run tauri build
 
 Les bibliothèques Rust sont créées avec `tempfile`. Le bac à sable AppContainer du poste refuse certains renommages de dossiers et hardlinks ; les tests de stockage ont donc été exécutés hors de ce bac à sable, toujours sur leurs seules fixtures jetables. Ce problème est distinct du fonctionnement de l’application Windows normale. Les avertissements de copie du cache incrémental Rust ne sont pas des échecs de tests.
 
-## Tests du cœur
+### Tests du cœur historiques
 
 La suite `cargo test --workspace` réussit : **46 tests Rust**, dont 19 tests de stockage, 1 arrêt brutal en sous-processus, 12 tests GLB, 3 tests d’aperçu sans Blender, 2 validations du runner sans processus externe, 3 tests internes du cœur et 6 tests de l’adaptateur desktop. Les doctests réussissent également (aucun exemple exécutable). `cargo clippy --workspace --all-targets -- -D warnings` et `cargo fmt --all --check` réussissent, en édition Rust 2024.
 
@@ -34,7 +105,7 @@ Les protections de chemins et l’inspecteur GLB ont leurs propres tests : donn�
 
 Les nouvelles régressions ont été écrites avant leur implémentation et observées en échec, puis exécutées à nouveau après correction. La revue a notamment ajouté un cas rouge pour le GLB principal supprimé : le repli sur l’unique `.blend` conserve désormais la configuration persistante.
 
-## Blender réel
+### Blender réel — historique
 
 Les **12 scénarios exigeant Blender réussissent sur Blender 5.1.1** : huit intégrations du worker et quatre intégrations du cache. Ils créent leurs propres projets et ressources. Les anciens scénarios avaient également été validés sur Blender 5.2.3 LTS ; la nouvelle suite complète n’a pas été réexécutée sur cette version.
 
@@ -47,11 +118,11 @@ Les scénarios comprennent création réelle d’un projet, export d’une colle
 
 Le cache est testé pour la réutilisation sans Blender, les rapports ignorés, les changements de textures externes, la corruption, l’isolation historique, le repli après suppression du GLB principal et une source modifiée pendant la conversion. Ce dernier cas vérifie une nouvelle tentative et la publication d’un seul GLB stable. Une annulation après création du temporaire laisse sources, métadonnées et objets inchangés. Les tests exigeant Blender sont ignorés par la commande Rust ordinaire parce qu’un exécutable doit être choisi explicitement.
 
-## Interface
+### Interface — historique
 
 Les **42 tests frontend passent**, répartis entre quatre fichiers. Ils couvrent notamment import, dépôt de dossier, configuration, navigation, erreurs, événements et validation des ressources de la visionneuse. Les nouveaux cas vérifient les dépendances non bloquantes, la dégradation, les erreurs locales d’aperçu, le choix GLB et sa suppression externe, les arêtes et la provenance, la conservation de l’analyse Blender et les résultats obsolètes après changement de sélection. Le typage TypeScript, ESLint, Prettier et le build Vite réussissent. La visionneuse est également exercée dans la véritable WebView2 ; les tests unitaires seuls ne prouvent pas le rendu GPU.
 
-## Mesures de performance
+### Mesures de performance historiques
 
 ```powershell
 cargo test -p edge-lock-core --test performance -- --ignored --nocapture
@@ -69,7 +140,7 @@ Une bibliothèque temporaire a reçu 1 000 imports d’un petit fichier identiqu
 
 La mémoire est mesurée avec `GetProcessMemoryInfo` ; il s’agit du pic du processus, pas d’une attribution parfaite au seul moteur de stockage. Ces résultats confirment le transfert en flux sur ce cas. Ils ne prouvent pas un débit identique pour 100 Go, un disque réseau, un million de petits fichiers ou une scène Blender complexe. Aucun test n’a rempli le disque physique ; les erreurs d’écriture sont injectées avec une obstruction de chemin et des verrous.
 
-## Application desktop et installateur
+### Application desktop et installateur — historique
 
 Le script `scripts/e2e.mjs` pilote une vraie WebView2 via `tauri-driver` et un Microsoft Edge WebDriver compatible. Il utilise `.test-data/`, des réglages isolés via `EDGE_LOCK_TEST_DATA_DIR` en build debug et un dossier WebView temporaire. Les chemins des exécutables peuvent être fournis par `EDGE_LOCK_E2E_EXE`, `TAURI_DRIVER` et `EDGE_DRIVER`.
 

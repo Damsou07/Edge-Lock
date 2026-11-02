@@ -1,5 +1,6 @@
 use crate::{
     jobs::{self, JobRequest},
+    preview_resources::{self, ResourceUrl},
     settings,
     state::*,
 };
@@ -10,6 +11,7 @@ use edge_lock_core::{
 use notify::Watcher;
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -78,8 +80,12 @@ pub async fn open_library(path: String, state: State<'_, ManagedState>) -> AppRe
         *lock(&state.settings)? = changed;
         state.watcher_generation.fetch_add(1, Ordering::SeqCst);
         *lock(&state.watcher)? = None;
-        *lock(&state.library)? = Some(library);
-        lock(&state.previews)?.clear();
+        {
+            let mut current = lock(&state.library)?;
+            let mut previews = lock(&state.previews)?;
+            *current = Some(library);
+            previews.clear();
+        }
         *lock(&state.startup_error)? = None;
         Ok(info)
     })
@@ -383,4 +389,72 @@ pub fn cancel_job(id: String, state: State<'_, ManagedState>) -> AppResult<()> {
         .ok_or_else(|| AppError::new("not_found", "Tâche introuvable"))?;
     entry.cancelled.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_asset_thumbnails(
+    asset_ids: Vec<String>,
+    state: State<'_, ManagedState>,
+) -> AppResult<HashMap<String, ResourceUrl>> {
+    if asset_ids.len() > 64 {
+        return Err(AppError::new(
+            "invalid",
+            "Demandez au maximum 64 miniatures.",
+        ));
+    }
+    let state = state.0.clone();
+    let library = state.library()?;
+    blocking(move || {
+        let resources = preview_resources::cached_asset_resources(&library, &asset_ids)?;
+        preview_resources::register_batch(&state, &library, resources)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn store_thumbnail(
+    preview_token: String,
+    png_bytes: Vec<u8>,
+    state: State<'_, ManagedState>,
+) -> AppResult<ResourceUrl> {
+    let state = state.0.clone();
+    let library = state.library()?;
+    blocking(move || preview_resources::store(&state, &library, &preview_token, &png_bytes)).await
+}
+
+#[tauri::command]
+pub fn release_preview_resources(
+    tokens: Vec<String>,
+    state: State<'_, ManagedState>,
+) -> AppResult<()> {
+    lock(&state.0.previews)?.release(&tokens)
+}
+
+#[tauri::command]
+pub async fn invalidate_thumbnail(
+    resource_token: String,
+    state: State<'_, ManagedState>,
+) -> AppResult<()> {
+    let state = state.0.clone();
+    blocking(move || {
+        let _gate = lock(&state.operation_gate)?;
+        let library = state.library()?;
+        let Some(resource) = lock(&state.previews)?.get(&resource_token) else {
+            return Ok(());
+        };
+        if !resource.is_thumbnail() {
+            return Err(AppError::new(
+                "invalid",
+                "Ce jeton ne désigne pas une miniature.",
+            ));
+        }
+        let source = resource
+            .thumbnail
+            .as_ref()
+            .ok_or_else(|| AppError::new("invalid", "Origine de miniature absente."))?;
+        preview_resources::remove_thumbnail(library.root(), source)?;
+        lock(&state.previews)?.remove_path(&resource.path);
+        Ok(())
+    })
+    .await
 }

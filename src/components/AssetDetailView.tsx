@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { FormEvent } from "react";
 import { api } from "../api";
 import type {
@@ -26,6 +34,13 @@ import { MetadataModal } from "./AssetForms";
 import { Modal } from "./Modal";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
+
+function releasePreview(url: string) {
+  const token = new URL(url).pathname.slice(1);
+  void api.releasePreviewResources([token]).catch(() => {
+    /* Resource cleanup must not interrupt navigation. */
+  });
+}
 
 function VersionModal({
   mode,
@@ -171,10 +186,27 @@ export function AssetDetailView({
   currentSelection.current = selection;
   const configEdited = useRef(false);
   const configVariant = useRef("");
+  const alive = useRef(true);
+  const previewRequest = useRef(0);
+  const autoPreviewAttempt = useRef("");
   const editConfig = (update: (previous: ExportConfig) => ExportConfig) => {
     configEdited.current = true;
     setConfig(update);
   };
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      previewRequest.current += 1;
+    };
+  }, []);
+  useEffect(() => {
+    const url = preview?.url;
+    return () => {
+      if (url) releasePreview(url);
+    };
+  }, [preview?.url]);
 
   useEffect(() => {
     let active = true;
@@ -261,6 +293,8 @@ export function AssetDetailView({
     };
   }, [snapshotId, onError]);
   useEffect(() => {
+    previewRequest.current += 1;
+    autoPreviewAttempt.current = "";
     setPreview(null);
     setInspection(null);
     setPreviewBusy(false);
@@ -314,9 +348,13 @@ export function AssetDetailView({
     snapshotDetail?.id === snapshotId
       ? snapshotDetail
       : snapshots.find((snapshot) => snapshot.id === snapshotId);
-  const files = snapshotId
-    ? (selectedSnapshot?.entries ?? [])
-    : (variantDetail?.files ?? []);
+  const files = useMemo(
+    () =>
+      snapshotId
+        ? (selectedSnapshot?.entries ?? [])
+        : (variantDetail?.files ?? []),
+    [snapshotId, selectedSnapshot?.entries, variantDetail?.files],
+  );
   const activeConfig = selectedSnapshot?.config ?? config;
   const configurationDirty =
     !snapshotId &&
@@ -384,64 +422,97 @@ export function AssetDetailView({
       if (currentSelection.current === target) setInspectionBusy(false);
     }
   };
-  const loadPreviewFiles = async (target: string) => {
-    if (snapshotId) return files;
-    const updated = await api.getVariant(variantId);
-    if (currentSelection.current !== target) return null;
-    setVariantDetail(updated);
-    return updated.files;
-  };
-  const generatePreview = async (selectedFile = previewFile) => {
-    const target = selection;
-    setPreviewBusy(true);
-    setPreviewError("");
-    setPreviewFile(selectedFile);
-    try {
-      if (selectedFile && !snapshotId) {
-        const currentFiles = await loadPreviewFiles(target);
-        if (!currentFiles) return;
-        if (
-          !currentFiles.some(
-            (file) => file.kind === "file" && file.path === selectedFile,
-          )
-        ) {
-          selectedFile = "";
-          setPreviewFile("");
+  const loadPreviewFiles = useCallback(
+    async (target: string) => {
+      if (snapshotId) return files;
+      const updated = await api.getVariant(variantId);
+      if (!alive.current || currentSelection.current !== target) return null;
+      setVariantDetail(updated);
+      return updated.files;
+    },
+    [snapshotId, files, variantId],
+  );
+  const generatePreview = useCallback(
+    async (selectedFile = previewFile) => {
+      const target = selection;
+      const request = ++previewRequest.current;
+      const isCurrent = () =>
+        alive.current &&
+        currentSelection.current === target &&
+        previewRequest.current === request;
+      setPreviewBusy(true);
+      setPreviewError("");
+      setPreviewFile(selectedFile);
+      try {
+        if (selectedFile && !snapshotId) {
+          const currentFiles = await loadPreviewFiles(target);
+          if (!currentFiles || !isCurrent()) return;
+          if (
+            !currentFiles.some(
+              (file) => file.kind === "file" && file.path === selectedFile,
+            )
+          ) {
+            selectedFile = "";
+            setPreviewFile("");
+          }
         }
-      }
-      const result = await runJob<PreviewResult>({
-        kind: "preview",
-        variantId,
-        snapshotId,
-        ...(selectedFile ? { previewFile: selectedFile } : {}),
-      });
-      if (currentSelection.current === target) {
-        setPreview(result);
-        if (result.sourceKind === "generatedGlb") setInspection(null);
-        setPreviewCandidates([]);
-        setExternalChanged(false);
-      }
-    } catch (reason) {
-      if (currentSelection.current !== target) return;
-      const error = reason as AppError | null;
-      const candidates = error?.details?.candidates;
-      if (
-        error?.code === "preview_ambiguous" &&
-        Array.isArray(candidates) &&
-        candidates.length > 0 &&
-        candidates.every((candidate) => typeof candidate === "string")
-      ) {
-        setPreviewCandidates(candidates);
-        setPreviewFile("");
-      } else {
-        if (error?.code === "invalid" && selectedFile && !snapshotId)
+        const result = await runJob<PreviewResult>({
+          kind: "preview",
+          variantId,
+          snapshotId,
+          ...(selectedFile ? { previewFile: selectedFile } : {}),
+        });
+        if (isCurrent()) {
+          setPreview(result);
+          if (result.sourceKind === "generatedGlb") setInspection(null);
+          setPreviewCandidates([]);
+          setExternalChanged(false);
+        } else releasePreview(result.url);
+      } catch (reason) {
+        if (!isCurrent()) return;
+        const error = reason as AppError | null;
+        const candidates = error?.details?.candidates;
+        if (
+          error?.code === "preview_ambiguous" &&
+          Array.isArray(candidates) &&
+          candidates.length > 0 &&
+          candidates.every((candidate) => typeof candidate === "string")
+        ) {
+          setPreviewCandidates(candidates);
           setPreviewFile("");
-        setPreviewError(errorMessage(reason));
+        } else {
+          if (error?.code === "invalid" && selectedFile && !snapshotId)
+            setPreviewFile("");
+          setPreviewError(errorMessage(reason));
+        }
+      } finally {
+        if (isCurrent()) setPreviewBusy(false);
       }
-    } finally {
-      if (currentSelection.current === target) setPreviewBusy(false);
-    }
-  };
+    },
+    [selection, variantId, snapshotId, previewFile, loadPreviewFiles, runJob],
+  );
+  const persistedConfig = snapshotId
+    ? snapshotDetail?.id === snapshotId
+      ? snapshotDetail.config
+      : null
+    : variantDetail?.variant.id === variantId &&
+        variantDetail.variant.assetId === id
+      ? variantDetail.variant.config
+      : null;
+  const autoPreviewKey = persistedConfig
+    ? JSON.stringify([selection, persistedConfig])
+    : "";
+  useEffect(() => {
+    if (
+      !autoPreviewKey ||
+      configurationDirty ||
+      configBusy ||
+      autoPreviewAttempt.current === autoPreviewKey
+    )
+      return;
+    autoPreviewAttempt.current = autoPreviewKey;
+    void generatePreview("");
+  }, [autoPreviewKey, configurationDirty, configBusy, generatePreview]);
   const changePreviewFile = async () => {
     const target = selection;
     setPreviewBusy(true);
@@ -482,10 +553,13 @@ export function AssetDetailView({
   };
   const saveConfig = async (event: FormEvent) => {
     event.preventDefault();
+    const target = selection;
     setConfigBusy(true);
     try {
       await api.updateConfig(variantId, config);
+      if (!alive.current || currentSelection.current !== target) return;
       configEdited.current = false;
+      previewRequest.current += 1;
       setPreview(null);
       setInspection(null);
       setPreviewError("");
@@ -611,7 +685,7 @@ export function AssetDetailView({
             className="button secondary"
             onClick={() => setModal("metadata")}
           >
-            <Icon name="settings" />
+            <Icon name="organize" />
             Organiser
           </button>
           <button
@@ -881,7 +955,7 @@ export function AssetDetailView({
                 className="inspection-provenance"
                 title={
                   sourceInspection
-                    ? "Dernière analyse de la source ; utilisez Analyser pour l’actualiser."
+                    ? "Dernière analyse de la source ; utilisez Analyser la source pour l’actualiser."
                     : undefined
                 }
               >
@@ -1074,21 +1148,29 @@ export function AssetDetailView({
                 className="text-button"
                 disabled={!variant || inspectionBusy || configurationDirty}
                 onClick={() => void inspect()}
+                title="Actualiser la géométrie, les scènes, les collections et les dépendances de la source enregistrée."
               >
                 <Icon
                   name="refresh"
                   size={13}
                   className={inspectionBusy ? "spinning" : ""}
                 />
-                {inspectionBusy ? "Analyse…" : "Analyser"}
+                {inspectionBusy ? "Analyse…" : "Analyser la source"}
               </button>
               <button
                 className="button secondary small-button"
-                disabled={!variant || !!snapshotId || configBusy}
+                disabled={
+                  !variant || !!snapshotId || configBusy || !configurationDirty
+                }
               >
-                {configBusy ? "Enregistrement…" : "Enregistrer"}
+                {configBusy ? "Enregistrement…" : "Enregistrer les réglages"}
               </button>
             </div>
+            <p className="field-help">
+              Ces réglages définissent la source de l’aperçu et de l’export.
+              Enregistrez vos fichiers dans Blender, puis créez une version pour
+              conserver votre travail.
+            </p>
             {configurationDirty && (
               <p className="field-help">
                 Enregistrez la source pour l’utiliser dans Blender, les versions
@@ -1177,7 +1259,7 @@ export function AssetDetailView({
             className={tab === "changes" ? "active" : ""}
             onClick={() => setTab("changes")}
           >
-            <Icon name="branch" size={16} />
+            <Icon name="diff" size={16} />
             Modifications
             {pendingCount != null && (
               <span className={pendingCount > 0 ? "changes-count" : ""}>

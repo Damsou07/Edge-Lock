@@ -476,6 +476,19 @@ fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
             .is_empty()
     );
     assert!(document["images"][0]["bufferView"].is_u64());
+    let primitive = &document["meshes"][0]["primitives"][0];
+    let material = primitive["material"].as_u64().unwrap() as usize;
+    let texture =
+        document["materials"][material]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+            .as_u64()
+            .expect("the Blender image must remain connected to the exported material")
+            as usize;
+    let image = document["textures"][texture]["source"].as_u64().unwrap() as usize;
+    assert!(document["images"][image]["bufferView"].is_u64());
+    let uv = primitive["attributes"]["TEXCOORD_0"]
+        .as_u64()
+        .expect("textured geometry must preserve UV coordinates") as usize;
+    assert_eq!(document["accessors"][uv]["type"], "VEC2");
     assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
     let modifiers = ExportConfig {
         apply_modifiers: true,

@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 blake3 = "1"
 tempfile = "3"
 notify = "8"
+png = "0.18"
 dunce = "1"
 
 [dev-dependencies]

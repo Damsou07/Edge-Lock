@@ -1,3 +1,4 @@
+use crate::preview_resources::{self, PreviewResource, ThumbnailSource};
 use crate::state::*;
 use edge_lock_core::{
     ExportConfig, Library, OperationContext, Snapshot,
@@ -50,6 +51,9 @@ pub enum JobRequest {
         snapshot_id: Option<String>,
         preview_file: Option<String>,
     },
+    Thumbnail {
+        asset_id: String,
+    },
     Export {
         variant_id: String,
         snapshot_id: Option<String>,
@@ -67,6 +71,7 @@ impl JobRequest {
             Self::Changes { .. } => "changes",
             Self::Inspect { .. } => "inspect",
             Self::Preview { .. } => "preview",
+            Self::Thumbnail { .. } => "thumbnail",
             Self::Export { .. } => "export",
         }
     }
@@ -187,7 +192,7 @@ fn runner(state: &AppState) -> AppResult<BlenderRunner> {
 
 fn run(
     state: &AppState,
-    library: &Library,
+    library: &Arc<Library>,
     request: &JobRequest,
     ctx: &OperationContext,
 ) -> AppResult<Value> {
@@ -271,17 +276,78 @@ fn run(
             if snapshot_id.is_none() && artifact.updates_geometry {
                 library.set_geometry(variant_id, artifact.inspection.geometry.triangles)?;
             }
-            let token = uuid::Uuid::new_v4().simple().to_string();
-            {
-                let mut previews = lock(&state.previews)?;
-                previews.clear();
-                previews.insert(token.clone(), artifact.path.clone());
-            }
+            let resource = preview_resources::register(
+                state,
+                library,
+                PreviewResource::glb(artifact.path.clone(), None),
+            )?;
             trim_cache(&library.root().join("cache"), &artifact.path, state);
             Ok(
-                json!({ "url": format!("http://edge-preview.localhost/{token}"), "inspection": artifact.inspection,
+                json!({ "url": resource.url, "resourceToken":resource.resource_token,"artifactKey":artifact.artifact_key,"inspection": artifact.inspection,
                     "sourceLabel": if snapshot_id.is_some() { "Version enregistrée" } else { "Travail enregistré sur disque" },
                     "sourceFile": artifact.source_file, "sourceKind": artifact.source_kind }),
+            )
+        }
+        JobRequest::Thumbnail { asset_id } => {
+            let variant = library
+                .get_asset(asset_id)?
+                .variants
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AppError::new("not_found", "Cet asset ne contient aucune variante.")
+                })?;
+            let blender_path = lock(&state.settings)?.blender_path.clone();
+            let artifact = match preview::prepare_preview(
+                library,
+                PreviewRequest {
+                    variant_id: &variant.id,
+                    snapshot_id: None,
+                    preview_file: None,
+                    blender_path: blender_path.as_deref().map(Path::new),
+                },
+                ctx,
+            )? {
+                PreviewOutcome::Ready(artifact) => artifact,
+                PreviewOutcome::Choose(_) => {
+                    return Err(AppError::new(
+                        "preview_ambiguous",
+                        "Choisissez le GLB d’aperçu dans la fiche de l’asset.",
+                    ));
+                }
+            };
+            ctx.check_cancelled()?;
+            let source = ThumbnailSource {
+                variant_id: variant.id,
+                artifact_key: artifact.artifact_key.clone(),
+            };
+            if let Some(path) = preview_resources::find_thumbnail(
+                library.root(),
+                &source.variant_id,
+                Some(&source.artifact_key),
+            )? {
+                let resource = preview_resources::register(
+                    state,
+                    library,
+                    PreviewResource::png(path.clone(), source),
+                )?;
+                trim_cache(&library.root().join("cache"), &path, state);
+                return Ok(
+                    json!({"state":"ready","url":resource.url,"resourceToken":resource.resource_token}),
+                );
+            }
+            let resource = preview_resources::register(
+                state,
+                library,
+                PreviewResource::glb(artifact.path.clone(), Some(source)),
+            )?;
+            trim_cache(&library.root().join("cache"), &artifact.path, state);
+            Ok(
+                json!({"state":"render","resourceToken":resource.resource_token,"preview":{
+                    "url":resource.url,"resourceToken":resource.resource_token,"artifactKey":artifact.artifact_key,
+                    "inspection":artifact.inspection,"sourceLabel":"Travail enregistré sur disque",
+                    "sourceFile":artifact.source_file,"sourceKind":artifact.source_kind
+                }}),
             )
         }
         JobRequest::Export {
@@ -489,16 +555,17 @@ fn managed_cache_dir(root: &Path) -> AppResult<PathBuf> {
     Ok(path)
 }
 
-fn trim_cache(cache: &Path, keep: &Path, state: &AppState) {
-    let protected: Vec<PathBuf> = state
-        .previews
-        .lock()
-        .map(|p| p.values().cloned().collect())
-        .unwrap_or_default();
+pub(crate) fn trim_cache(cache: &Path, keep: &Path, state: &AppState) {
+    let protected: Vec<PathBuf> = state.previews.lock().map(|p| p.paths()).unwrap_or_default();
+    trim_cache_to_budget(cache, keep, &protected, 2 * 1024 * 1024 * 1024);
+}
+
+fn trim_cache_to_budget(cache: &Path, keep: &Path, protected: &[PathBuf], budget: u64) {
     let entries = [
         cache.to_path_buf(),
         cache.join("previews"),
         cache.join("exports"),
+        cache.join("thumbnails"),
     ]
     .into_iter()
     .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && !is_link(&m)))
@@ -509,14 +576,16 @@ fn trim_cache(cache: &Path, keep: &Path, state: &AppState) {
         .filter_map(|e| {
             let path = e.path();
             let meta = fs::symlink_metadata(&path).ok()?;
-            (meta.is_file() && !is_link(&meta) && path.extension().is_some_and(|e| e == "glb"))
-                .then_some((path, meta.len(), meta.modified().ok()))
+            (meta.is_file()
+                && !is_link(&meta)
+                && path.extension().is_some_and(|e| e == "glb" || e == "png"))
+            .then_some((path, meta.len(), meta.modified().ok()))
         })
         .collect();
     let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
     files.sort_by_key(|(_, _, modified)| *modified);
     for (path, bytes, _) in files {
-        if total <= 2 * 1024 * 1024 * 1024 {
+        if total <= budget {
             break;
         }
         if path == keep || protected.contains(&path) {
@@ -631,5 +700,120 @@ mod tests {
             serde_json::from_value(json!({"kind":"snapshot","variantId":"abc","message":"v2"}))
                 .unwrap();
         assert!(matches!(request, JobRequest::Snapshot { variant_id, .. } if variant_id == "abc"));
+        let thumbnail: JobRequest =
+            serde_json::from_value(json!({"kind":"thumbnail","assetId":"asset"})).unwrap();
+        assert!(matches!(thumbnail, JobRequest::Thumbnail {asset_id} if asset_id == "asset"));
+    }
+
+    #[test]
+    fn cache_budget_counts_thumbnails_and_keeps_active_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(cache.join("thumbnails")).unwrap();
+        fs::create_dir_all(cache.join("previews")).unwrap();
+        let active = cache.join("thumbnails/active.png");
+        let stale = cache.join("thumbnails/stale.png");
+        let current = cache.join("previews/current.glb");
+        for path in [&active, &stale, &current] {
+            fs::write(path, [1; 50]).unwrap();
+        }
+        fs::write(cache.join("keep.txt"), b"personal").unwrap();
+        trim_cache_to_budget(&cache, &current, std::slice::from_ref(&active), 100);
+        assert!(active.is_file());
+        assert!(current.is_file());
+        assert!(!stale.exists());
+        assert_eq!(fs::read(cache.join("keep.txt")).unwrap(), b"personal");
+    }
+
+    #[test]
+    fn thumbnail_job_generates_once_reuses_png_and_does_not_replace_the_watcher() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut json = serde_json::to_vec(&json!({
+            "asset":{"version":"2.0"},"buffers":[{"byteLength":36}],
+            "bufferViews":[{"buffer":0,"byteLength":36}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],
+            "nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}]
+        }))
+        .unwrap();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(((12 + 8 + json.len() + 8 + 36) as u32).to_le_bytes());
+        glb.extend((json.len() as u32).to_le_bytes());
+        glb.extend(0x4e4f534au32.to_le_bytes());
+        glb.extend(json);
+        glb.extend(36u32.to_le_bytes());
+        glb.extend(0x004e4942u32.to_le_bytes());
+        glb.extend([0; 36]);
+        fs::write(source.join("triangle.glb"), &glb).unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let ctx = OperationContext::default();
+        let asset = library
+            .import_folder(&source, "Triangle", ExportConfig::default(), &ctx)
+            .unwrap();
+        let state = crate::state::test_state(library.clone());
+        assert!(
+            preview_resources::cached_asset_resources(
+                &library,
+                std::slice::from_ref(&asset.asset.id)
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let request = JobRequest::Thumbnail {
+            asset_id: asset.asset.id.clone(),
+        };
+        let generated = run(&state, &library, &request, &ctx).unwrap();
+        assert_eq!(generated["state"], "render");
+        let token = generated["resourceToken"].as_str().unwrap();
+        assert_eq!(
+            lock(&state.previews)
+                .unwrap()
+                .get(token)
+                .unwrap()
+                .read()
+                .unwrap(),
+            glb
+        );
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 512, 384);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![128; 512 * 384 * 4])
+                .unwrap();
+        }
+        let stored = preview_resources::store(&state, &library, token, &png).unwrap();
+        let warm = run(&state, &library, &request, &ctx).unwrap();
+        assert_eq!(warm["state"], "ready");
+        assert!(
+            lock(&state.previews)
+                .unwrap()
+                .get(&stored.resource_token)
+                .is_some()
+        );
+        assert!(lock(&state.previews).unwrap().get(token).is_some());
+        assert!(state.watcher.lock().unwrap().is_none());
+        assert_eq!(state.watcher_generation.load(Ordering::SeqCst), 0);
+        // The immediate catalog path does not inspect the now-unavailable source GLB.
+        fs::remove_file(Path::new(&asset.variants[0].workspace_path).join("triangle.glb")).unwrap();
+        let cached = preview_resources::cached_asset_resources(
+            &library,
+            std::slice::from_ref(&asset.asset.id),
+        )
+        .unwrap();
+        assert_eq!(cached[&asset.asset.id].mime(), "image/png");
+        assert!(
+            preview_resources::cached_asset_resources(&library, &vec![asset.asset.id; 65]).is_err()
+        );
+        assert_eq!(fs::read(source.join("triangle.glb")).unwrap(), glb);
     }
 }

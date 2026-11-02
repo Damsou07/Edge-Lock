@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type {
   Asset,
@@ -24,6 +24,9 @@ import {
   formatDate,
 } from "./lib/format";
 import { useJobs } from "./lib/useJobs";
+import type { RunJobOptions } from "./lib/useJobs";
+import { useAssetThumbnails } from "./lib/useAssetThumbnails";
+import type { ThumbnailState } from "./lib/useAssetThumbnails";
 
 const initialFilter: AssetFilter = {
   search: "",
@@ -78,20 +81,66 @@ function AssetCard({
   asset,
   onSelect,
   list,
+  thumbnail,
+  setVisible,
+  onImageError,
 }: {
   asset: Asset;
   onSelect: (id: string) => void;
   list: boolean;
+  thumbnail?: ThumbnailState;
+  setVisible: (id: string, visible: boolean) => void;
+  onImageError: (id: string) => Promise<void>;
 }) {
+  const card = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const element = card.current;
+    if (!element) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(asset.id, true);
+      return () => setVisible(asset.id, false);
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      setVisible(asset.id, !!entry?.isIntersecting);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      setVisible(asset.id, false);
+    };
+  }, [asset.id, setVisible]);
   return (
     <button
+      ref={card}
       className={`asset-card ${list ? "asset-row" : ""}`}
       onClick={() => onSelect(asset.id)}
     >
       <div className="asset-thumbnail">
-        <div className="asset-wireframe">
-          <Icon name="cube" size={list ? 26 : 64} />
-        </div>
+        {thumbnail?.url ? (
+          <img
+            src={thumbnail.url}
+            alt={`Aperçu texturé de ${asset.name}`}
+            loading="lazy"
+            decoding="async"
+            onError={() => void onImageError(asset.id)}
+          />
+        ) : (
+          <div className="asset-wireframe">
+            <Icon name="cube" size={list ? 26 : 64} />
+          </div>
+        )}
+        {thumbnail?.status !== "ready" && (
+          <span
+            className={`thumbnail-status ${thumbnail?.status === "error" ? "thumbnail-error" : ""}`}
+            title={thumbnail?.error}
+          >
+            {thumbnail?.status === "error"
+              ? "Aperçu indisponible · ouvrir la fiche"
+              : thumbnail?.status === "loading"
+                ? "Préparation de l’aperçu…"
+                : "Aperçu en attente"}
+          </span>
+        )}
         <span className="asset-type">3D ASSET</span>
         {asset.archived && <span className="archived-badge">Archivé</span>}
       </div>
@@ -142,6 +191,7 @@ export default function App() {
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [view, setView] = useState<"grid" | "list">("grid");
   const [selected, setSelected] = useState<string | null>(null);
+  const navigation = useRef(0);
   const [modal, setModal] = useState<
     "import" | "create" | "settings" | "category" | "game" | null
   >(null);
@@ -149,31 +199,57 @@ export default function App() {
   const [generation, setGeneration] = useState(0);
   const { jobs, runJob: runBaseJob, dismiss } = useJobs();
   const library = bootstrap?.library;
+  const {
+    states: thumbnails,
+    setVisible,
+    imageFailed,
+    pause,
+    resume,
+  } = useAssetThumbnails(
+    page.items,
+    library?.root,
+    !!library && !selected && !modal && !opening,
+    runBaseJob,
+  );
   const refresh = useCallback(() => setGeneration((value) => value + 1), []);
   const runJob = useCallback(
-    async <T = unknown,>(request: JobRequest): Promise<T> => {
-      const result = await runBaseJob<T>(request);
-      if (
-        [
-          "import",
-          "create",
-          "variant",
-          "snapshot",
-          "inspect",
-          "preview",
-        ].includes(request.kind)
-      ) {
-        try {
-          setBootstrap(await api.bootstrap());
-        } catch (reason) {
-          setError(errorMessage(reason));
+    async <T = unknown,>(
+      request: JobRequest,
+      options?: RunJobOptions,
+    ): Promise<T> => {
+      await pause();
+      try {
+        const result = await runBaseJob<T>(request, options);
+        if (
+          [
+            "import",
+            "create",
+            "variant",
+            "snapshot",
+            "inspect",
+            "preview",
+          ].includes(request.kind)
+        ) {
+          try {
+            setBootstrap(await api.bootstrap());
+          } catch (reason) {
+            setError(errorMessage(reason));
+          }
+          refresh();
         }
-        refresh();
+        return result;
+      } finally {
+        resume();
       }
-      return result;
     },
-    [runBaseJob, refresh],
+    [runBaseJob, refresh, pause, resume],
   );
+  const selectAsset = async (id: string) => {
+    const intent = ++navigation.current;
+    await pause();
+    if (navigation.current === intent) setSelected(id);
+    resume();
+  };
 
   useEffect(() => {
     let active = true;
@@ -270,9 +346,11 @@ export default function App() {
   }, [library, filter, generation]);
 
   const openLibrary = async () => {
+    ++navigation.current;
     setError("");
     setOpening(true);
     try {
+      await pause();
       const path = await api.chooseFolder();
       if (path) {
         const value = await api.openLibrary(path);
@@ -294,13 +372,16 @@ export default function App() {
       setError(errorMessage(reason));
     } finally {
       setOpening(false);
+      resume();
     }
   };
   const changeFilter = (patch: Partial<AssetFilter>) => {
+    ++navigation.current;
     setFilter((previous) => ({ ...previous, ...patch, offset: 0 }));
     setSelected(null);
   };
   const resetFilters = () => {
+    ++navigation.current;
     setSearch("");
     setFilter(initialFilter);
     setSelected(null);
@@ -321,7 +402,9 @@ export default function App() {
     filter.archived
   );
   const hasRunningJobs = jobs.some(
-    (job) => job.status === "running" || job.status === "queued",
+    (job) =>
+      job.kind !== "thumbnail" &&
+      (job.status === "running" || job.status === "queued"),
   );
 
   return (
@@ -684,7 +767,10 @@ export default function App() {
                       asset={asset}
                       key={asset.id}
                       list={view === "list"}
-                      onSelect={setSelected}
+                      onSelect={(id) => void selectAsset(id)}
+                      thumbnail={thumbnails[asset.id]}
+                      setVisible={setVisible}
+                      onImageError={imageFailed}
                     />
                   ))}
                 </div>

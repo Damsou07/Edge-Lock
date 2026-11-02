@@ -12,6 +12,7 @@ import type {
   LibraryInfo,
   Snapshot,
   Taxonomy,
+  ThumbnailResource,
   VariantDetail,
 } from "./contracts";
 
@@ -26,6 +27,16 @@ export const api = {
   listAssets: (filter: AssetFilter) =>
     invoke<AssetPage>("list_assets", { filter }),
   getAsset: (id: string) => invoke<AssetDetail>("get_asset", { id }),
+  getAssetThumbnails: (assetIds: string[]) =>
+    invoke<Record<string, ThumbnailResource>>("get_asset_thumbnails", {
+      assetIds,
+    }),
+  storeThumbnail: (previewToken: string, pngBytes: number[]) =>
+    invoke<ThumbnailResource>("store_thumbnail", { previewToken, pngBytes }),
+  releasePreviewResources: (tokens: string[]) =>
+    invoke<void>("release_preview_resources", { tokens }),
+  invalidateThumbnail: (resourceToken: string) =>
+    invoke<void>("invalidate_thumbnail", { resourceToken }),
   getVariant: (id: string) => invoke<VariantDetail>("get_variant", { id }),
   getSnapshot: (id: string) => invoke<Snapshot>("get_snapshot", { id }),
   listSnapshots: (variantId: string, offset: number, limit = 50) =>

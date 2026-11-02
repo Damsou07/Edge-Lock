@@ -32,6 +32,7 @@ pub enum PreviewKind {
 
 pub struct PreviewArtifact {
     pub path: PathBuf,
+    pub artifact_key: String,
     pub inspection: Inspection,
     pub source_file: String,
     pub source_kind: PreviewKind,
@@ -67,6 +68,47 @@ struct CacheRecord {
     source_kind: PreviewKind,
     sources: Vec<SourceFingerprint>,
     inspection: Inspection,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewPreference {
+    version: u32,
+    config: ExportConfig,
+    source_file: String,
+}
+
+fn preference_path(cache: &Path, variant_id: &str) -> PathBuf {
+    cache.join(format!(
+        "choice-{}.json",
+        blake3::hash(variant_id.as_bytes()).to_hex()
+    ))
+}
+
+fn remembered_choice(
+    root: &Path,
+    variant_id: &str,
+    config: &ExportConfig,
+    entries: &[ManifestEntry],
+) -> Option<String> {
+    let cache = root.join("cache");
+    ensure_real_directory(&cache).ok()?;
+    let cache = cache.join("previews");
+    ensure_real_directory(&cache).ok()?;
+    let path = preference_path(&cache, variant_id);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || is_link(&meta) || meta.len() > 4096 {
+        return None;
+    }
+    let choice: PreviewPreference = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (choice.version == 1
+        && choice.config == *config
+        && extension(&choice.source_file, "glb")
+        && safe_relative(&choice.source_file).is_ok()
+        && entries
+            .iter()
+            .any(|entry| entry.kind == "file" && entry.path == choice.source_file))
+    .then_some(choice.source_file)
 }
 
 fn extension(path: &str, expected: &str) -> bool {
@@ -360,7 +402,7 @@ fn read_record(path: &Path) -> Option<CacheRecord> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-fn atomic_json(path: &Path, value: &CacheRecord, staging: &Path) -> Result<()> {
+fn atomic_json(path: &Path, value: &impl Serialize, staging: &Path) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(staging)?;
     temporary.write_all(&serde_json::to_vec(value)?)?;
     temporary.as_file().sync_all()?;
@@ -429,7 +471,16 @@ pub fn prepare_preview(
         )
     };
     let logical_root = dunce::simplified(&logical_root).to_path_buf();
-    let candidates = choose_glb(&entries, &config, request.preview_file)?;
+    let remembered = if request.snapshot_id.is_none() && request.preview_file.is_none() {
+        remembered_choice(library.root(), request.variant_id, &config, &entries)
+    } else {
+        None
+    };
+    let candidates = choose_glb(
+        &entries,
+        &config,
+        request.preview_file.or(remembered.as_deref()),
+    )?;
     if candidates.len() > 1 {
         return Ok(PreviewOutcome::Choose(candidates));
     }
@@ -497,6 +548,23 @@ pub fn prepare_preview(
     .to_string();
     let cache = managed_cache(library.root())?;
     cleanup_temporary(library.root())?;
+    let remember_choice = || {
+        if request.snapshot_id.is_none()
+            && request.preview_file.is_some()
+            && kind == PreviewKind::AssetGlb
+        {
+            // This is disposable UI preference data; failure must not hide a valid preview.
+            let _ = atomic_json(
+                &preference_path(&cache, request.variant_id),
+                &PreviewPreference {
+                    version: 1,
+                    config: config.clone(),
+                    source_file: source_file.clone(),
+                },
+                &cache,
+            );
+        }
+    };
     let record_path = cache.join(format!("index-{index}.json"));
     let manifest = snapshot.as_ref().map(|s| s.entries.as_slice());
     if let Some(record) = read_record(&record_path)
@@ -519,8 +587,10 @@ pub fn prepare_preview(
             && hash_file(&path, ctx)?.as_deref() == Some(&record.artifact_hash)
         {
             ctx.report("Aperçu en cache", 1, Some(1));
+            remember_choice();
             return Ok(PreviewOutcome::Ready(Box::new(PreviewArtifact {
                 path,
+                artifact_key: record.artifact,
                 inspection: record.inspection,
                 source_file,
                 source_kind: kind,
@@ -626,8 +696,10 @@ pub fn prepare_preview(
                 inspection,
             };
             atomic_json(&record_path, &record, temporary.path())?;
+            remember_choice();
             Ok(PreviewOutcome::Ready(Box::new(PreviewArtifact {
                 path,
+                artifact_key: record.artifact,
                 inspection: record.inspection,
                 source_file: source_file.clone(),
                 source_kind: kind,

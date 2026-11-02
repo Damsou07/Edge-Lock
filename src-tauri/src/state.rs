@@ -1,4 +1,4 @@
-use crate::settings::Settings;
+use crate::{preview_resources::PreviewResources, settings::Settings};
 use edge_lock_core::{CoreError, Library};
 use serde::Serialize;
 use std::{
@@ -79,7 +79,7 @@ pub struct AppState {
     pub library: Mutex<Option<Arc<Library>>>,
     pub jobs: Mutex<HashMap<String, JobEntry>>,
     pub operation_gate: Mutex<()>,
-    pub previews: Mutex<HashMap<String, PathBuf>>,
+    pub previews: Mutex<PreviewResources>,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub watcher_generation: std::sync::atomic::AtomicU64,
     pub closing: AtomicBool,
@@ -96,5 +96,21 @@ impl AppState {
         Ok(lock(&self.jobs)?
             .values()
             .any(|entry| matches!(entry.job.status.as_str(), "queued" | "running")))
+    }
+}
+
+#[cfg(test)]
+pub fn test_state(library: Arc<Library>) -> AppState {
+    AppState {
+        settings: Mutex::new(Settings::default()),
+        settings_file: library.root().join("test-settings.json"),
+        startup_error: Mutex::new(None),
+        library: Mutex::new(Some(library)),
+        jobs: Mutex::new(HashMap::new()),
+        operation_gate: Mutex::new(()),
+        previews: Mutex::new(PreviewResources::default()),
+        watcher: Mutex::new(None),
+        watcher_generation: std::sync::atomic::AtomicU64::new(0),
+        closing: AtomicBool::new(false),
     }
 }

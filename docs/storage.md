@@ -13,6 +13,7 @@ Bibliothèque/
   workspaces/<asset-id>/<variant-id>/
   staging/                    # captures temporaires et journaux d’opération
   cache/previews/             # GLB d’aperçu, index JSON et temporaires marqués
+  cache/thumbnails/           # PNG fixes et index par variante, régénérables
   cache/exports/              # résultats dérivés des exports stricts
   backups/                    # sauvegardes de catalogue avant migration
 ```
@@ -48,7 +49,7 @@ Les gros transferts sont annulables. Une annulation survenue après une frontiè
 3. Sauvegarder séparément `settings.json` si les réglages globaux doivent aussi être conservés. Les fichiers externes référencés par un `.blend` ne font pas partie de la bibliothèque.
 4. Pour tester une restauration, copier la sauvegarde vers **un nouveau dossier**, ouvrir cette copie et matérialiser une version représentative. Conserver la bibliothèque actuelle jusqu’à validation de la copie restaurée.
 
-Le cache est régénérable, mais copier l’ensemble est le procédé le plus simple. Aperçus et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les fichiers originaux ne sont jamais remplacés par un aperçu. Les anciens caches deviennent simplement non réutilisés et sont évincés selon le budget ; aucun changement de schéma SQLite n’est nécessaire. Ne pas fusionner manuellement deux bibliothèques, ne pas modifier les objets, et ne pas remplacer seulement leur catalogue par celui d’une autre sauvegarde.
+Le cache est régénérable, mais copier l’ensemble est le procédé le plus simple. Aperçus GLB, vignettes PNG et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les PNG sont associés à la clé d’artefact et à une version du rendu ; ils ne font pas partie des versions de l’asset. Les fichiers originaux ne sont jamais remplacés par un aperçu. Les anciens caches deviennent simplement non réutilisés et sont évincés selon le budget ; aucun changement de schéma SQLite n’est nécessaire. Ne pas fusionner manuellement deux bibliothèques, ne pas modifier les objets, et ne pas remplacer seulement leur catalogue par celui d’une autre sauvegarde.
 
 Lorsqu’une notice signale une publication interrompue, fermer l’application et sauvegarder l’ensemble avant intervention. Le journal contient `workspace`, relatif à la racine. Si ce dossier existe, en faire une copie hors de la bibliothèque et importer cette copie comme un nouvel asset après vérification. Conserver les temporaires de publication pour diagnostic. Seuls les répertoires d’aperçu `.preview-tmp-*` dotés du marqueur interne attendu sont nettoyés automatiquement ; les données de travail et journaux ne sont pas concernés.
 

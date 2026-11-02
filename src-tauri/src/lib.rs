@@ -1,5 +1,6 @@
 mod commands;
 mod jobs;
+mod preview_resources;
 mod settings;
 mod state;
 
@@ -55,7 +56,7 @@ pub fn run() {
                 library: Mutex::new(library),
                 jobs: Mutex::new(HashMap::new()),
                 operation_gate: Mutex::new(()),
-                previews: Mutex::new(HashMap::new()),
+                previews: Mutex::new(preview_resources::PreviewResources::default()),
                 watcher: Mutex::new(None),
                 watcher_generation: std::sync::atomic::AtomicU64::new(0),
                 closing: std::sync::atomic::AtomicBool::new(false),
@@ -108,12 +109,13 @@ pub fn run() {
                 } else {
                     "http://tauri.localhost"
                 };
-                let path = if token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let resource = if token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())
+                {
                     state
                         .previews
                         .lock()
                         .ok()
-                        .and_then(|paths| paths.get(token).cloned())
+                        .and_then(|paths| paths.get(token))
                 } else {
                     None
                 };
@@ -121,17 +123,12 @@ pub fn run() {
                     tauri::http::Response::builder()
                         .status(405)
                         .body(Vec::new())
-                } else if let Some(path) = path {
-                    match std::fs::metadata(&path).and_then(|meta| {
-                        if meta.len() <= edge_lock_core::glb::MAX_PREVIEW_BYTES {
-                            std::fs::read(&path)
-                        } else {
-                            Err(std::io::Error::other("Aperçu trop volumineux"))
-                        }
-                    }) {
+                } else if let Some(resource) = resource {
+                    match resource.read() {
                         Ok(bytes) => tauri::http::Response::builder()
                             .status(200)
-                            .header("Content-Type", "model/gltf-binary")
+                            .header("Content-Type", resource.mime())
+                            .header("X-Content-Type-Options", "nosniff")
                             .header("Access-Control-Allow-Origin", origin)
                             .header("Cache-Control", "private, max-age=3600")
                             .body(bytes),
@@ -170,7 +167,11 @@ pub fn run() {
             commands::open_blender,
             commands::start_job,
             commands::get_job,
-            commands::cancel_job
+            commands::cancel_job,
+            commands::get_asset_thumbnails,
+            commands::store_thumbnail,
+            commands::release_preview_resources,
+            commands::invalidate_thumbnail
         ])
         .run(tauri::generate_context!())
         .expect("Impossible de démarrer Edge Lock");

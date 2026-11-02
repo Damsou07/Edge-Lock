@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,6 +33,7 @@ vi.mock("../api", () => ({
     openWorkspace: vi.fn(),
     openBlender: vi.fn(),
     copyText: vi.fn(),
+    releasePreviewResources: vi.fn(),
   },
 }));
 
@@ -116,8 +118,9 @@ beforeEach(() => {
   vi.mocked(api.onWorkspaceChanged).mockResolvedValue(() => {});
   vi.mocked(api.chooseExportPath).mockResolvedValue("C:\\Export\\drone.glb");
   vi.mocked(api.openBlender).mockResolvedValue(undefined);
+  vi.mocked(api.releasePreviewResources).mockResolvedValue(undefined);
   run.mockImplementation(async (request: JobRequest) =>
-    request.kind === "changes" ? changes : null,
+    request.kind === "changes" ? changes : generatedPreview,
   );
   vi.spyOn(HTMLDialogElement.prototype, "showModal").mockImplementation(
     function (this: HTMLDialogElement) {
@@ -161,7 +164,8 @@ describe("versions et travail en cours", () => {
     expect(screen.getByText("Cette version").parentElement).toHaveTextContent(
       "10 o",
     );
-    expect(screen.getByText("Triangles").parentElement).toHaveTextContent("—");
+    await screen.findByLabelText("Aperçu 3D interactif");
+    expect(screen.getByText("Triangles").parentElement).toHaveTextContent("12");
   });
   it("signale une modification externe sans créer de version automatiquement", async () => {
     renderDetail();
@@ -223,18 +227,22 @@ describe("versions et travail en cours", () => {
     };
     const rendered = render(<AssetDetailView {...props} />);
     await screen.findByText("Modifications non versionnées");
-    await userEvent.type(
-      screen.getByRole("textbox", { name: "Scène" }),
-      "Export",
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Scène" }),
+      "Scene",
     );
     rendered.rerender(<AssetDetailView {...props} generation={1} />);
     await waitFor(() => expect(api.getVariant).toHaveBeenCalledTimes(2));
     expect(
       screen.getByRole("button", { name: "Exporter .glb" }),
     ).toBeDisabled();
-    expect(screen.getByRole("textbox", { name: "Scène" })).toHaveValue(
-      "Export",
+    expect(screen.getByRole("combobox", { name: "Scène" })).toHaveValue(
+      "Scene",
     );
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
   });
 
   it("ne remplace un export existant qu’après confirmation", async () => {
@@ -295,6 +303,187 @@ describe("versions et travail en cours", () => {
 });
 
 describe("aperçu indépendant et dépendances", () => {
+  it("ne double pas la génération dans StrictMode", async () => {
+    render(
+      <StrictMode>
+        <AssetDetailView
+          id="asset-1"
+          taxonomy={{ categories: [], games: [], tags: [] }}
+          generation={0}
+          onBack={vi.fn()}
+          onChanged={vi.fn()}
+          onError={onError}
+          runJob={run as RunJob}
+        />
+      </StrictMode>,
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
+    expect(api.releasePreviewResources).not.toHaveBeenCalled();
+  });
+
+  it("attend les réglages de la nouvelle variante avant d’afficher son aperçu", async () => {
+    const alternate = {
+      ...variant.variant,
+      id: "variant-2",
+      name: "Désert",
+      config: { ...variant.variant.config, primaryFile: "desert.blend" },
+    };
+    vi.mocked(api.getAsset).mockResolvedValue({
+      ...detail,
+      variants: [...detail.variants, alternate],
+    });
+    let finishVariant: (value: VariantDetail) => void = () => {};
+    vi.mocked(api.getVariant).mockImplementation(async (id) => {
+      if (id === "variant-1") return variant;
+      return new Promise((resolve) => {
+        finishVariant = resolve;
+      });
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : {
+            ...generatedPreview,
+            url: `http://edge-preview.localhost/${"variantId" in request ? request.variantId : "unused"}`,
+          },
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Variante" }),
+      "variant-2",
+    );
+    expect(
+      screen.queryByLabelText("Aperçu 3D interactif"),
+    ).not.toBeInTheDocument();
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
+    await act(async () => finishVariant({ ...variant, variant: alternate }));
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toHaveAttribute("data-url", "http://edge-preview.localhost/variant-2");
+    expect(run).toHaveBeenCalledWith({
+      kind: "preview",
+      variantId: "variant-2",
+      snapshotId: null,
+    });
+    expect(
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+    ).toHaveValue("desert.blend");
+    expect(api.releasePreviewResources).toHaveBeenCalledWith(["variant-1"]);
+  });
+
+  it("charge automatiquement une seule fois et résiste au rafraîchissement global des métriques", async () => {
+    run.mockImplementation(async (request) =>
+      request.kind === "changes" ? changes : generatedPreview,
+    );
+    const props = {
+      id: "asset-1",
+      taxonomy: { categories: [], games: [], tags: [] },
+      generation: 0,
+      onBack: vi.fn(),
+      onChanged: vi.fn(),
+      onError,
+      runJob: run as RunJob,
+    };
+    const rendered = render(<AssetDetailView {...props} />);
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toHaveAttribute("data-url", generatedPreview.url);
+    rendered.rerender(<AssetDetailView {...props} generation={1} />);
+    await waitFor(() => expect(api.getVariant).toHaveBeenCalledTimes(2));
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
+    );
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(2);
+  });
+
+  it("préserve les réglages saisis et recharge après leur enregistrement uniquement", async () => {
+    let savedConfig = variant.variant.config;
+    vi.mocked(api.getVariant).mockImplementation(async () => ({
+      ...variant,
+      variant: { ...variant.variant, config: savedConfig },
+    }));
+    vi.mocked(api.updateConfig).mockImplementation(async (_, value) => {
+      savedConfig = value;
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes" ? changes : generatedPreview,
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    const save = screen.getByRole("button", {
+      name: "Enregistrer les réglages",
+    });
+    expect(save).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    );
+    expect(save).toBeEnabled();
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
+    await userEvent.click(save);
+    await waitFor(() =>
+      expect(
+        run.mock.calls.filter(([request]) => request.kind === "preview"),
+      ).toHaveLength(2),
+    );
+    expect(api.updateConfig).toHaveBeenCalledWith("variant-1", {
+      ...variant.variant.config,
+      applyModifiers: true,
+    });
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    ).toBeChecked();
+    expect(save).toBeDisabled();
+  });
+
+  it("libère les ressources affichées et les réponses arrivées après fermeture", async () => {
+    let finish: (value: PreviewResult) => void = () => {};
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      return new Promise<PreviewResult>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const rendered = renderDetail();
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: null,
+      }),
+    );
+    await act(async () => finish(generatedPreview));
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
+    );
+    rendered.unmount();
+    await act(async () =>
+      finish({
+        ...generatedPreview,
+        url: "http://edge-preview.localhost/late",
+      }),
+    );
+    expect(api.releasePreviewResources).toHaveBeenCalledWith(["generated"]);
+    expect(api.releasePreviewResources).toHaveBeenCalledWith(["late"]);
+  });
+
   it("affiche les arêtes et ignore les dépendances secondaires dans les alertes", async () => {
     run.mockImplementation(async (request) => {
       if (request.kind === "changes") return changes;
@@ -323,9 +512,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     expect(
       await screen.findByLabelText("Aperçu 3D interactif"),
     ).toBeInTheDocument();
@@ -359,9 +545,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     expect(
       await screen.findByLabelText("Aperçu 3D interactif"),
     ).toBeInTheDocument();
@@ -401,9 +584,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     await userEvent.selectOptions(
       await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
       "other.glb",
@@ -459,9 +639,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Blender n’a pas produit de GLB.",
     );
@@ -470,6 +647,15 @@ describe("aperçu indépendant et dépendances", () => {
     await userEvent.click(open);
     expect(api.openBlender).toHaveBeenCalledWith("variant-1");
     expect(onError).not.toHaveBeenCalled();
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(1);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+    );
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(2);
   });
 
   it("préserve l’analyse de la source lorsqu’un GLB original sert d’aperçu", async () => {
@@ -499,10 +685,12 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Analyser la source" }),
+    );
     expect(await screen.findByText("12 arêtes")).toBeInTheDocument();
     await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
     );
     expect(
       await screen.findByLabelText("Aperçu 3D interactif"),
@@ -529,9 +717,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     expect(await screen.findByText("— arêtes")).toBeInTheDocument();
     expect(screen.getByLabelText("Aperçu 3D interactif")).toBeInTheDocument();
   });
@@ -552,39 +737,55 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Analyser la source" }),
+    );
     await screen.findByText("12 arêtes");
     await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
     );
     expect(await screen.findByText("24 arêtes")).toBeInTheDocument();
   });
 
   it("ignore un aperçu terminé après le changement de version", async () => {
     let finishPreview: (value: PreviewResult) => void = () => {};
+    let finishSnapshot: (value: PreviewResult) => void = () => {};
     run.mockImplementation(async (request) => {
       if (request.kind === "changes") return changes;
       if (request.kind === "preview")
         return new Promise<PreviewResult>((resolve) => {
-          finishPreview = resolve;
+          if (request.snapshotId) finishSnapshot = resolve;
+          else finishPreview = resolve;
         });
       return null;
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
     await userEvent.click(
       await screen.findByRole("button", { name: /Consulter/ }),
     );
     await screen.findByText("Cette version");
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith({
+        kind: "preview",
+        variantId: "variant-1",
+        snapshotId: "snapshot-1",
+      }),
+    );
+    await act(async () =>
+      finishSnapshot({
+        ...generatedPreview,
+        url: "http://edge-preview.localhost/snapshot",
+      }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
     await act(async () => finishPreview(generatedPreview));
-    expect(
-      screen.queryByLabelText("Aperçu 3D interactif"),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByText("12 arêtes")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Aperçu 3D interactif")).toHaveAttribute(
+      "data-url",
+      "http://edge-preview.localhost/snapshot",
+    );
+    expect(api.releasePreviewResources).toHaveBeenCalledWith(["generated"]);
   });
 
   it("abandonne le choix d’un GLB supprimé dans le travail courant", async () => {
@@ -622,9 +823,6 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     await userEvent.selectOptions(
       await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
       "other.glb",
@@ -681,9 +879,6 @@ describe("aperçu indépendant et dépendances", () => {
       await screen.findByRole("button", { name: /Consulter/ }),
     );
     await screen.findByText("Cette version");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     await userEvent.selectOptions(
       await screen.findByRole("combobox", { name: "GLB de prévisualisation" }),
       "saved-b.glb",
@@ -723,9 +918,6 @@ describe("aperçu indépendant et dépendances", () => {
     );
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
-    );
     expect(await screen.findByText(/Analyse de la source/)).toHaveTextContent(
       "drone.blend",
     );
@@ -760,11 +952,13 @@ describe("aperçu indépendant et dépendances", () => {
     });
     renderDetail();
     await screen.findByText("Modifications non versionnées");
-    await userEvent.click(screen.getByRole("button", { name: "Analyser" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Analyser la source" }),
+    );
     await screen.findByText("12 arêtes");
     await act(async () => workspaceChanged("variant-1"));
     await userEvent.click(
-      screen.getByRole("button", { name: "Afficher l’aperçu 3D" }),
+      screen.getAllByRole("button", { name: "Actualiser" })[0]!,
     );
     await screen.findByLabelText("Aperçu 3D interactif");
     expect(screen.getByText("12 arêtes")).toBeInTheDocument();

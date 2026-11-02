@@ -62,6 +62,10 @@ fn sibling_glb_wins_without_blender_and_cache_survives_irrelevant_changes() {
         panic!("expected preview")
     };
     assert_eq!(first.source_file, "Kitsune_GameReady.glb");
+    assert_eq!(
+        first.path.file_stem().unwrap().to_str().unwrap(),
+        first.artifact_key
+    );
     assert!(!first.updates_geometry);
     assert_eq!(first.inspection.geometry.edges, Some(3));
     let modified = fs::metadata(&first.path).unwrap().modified().unwrap();
@@ -74,6 +78,7 @@ fn sibling_glb_wins_without_blender_and_cache_survives_irrelevant_changes() {
         panic!("expected preview")
     };
     assert_eq!(first.path, second.path);
+    assert_eq!(first.artifact_key, second.artifact_key);
     assert_eq!(
         fs::metadata(&second.path).unwrap().modified().unwrap(),
         modified
@@ -129,12 +134,119 @@ fn ambiguous_glbs_require_explicit_asset_relative_choice() {
         PreviewOutcome::Ready(_)
     ));
     assert!(prepare_preview(&library, request(Some("../outside.glb")), &ctx).is_err());
+    fs::remove_file(Path::new(&asset.variants[0].workspace_path).join("two.glb")).unwrap();
     triangle(&Path::new(&asset.variants[0].workspace_path).join("main.glb"));
     let PreviewOutcome::Ready(preview) = prepare_preview(&library, request(None), &ctx).unwrap()
     else {
         panic!("matching name should win")
     };
     assert_eq!(preview.source_file, "main.glb");
+}
+
+#[test]
+fn current_preview_choice_is_remembered_and_explicit_choice_has_priority() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    triangle(&source.join("one.glb"));
+    triangle(&source.join("two.glb"));
+    let library = Library::open(root.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&source, "Choices", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    let config = variant.config.clone();
+    let preview = |selected| {
+        prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: &variant.id,
+                snapshot_id: None,
+                preview_file: selected,
+                blender_path: None,
+            },
+            &ctx,
+        )
+        .unwrap()
+    };
+    let PreviewOutcome::Ready(chosen) = preview(Some("two.glb")) else {
+        panic!("explicit choice")
+    };
+    let PreviewOutcome::Ready(reused) = preview(None) else {
+        panic!("remembered choice must resolve the ambiguity")
+    };
+    assert_eq!(chosen.path, reused.path);
+    assert_eq!(reused.source_file, "two.glb");
+    assert!(
+        matches!(preview(Some("one.glb")), PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb")
+    );
+    assert!(
+        matches!(preview(None), PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb")
+    );
+    assert_eq!(
+        library.get_variant(&variant.id).unwrap().variant.config,
+        config
+    );
+    fs::remove_file(Path::new(&variant.workspace_path).join("one.glb")).unwrap();
+    assert!(
+        matches!(preview(None), PreviewOutcome::Ready(artifact) if artifact.source_file == "two.glb")
+    );
+    assert_eq!(
+        fs::read(source.join("one.glb")).unwrap(),
+        fs::read(source.join("two.glb")).unwrap()
+    );
+}
+
+#[test]
+fn remembered_preview_choice_is_scoped_to_current_config_and_never_used_or_saved_by_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    triangle(&source.join("one.glb"));
+    triangle(&source.join("two.glb"));
+    let library = Library::open(root.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&source, "Choices", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    let preview = |snapshot_id, preview_file| {
+        prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: &variant.id,
+                snapshot_id,
+                preview_file,
+                blender_path: None,
+            },
+            &ctx,
+        )
+        .unwrap()
+    };
+    preview(None, Some("two.glb"));
+    assert!(matches!(
+        preview(Some(&variant.head_snapshot_id), None),
+        PreviewOutcome::Choose(_)
+    ));
+    preview(Some(&variant.head_snapshot_id), Some("one.glb"));
+    assert!(
+        matches!(preview(None,None),PreviewOutcome::Ready(artifact) if artifact.source_file == "two.glb")
+    );
+    library
+        .update_config(
+            &variant.id,
+            ExportConfig {
+                apply_modifiers: !variant.config.apply_modifiers,
+                ..variant.config.clone()
+            },
+        )
+        .unwrap();
+    assert!(matches!(preview(None, None), PreviewOutcome::Choose(_)));
+    assert!(matches!(
+        preview(Some(&variant.head_snapshot_id), None),
+        PreviewOutcome::Choose(_)
+    ));
 }
 
 fn blender_executable() -> PathBuf {

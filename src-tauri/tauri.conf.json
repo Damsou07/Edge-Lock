@@ -6,7 +6,7 @@
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": {
     "windows": [{ "title": "Edge Lock", "width": 1440, "height": 940, "minWidth": 1024, "minHeight": 700, "backgroundColor": "#0d1118", "dragDropEnabled": true }],
-    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost blob: data:; connect-src ipc: http://ipc.localhost 'self' edge-preview: http://edge-preview.localhost; worker-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'self'", "capabilities": ["main"] }
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost edge-preview: http://edge-preview.localhost blob: data:; connect-src blob: data: ipc: http://ipc.localhost 'self' edge-preview: http://edge-preview.localhost; worker-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'self'", "capabilities": ["main"] }
   },
   "bundle": { "active": true, "targets": ["nsis"], "icon": ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"], "windows": { "nsis": { "installMode": "currentUser", "languages": ["French", "English"], "displayLanguageSelector": false } } }
 }

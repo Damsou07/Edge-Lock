@@ -142,12 +142,20 @@ export interface PreviewResult {
   sourceFile: string;
   sourceKind: "assetGlb" | "generatedGlb";
 }
+export interface ThumbnailResource {
+  url: string;
+  resourceToken: string;
+}
+export type ThumbnailResult =
+  | ({ state: "ready" } & ThumbnailResource)
+  | { state: "render"; preview: PreviewResult; resourceToken: string };
 export interface AppError {
   code: string;
   message: string;
   details?: { candidates?: string[] } | null;
 }
 export type JobRequest =
+  | { kind: "thumbnail"; assetId: string }
   | { kind: "import"; source: string; name: string; config: ExportConfig }
   | { kind: "create"; name: string }
   | { kind: "snapshot"; variantId: string; message: string }

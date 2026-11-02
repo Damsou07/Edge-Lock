@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { Icon } from "./Icon";
 import {
-  inspectGlb,
-  isEmbeddedImageUri,
-  MAX_PREVIEW_BYTES,
-} from "./viewer-utils";
+  createPreviewRenderer,
+  createPreviewStage,
+  disposePreviewRenderer,
+  framePreviewModel,
+  loadPreviewModel,
+  releaseModel,
+} from "./viewer-runtime";
 import { errorMessage } from "../lib/format";
 
 type ViewerRuntime = {
@@ -15,35 +18,6 @@ type ViewerRuntime = {
   play: (index: number, playing: boolean) => void;
   seek: (time: number) => void;
 };
-
-function releaseModel(root: THREE.Object3D) {
-  const geometries = new Set<THREE.BufferGeometry>();
-  const materials = new Set<THREE.Material>();
-  const textures = new Set<THREE.Texture>();
-  const skeletons = new Set<THREE.Skeleton>();
-  root.traverse((object) => {
-    if (object instanceof THREE.Mesh) {
-      geometries.add(object.geometry);
-      for (const material of Array.isArray(object.material)
-        ? object.material
-        : [object.material])
-        materials.add(material);
-    }
-    if (object instanceof THREE.SkinnedMesh) skeletons.add(object.skeleton);
-  });
-  for (const material of materials)
-    for (const value of Object.values(material))
-      if (value instanceof THREE.Texture) textures.add(value);
-  for (const texture of textures) {
-    const bitmap: unknown = texture.source.data;
-    if (typeof ImageBitmap !== "undefined" && bitmap instanceof ImageBitmap)
-      bitmap.close();
-    texture.dispose();
-  }
-  geometries.forEach((resource) => resource.dispose());
-  materials.forEach((resource) => resource.dispose());
-  skeletons.forEach((resource) => resource.dispose());
-}
 
 export default function ModelViewer({
   url,
@@ -70,6 +44,8 @@ export default function ModelViewer({
     let renderer: THREE.WebGLRenderer | undefined;
     let controls: OrbitControls | undefined;
     let loaded: THREE.Object3D | undefined;
+    let loadedModel: GLTF | undefined;
+    let stage: ReturnType<typeof createPreviewStage> | undefined;
     let mixer: THREE.AnimationMixer | undefined;
     let action: THREE.AnimationAction | undefined;
     let resize: ResizeObserver | undefined;
@@ -83,18 +59,9 @@ export default function ModelViewer({
     setPlaying(false);
     setClip(0);
     setTime(0);
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 10_000);
-    scene.background = new THREE.Color("#141a23");
-    scene.add(new THREE.HemisphereLight(0xdceaff, 0x555e73, 2.7));
-    const key = new THREE.DirectionalLight(0xffffff, 3.4);
-    key.position.set(4, 6, 5);
-    scene.add(key);
-    const fill = new THREE.DirectionalLight(0x8bbcff, 1.6);
-    fill.position.set(-4, 2, -3);
-    scene.add(fill);
     const render = () => {
-      if (!disposed && renderer) renderer.render(scene, camera);
+      if (!disposed && renderer && stage)
+        renderer.render(stage.scene, stage.camera);
     };
     const fail = (reason: unknown) => {
       if (!disposed) {
@@ -122,84 +89,51 @@ export default function ModelViewer({
       frameId = requestAnimationFrame(animate);
     };
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
-      renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.05;
+      renderer = createPreviewRenderer();
+      stage = createPreviewStage(renderer);
+      const { scene, camera } = stage;
       renderer.domElement.setAttribute("aria-label", "Aperçu 3D interactif");
       renderer.domElement.addEventListener("webglcontextlost", contextLost);
       container.appendChild(renderer.domElement);
       controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = false;
       controls.addEventListener("change", render);
-      resize = new ResizeObserver(() => {
+      const resizeCanvas = () => {
         const width = Math.max(1, container.clientWidth);
         const height = Math.max(1, container.clientHeight);
         renderer?.setSize(width, height, false);
         camera.aspect = width / height;
         camera.updateProjectionMatrix();
         render();
-      });
+      };
+      resizeCanvas();
+      resize = new ResizeObserver(resizeCanvas);
       resize.observe(container);
       void (async () => {
-        const response = await fetch(url, { signal: abort.signal });
-        if (!response.ok)
-          throw new Error("Impossible de charger le fichier d’aperçu.");
-        if (Number(response.headers.get("content-length")) > MAX_PREVIEW_BYTES)
-          throw new Error(
-            "Cet aperçu dépasse 256 Mo. Ouvrez l’asset dans Blender.",
-          );
-        const bytes = await response.arrayBuffer();
-        inspectGlb(bytes);
-        if (disposed) return;
-        const manager = new THREE.LoadingManager();
-        manager.setURLModifier((resource) => {
-          if (!resource.startsWith("blob:") && !isEmbeddedImageUri(resource))
-            throw new Error("Ressource externe interdite dans l’aperçu.");
-          return resource;
-        });
-        const model = await new GLTFLoader(manager).parseAsync(bytes, "");
+        const model = await loadPreviewModel(url, abort.signal);
         if (disposed) {
-          releaseModel(model.scene);
+          releaseModel(model.scene, ...model.scenes);
           return;
         }
+        loadedModel = model;
         loaded = model.scene;
         scene.add(loaded);
         const frame = () => {
-          if (!loaded || !controls) return;
-          const box = new THREE.Box3().setFromObject(loaded);
-          if (box.isEmpty()) {
-            fail(
-              new Error("Cette scène ne contient aucune géométrie visible."),
-            );
-            return;
+          if (!loaded || !controls) return false;
+          let framed: ReturnType<typeof framePreviewModel>;
+          try {
+            framed = framePreviewModel(loaded, camera);
+          } catch (reason) {
+            fail(reason);
+            return false;
           }
-          const center = box.getCenter(new THREE.Vector3());
-          const radius = Math.max(
-            box.getSize(new THREE.Vector3()).length() / 2,
-            0.01,
-          );
-          const verticalFov = THREE.MathUtils.degToRad(camera.fov / 2);
-          const limitingFov = Math.min(
-            verticalFov,
-            Math.atan(Math.tan(verticalFov) * camera.aspect),
-          );
-          const distance = (radius / Math.sin(limitingFov)) * 1.2;
-          camera.position
-            .copy(center)
-            .add(
-              new THREE.Vector3(1, 0.7, 1.2)
-                .normalize()
-                .multiplyScalar(distance),
-            );
-          camera.near = Math.max(radius / 1000, 0.0001);
-          camera.far = Math.max(radius * 100, 10);
-          camera.updateProjectionMatrix();
-          controls.target.copy(center);
+          const { target, radius } = framed;
+          controls.target.copy(target);
           controls.minDistance = radius * 0.05;
           controls.maxDistance = radius * 30;
           controls.update();
           render();
+          return true;
         };
         mixer = new THREE.AnimationMixer(loaded);
         const play = (index: number, active: boolean) => {
@@ -241,7 +175,7 @@ export default function ModelViewer({
             duration: item.duration,
           })),
         );
-        frame();
+        if (!frame()) return;
         if (model.animations.length) play(0, false);
         setStatus("ready");
         render();
@@ -261,16 +195,16 @@ export default function ModelViewer({
       mixer?.stopAllAction();
       if (loaded) {
         mixer?.uncacheRoot(loaded);
-        scene.remove(loaded);
-        releaseModel(loaded);
+        loaded.removeFromParent();
       }
+      if (loadedModel) releaseModel(loadedModel.scene, ...loadedModel.scenes);
+      stage?.dispose();
       if (renderer) {
         renderer.domElement.removeEventListener(
           "webglcontextlost",
           contextLost,
         );
-        renderer.dispose();
-        renderer.domElement.remove();
+        disposePreviewRenderer(renderer);
       }
     };
   }, [url]);

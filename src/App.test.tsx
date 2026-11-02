@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { api } from "./api";
-import type { Asset, Bootstrap } from "./contracts";
+import type { Asset, Bootstrap, Job } from "./contracts";
 
 vi.mock("./api", () => ({
   api: {
@@ -18,6 +18,10 @@ vi.mock("./api", () => ({
     getAsset: vi.fn(),
     startJob: vi.fn(),
     getJob: vi.fn(),
+    cancelJob: vi.fn(),
+    getAssetThumbnails: vi.fn(),
+    releasePreviewResources: vi.fn(),
+    invalidateThumbnail: vi.fn(),
   },
 }));
 
@@ -68,9 +72,104 @@ beforeEach(() => {
     tags: [],
   });
   vi.mocked(api.listAssets).mockResolvedValue({ items: [], total: 0 });
+  vi.mocked(api.getAssetThumbnails).mockResolvedValue({});
+  vi.mocked(api.releasePreviewResources).mockResolvedValue(undefined);
+  vi.mocked(api.cancelJob).mockResolvedValue(undefined);
+  // Visibility itself is exercised by the dedicated thumbnail queue tests.
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("respecte la navigation choisie pendant l’annulation d’une vignette avant ouverture", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
+    vi.mocked(api.listAssets).mockImplementation(async (filter) =>
+      filter.archived ? { items: [], total: 0 } : { items: [sample], total: 1 },
+    );
+    vi.mocked(api.getAsset).mockResolvedValue({ asset: sample, variants: [] });
+    let showCard!: () => void;
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(
+          callback: (entries: { isIntersecting: boolean }[]) => void,
+        ) {
+          showCard = () => callback([{ isIntersecting: true }]);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.mocked(api.startJob).mockResolvedValue("thumbnail-pending");
+    let finish!: (job: Job) => void;
+    vi.mocked(api.getJob).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<App />);
+    const card = await screen.findByRole("button", {
+      name: /Robot explorateur/,
+    });
+    act(() => showCard());
+    await waitFor(() =>
+      expect(api.getJob).toHaveBeenCalledWith("thumbnail-pending"),
+    );
+    await userEvent.click(card);
+    await waitFor(() =>
+      expect(api.cancelJob).toHaveBeenCalledWith("thumbnail-pending"),
+    );
+    expect(api.getAsset).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Archives" }));
+    await waitFor(() =>
+      expect(api.listAssets).toHaveBeenLastCalledWith(
+        expect.objectContaining({ archived: true }),
+      ),
+    );
+    await act(async () =>
+      finish({
+        id: "thumbnail-pending",
+        kind: "thumbnail",
+        status: "cancelled",
+        phase: "Annulé",
+        completed: 0,
+        total: null,
+        result: null,
+        error: null,
+      }),
+    );
+    expect(api.getAsset).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("heading", { name: /^Archives/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Retour à la bibliothèque"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("affiche une image fixe en cache dans la carte, sans visionneuse 3D", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
+    vi.mocked(api.listAssets).mockResolvedValue({ items: [sample], total: 1 });
+    vi.mocked(api.getAssetThumbnails).mockResolvedValue({
+      [sample.id]: {
+        url: "http://edge-preview.localhost/image",
+        resourceToken: "image",
+      },
+    });
+    const { container } = render(<App />);
+    const image = await screen.findByAltText(
+      "Aperçu texturé de Robot explorateur",
+    );
+    expect(image).toHaveAttribute("src", "http://edge-preview.localhost/image");
+    expect(container.querySelector("canvas")).toBeNull();
+    expect(api.startJob).not.toHaveBeenCalled();
+  });
   it("demande un emplacement réel et respecte l’annulation du sélecteur", async () => {
     vi.mocked(api.chooseFolder).mockResolvedValue(null);
     render(<App />);

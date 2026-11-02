@@ -10,7 +10,8 @@ const paths = {
   import: "M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6",
   export: "M12 15V3m-5 5 5-5 5 5M4 15v6h16v-6",
   settings:
-    "m9 3-1 3-3 1-2 3 2 2-1 4 3 2 3-1 3 1 3-2-1-4 2-2-2-3-3-1-1-3H9Zm6 9a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
+    "M9.7 3h4.6l.5 2.2 1.7 1 2.2-.7 2.3 4-1.7 1.5v2l1.7 1.5-2.3 4-2.2-.7-1.7 1-.5 2.2H9.7l-.5-2.2-1.7-1-2.2.7-2.3-4 1.7-1.5v-2L3 9.5l2.3-4 2.2.7 1.7-1L9.7 3Zm5.3 9a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
+  organize: "M9 3h6v5H9V3ZM3 16h6v5H3v-5Zm12 0h6v5h-6v-5ZM12 8v4M6 16v-4h12v4",
   chevron: "m9 5 7 7-7 7",
   down: "m6 9 6 6 6-6",
   back: "m12 5-7 7 7 7M5 12h15",
@@ -18,8 +19,9 @@ const paths = {
   game: "M6 7h12l3 10-3 2-4-4h-4l-4 4-3-2L6 7Zm1 3v4m-2-2h4m6-1h.01m3 2h.01",
   tag: "M3 3h8l10 10-8 8L3 11V3Zm4 4h.01",
   branch:
-    "M6 3v12a5 5 0 0 0 10 0V9M6 9c7 0 10-2 10-6M3 18a3 3 0 1 0 6 0 3 3 0 1 0-6 0",
-  history: "M3 11a9 9 0 1 1 2 7M3 4v7h7m2-4v5l4 2",
+    "M8 5a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm0 14a2 2 0 1 1-4 0 2 2 0 0 1 4 0ZM20 5a2 2 0 1 1-4 0 2 2 0 0 1 4 0ZM6 7v10M18 7v2a5 5 0 0 1-5 5H6",
+  diff: "M5 3h10l4 4v14H5V3Zm10 0v5h4M8 12h6m-3-3v6m-3 3h6",
+  history: "M3 11a9 9 0 1 1 2.6 7.4M3 4v7h7m2-4v5l4 2",
   file: "M5 3h9l5 5v13H5V3Zm9 0v6h5M8 13h8M8 17h5",
   check: "m5 12 4 4L19 6",
   copy: "M8 8h12v13H8zM16 8V3H3v13h5",
@@ -33,8 +35,8 @@ const paths = {
   archive: "M3 3h18v5H3zM5 8v13h14V8M9 12h6",
   clock: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-5v5l3 2",
   database:
-    "M21 5c0 2-4 3-9 3S3 7 3 5s4-3 9-3 9 1 9 3Zm0 0v14c0 2-4 3-9 3s-9-1-9-3V5m0 7c0 2 4 3 9 3s9-1 9-3",
-  mesh: "m12 3 9 6-3 11H6L3 9l9-6Zm0 0L6 20m6-17 6 17M3 9h18M6 20l6-11 6 11",
+    "M21 5c0 1.7-4 3-9 3S3 6.7 3 5s4-3 9-3 9 1.3 9 3ZM3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3",
+  mesh: "M12 3 3 8v9l9 5 9-5V8l-9-5Zm0 0v19M3 8l18 9M21 8 3 17M3 8l9 5 9-5",
   sparkle: "m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3 3-7Z",
   arrow: "M5 12h14m-6-6 6 6-6 6",
 } as const;
@@ -58,7 +60,7 @@ export function Icon({
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.65"
+      strokeWidth="2"
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"

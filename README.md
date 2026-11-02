@@ -4,7 +4,7 @@ Edge Lock est une application desktop Windows pour centraliser des dossiers d’
 
 ## Installation Windows
 
-L’installateur **0.1.0 x64** construit localement se trouve dans `target/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque est choisie au premier lancement et reste séparée de l’application. WebView2 est requis. Blender est facultatif pour gérer et versionner les dossiers et les GLB, mais requis pour les opérations sur les `.blend`.
+L’installateur **0.1.0 x64** de cette construction se trouve dans `target/automatic-preview/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque est choisie au premier lancement et reste séparée de l’application. WebView2 est requis. Blender est facultatif pour gérer et versionner les dossiers et les GLB, mais requis pour les opérations sur les `.blend`.
 
 Le binaire et l’installateur ont été construits et leur version vérifiée. L’installation et la mise à niveau en VM jetable restent à valider ; voir [le bilan de validation](docs/validation.md).
 
@@ -21,15 +21,21 @@ Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieur
 
 ## Aperçu et export
 
-L’aperçu 3D fournit navigation orbitale et lecture des animations GLB. Il privilégie un GLB déjà présent dans l’asset : choix explicite d’aperçu, GLB principal, GLB portant le nom du `.blend`, puis unique GLB disponible. Si plusieurs candidats restent possibles, un sélecteur permet de choisir sans changer le fichier principal. Sans GLB, Blender produit automatiquement un aperçu en arrière-plan dans le cache local, sans sauvegarder le `.blend` ni écraser un GLB original.
+La bibliothèque affiche des vignettes texturées fixes, sans rotation ni animation. Les dernières images en cache apparaissent immédiatement, puis les cartes visibles sont vérifiées et préparées une à la fois. Sans aperçu existant, Blender effectue la première conversion en arrière-plan ; les passages suivants réutilisent le GLB et la vignette. La première variante, identique à celle ouverte par défaut dans la fiche, représente l’asset. Une source ambiguë ou une erreur reste indiquée sur la carte et se résout dans la fiche.
 
-L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. Les calculs sont lancés à la demande.
+L’aperçu 3D s’ouvre automatiquement dans la fiche et fournit navigation orbitale et lecture des animations GLB. Les statistiques et dépendances disponibles s’affichent avec le modèle. Il privilégie un GLB déjà présent dans l’asset : choix explicite d’aperçu, GLB principal, GLB portant le nom du `.blend`, puis unique GLB disponible. Si plusieurs candidats restent possibles, un sélecteur permet de choisir sans changer le fichier principal. Sans GLB, Blender produit automatiquement un aperçu en arrière-plan dans le cache local, sans sauvegarder le `.blend` ni écraser un GLB original. L’ouverture d’une fiche ou une opération utilisateur suspend la préparation des vignettes.
+
+Le rendu conserve les textures, UV, transparences et matériaux pris en charge par glTF. Un environnement de studio généré localement éclaire les matériaux PBR, notamment métalliques, sans téléchargement. Les shaders procéduraux propres à Blender ne sont pas automatiquement convertis en textures : préparer des matériaux compatibles glTF reste nécessaire pour ces cas.
+
+Le choix explicite d’un GLB d’aperçu du travail courant est mémorisé dans le cache pour la fiche et sa vignette, sans modifier le fichier principal ni les versions. Un changement de configuration ou la disparition du GLB invalide ce choix. Les aperçus historiques restent indépendants.
+
+L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. **Analyser la source** actualise explicitement la géométrie, les scènes, les collections et les dépendances de la source enregistrée. **Enregistrer les réglages** conserve le fichier principal, la scène, la collection et les options d’export ; ce bouton ne sauvegarde pas le fichier Blender et ne crée aucune version.
 
 Pour un `.blend`, choisir le fichier principal, éventuellement une scène et une collection racine. Les sous-collections sont incluses. L’application des modificateurs à l’export est désactivée par défaut pour préserver les shape keys et animations compatibles avec glTF. Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
 
 Les dépendances externes ou manquantes ne bloquent pas l’aperçu. La section **Dépendances** signale les ressources utiles au rendu ; les polices et brosses inutilisées ne déclenchent pas d’alerte. Une texture manquante peut être remplacée uniquement en mémoire pour afficher un modèle dégradé. Un échec de conversion laisse le fichier Blender accessible.
 
-Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. Il suit le contenu des sources utiles, y compris textures externes et bibliothèques liées ; modifier un rapport ou une capture ne régénère pas l’aperçu. Les temporaires d’aperçu identifiés comme appartenant à l’application sont nettoyés après interruption. Les tâches sont sérialisées et le budget commun des caches reste de 2 Gio.
+Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. Il suit le contenu des sources utiles, y compris textures externes et bibliothèques liées ; modifier un rapport ou une capture ne régénère pas l’aperçu. Les vignettes PNG de 512 × 384 sont liées à l’artefact GLB et à la version du rendu. Leur production utilise un seul contexte WebGL temporaire, libéré après la capture. Les temporaires d’aperçu identifiés comme appartenant à l’application sont nettoyés après interruption. Les tâches sont sérialisées et le budget commun des caches, vignettes comprises, reste de 2 Gio.
 
 Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les exports Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut donc influencer un aperçu historique.
 
@@ -74,6 +80,6 @@ npm run build
 npm run tauri build
 ```
 
-`npm run dev` seul lance uniquement l’interface web ; les opérations de bibliothèque nécessitent l’application Tauri. La construction Tauri produit l’exécutable dans `target/release/` et l’installateur NSIS dans `target/release/bundle/nsis/`. L’installateur vise l’utilisateur courant. Les données sont stockées dans la bibliothèque choisie, séparément du dossier d’installation.
+`npm run dev` seul lance uniquement l’interface web ; les opérations de bibliothèque nécessitent l’application Tauri. La construction Tauri produit par défaut l’exécutable dans `target/release/` et l’installateur NSIS dans `target/release/bundle/nsis/`. `CARGO_TARGET_DIR` permet une construction isolée ; celle validée pour les aperçus automatiques utilise `target/automatic-preview/`. L’installateur vise l’utilisateur courant. Les données sont stockées dans la bibliothèque choisie, séparément du dossier d’installation.
 
 Les tests Blender, desktop WebView2, performance et installation isolée demandent des prérequis supplémentaires ; leurs commandes et limites sont détaillées dans [docs/validation.md](docs/validation.md).

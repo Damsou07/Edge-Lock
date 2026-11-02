@@ -4,6 +4,7 @@ import { errorMessage } from "../lib/format";
 import { Icon } from "./Icon";
 
 const names: Record<Job["kind"], string> = {
+  thumbnail: "Préparation de la vignette",
   import: "Import du dossier",
   create: "Création de l’asset",
   snapshot: "Création de la version",
@@ -26,10 +27,11 @@ export function Jobs({
   const visible = jobs
     .filter(
       (job) =>
-        job.status === "running" ||
-        job.status === "queued" ||
-        job.status === "failed" ||
-        !["changes", "inspect", "preview"].includes(job.kind),
+        job.kind !== "thumbnail" &&
+        (job.status === "running" ||
+          job.status === "queued" ||
+          job.status === "failed" ||
+          !["changes", "inspect", "preview"].includes(job.kind)),
     )
     .slice(0, 3);
   if (!visible.length) return null;

@@ -16,6 +16,7 @@ import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve, join, relative, isAbsolute, sep } from "node:path";
 import { createHash } from "node:crypto";
+import { animatedTexturedTriangle as animatedTriangle } from "./e2e-fixtures.mjs";
 
 const root = resolve(".");
 await mkdir(".test-data", { recursive: true });
@@ -190,6 +191,408 @@ async function newSession() {
 async function screenshot(name) {
   const base64 = await request("GET", `/session/${session}/screenshot`);
   await writeFile(join(testRoot, name), Buffer.from(base64, "base64"));
+  return base64;
+}
+
+async function assertTexturePixels(selector, name) {
+  const base64 = await screenshot(name);
+  const result = await request("POST", `/session/${session}/execute/async`, {
+    script: `
+      const [base64, selector, done] = arguments;
+      const element = document.querySelector(selector);
+      if (!element) { done({ error: 'Missing texture capture region: ' + selector }); return; }
+      const rect = element.getBoundingClientRect();
+      const image = new Image();
+      image.onerror = () => done({ error: 'Unable to decode the WebDriver screenshot' });
+      image.onload = () => {
+        try {
+          const scaleX = image.naturalWidth / innerWidth;
+          const scaleY = image.naturalHeight / innerHeight;
+          const x = Math.max(0, Math.floor(rect.left * scaleX));
+          const y = Math.max(0, Math.floor(rect.top * scaleY));
+          const width = Math.min(image.naturalWidth - x, Math.ceil(rect.width * scaleX));
+          const height = Math.min(image.naturalHeight - y, Math.ceil(rect.height * scaleY));
+          if (width <= 0 || height <= 0) throw new Error('Texture region is outside the viewport');
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          const context = canvas.getContext('2d');
+          context.drawImage(image, x, y, width, height, 0, 0, width, height);
+          const pixels = context.getImageData(0, 0, width, height).data;
+          let red = 0, green = 0;
+          for (let i = 0; i < pixels.length; i += 4) {
+            const [r, g, b] = [pixels[i], pixels[i + 1], pixels[i + 2]];
+            if (r > 60 && r > g * 1.5 && r > b * 1.5) red++;
+            // ACES and studio image-based lighting brighten saturated greens.
+            // White/missing textures still fail both chromatic dominance checks.
+            if (g > 60 && g > r * 1.12 && g > b * 1.25) green++;
+          }
+          done({ red, green, width, height });
+        } catch (error) { done({ error: String(error) }); }
+      };
+      image.src = 'data:image/png;base64,' + base64;
+    `,
+    args: [base64, selector],
+  });
+  assert.ok(!result.error, result.error);
+  assert.ok(
+    result.red > 20 && result.green > 20,
+    `Embedded texture missing in ${selector}: ${JSON.stringify(result)}`,
+  );
+  return result;
+}
+
+async function waitForThumbnail(name) {
+  return until(
+    () =>
+      script(
+        `
+    const card = Array.from(document.querySelectorAll('.asset-card')).find(element => element.innerText.includes(arguments[0]));
+    card?.scrollIntoView({ block: 'nearest' });
+    const image = card?.querySelector('.asset-thumbnail img');
+    return image?.complete && image.naturalWidth > 0 && !card.querySelector('.thumbnail-status') ? image.currentSrc : null;
+  `,
+        [name],
+      ),
+    300_000,
+  );
+}
+
+async function resourceAccessible(url) {
+  const result = await request("POST", `/session/${session}/execute/async`, {
+    script: `const [url, done] = arguments; const fetchResource = window.__edgeLockE2EAudit?.fetch ?? window.fetch.bind(window); fetchResource(url, {cache:'no-store'}).then(response => done(response.ok)).catch(() => done(false));`,
+    args: [url],
+  });
+  return result;
+}
+
+async function installNavigationAudit() {
+  await script(`
+    const contexts = new Set(), blobs = new Set();
+    const audit = window.__edgeLockE2EAudit = { contexts, blobs, modelUrls: [], maxContexts: 0, createdContexts: 0, fetch: window.fetch.bind(window) };
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+      const context = getContext.call(this, type, ...args);
+      if (context && ['webgl', 'webgl2', 'experimental-webgl'].includes(type) && !contexts.has(context)) {
+        contexts.add(context); audit.createdContexts++;
+        audit.maxContexts = Math.max(audit.maxContexts, contexts.size);
+        this.addEventListener('webglcontextlost', () => contexts.delete(context), { once: true });
+      }
+      return context;
+    };
+    const createUrl = URL.createObjectURL.bind(URL), revokeUrl = URL.revokeObjectURL.bind(URL);
+    URL.createObjectURL = object => { const url = createUrl(object); blobs.add(url); return url; };
+    URL.revokeObjectURL = url => { blobs.delete(url); revokeUrl(url); };
+    window.fetch = async (...args) => {
+      const response = await audit.fetch(...args);
+      if (response.headers.get('content-type')?.includes('model/gltf-binary')) audit.modelUrls.push(response.url || String(args[0]));
+      return response;
+    };
+    return true;
+  `);
+}
+
+async function navigationSnapshot() {
+  return script(`
+    const audit = window.__edgeLockE2EAudit;
+    const memory = performance.memory;
+    return {
+      canvases: document.querySelectorAll('.viewer-canvas canvas').length,
+      contexts: audit.contexts.size,
+      maxContexts: audit.maxContexts,
+      createdContexts: audit.createdContexts,
+      blobUrls: audit.blobs.size,
+      latestModelUrl: audit.modelUrls.at(-1) ?? null,
+      heap: memory ? { used: memory.usedJSHeapSize, total: memory.totalJSHeapSize, limit: memory.jsHeapSizeLimit } : null,
+    };
+  `);
+}
+
+function timings(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    median: sorted[Math.floor(sorted.length / 2)],
+    p95: sorted[Math.ceil(sorted.length * 0.95) - 1],
+  };
+}
+
+async function testNavigationPerformance() {
+  const warmLibraryStarted = performance.now();
+  await clickText("Retour à la bibliothèque");
+  await waitForThumbnail("Éclaireur");
+  report.previewPerformance.libraryWarmFirstMs = Math.round(
+    performance.now() - warmLibraryStarted,
+  );
+  await installNavigationAudit();
+  const before = await navigationSnapshot();
+  const samples = [];
+  for (let index = 0; index < 10; index++) {
+    const detailStarted = performance.now();
+    await clickText("Éclaireur");
+    await waitForModel("model.glb");
+    const detailMs = Math.round(performance.now() - detailStarted);
+    const active = await navigationSnapshot();
+    assert.equal(active.canvases, 1);
+    assert.equal(active.contexts, 1);
+    assert.ok(
+      active.latestModelUrl,
+      "The detail must fetch its model automatically.",
+    );
+    assert.equal(await resourceAccessible(active.latestModelUrl), true);
+    const galleryStarted = performance.now();
+    await clickText("Retour à la bibliothèque");
+    await waitForThumbnail("Éclaireur");
+    await until(async () => (await navigationSnapshot()).contexts === 0);
+    await until(async () => !(await resourceAccessible(active.latestModelUrl)));
+    const idle = await navigationSnapshot();
+    assert.equal(idle.canvases, 0);
+    assert.equal(idle.blobUrls, 0, "Embedded-image blob URLs must be revoked.");
+    assert.ok(
+      idle.maxContexts <= 1,
+      "A static gallery must not keep WebGL contexts alive.",
+    );
+    samples.push({
+      detailMs,
+      libraryMs: Math.round(performance.now() - galleryStarted),
+      ...idle,
+    });
+  }
+  const after = await navigationSnapshot();
+  report.previewPerformance.navigation = {
+    cycles: 10,
+    detailWarmMs: timings(samples.map((sample) => sample.detailMs)),
+    libraryWarmMs: timings(samples.map((sample) => sample.libraryMs)),
+    maxContexts: after.maxContexts,
+    idleContexts: after.contexts,
+    liveBlobUrls: after.blobUrls,
+    releasedModelUrls: 10,
+    resourceRegistryTotal:
+      "Non exposé par l’API ; les dix URL de modèles deviennent inaccessibles après navigation.",
+    memoryBefore: before.heap,
+    memoryAfter: after.heap,
+    memoryStatus:
+      before.heap && after.heap
+        ? "Tas JavaScript mesuré"
+        : "Indisponible : cette WebView2 n’expose pas performance.memory",
+    usedHeapDelta:
+      before.heap && after.heap ? after.heap.used - before.heap.used : null,
+    memoryLimit:
+      "performance.memory mesure le tas JavaScript lorsque disponible, pas la RAM totale WebView2 ni la mémoire GPU. Aucun GC forcé.",
+    samples,
+  };
+  report.checks.push(
+    "Dix allers-retours : un contexte WebGL dans la fiche, zéro dans la galerie, URL modèles libérées et aucune URL blob conservée",
+  );
+}
+
+async function reloadWithNavigationAudit(timeout) {
+  const previousOrigin = await script("return performance.timeOrigin;");
+  await script("window.location.reload(); return true;");
+  await until(
+    () =>
+      script("return performance.timeOrigin !== arguments[0];", [
+        previousOrigin,
+      ]),
+    timeout,
+  );
+  await installNavigationAudit();
+}
+
+async function galleryPageSnapshot() {
+  return script(`
+    const cards = Array.from(document.querySelectorAll('.asset-card'));
+    const viewport = document.querySelector('.main-area')?.getBoundingClientRect();
+    const visible = cards.filter(card => {
+      const rect = card.getBoundingClientRect();
+      return rect.bottom > Math.max(0, viewport?.top ?? 0) && rect.top < Math.min(innerHeight, viewport?.bottom ?? innerHeight) && rect.right > 0 && rect.left < innerWidth;
+    });
+    return {
+      cards: cards.length,
+      fixtureCards: cards.filter(card => card.innerText.includes('Performance galerie')).length,
+      visible: visible.length,
+      visibleImagesReady: visible.filter(card => { const image = card.querySelector('.asset-thumbnail img'); return image?.complete && image.naturalWidth > 0; }).length,
+      visibleValidating: visible.filter(card => card.querySelector('.thumbnail-status')).length,
+      canvases: document.querySelectorAll('canvas').length,
+    };
+  `);
+}
+
+async function testGalleryPagePerformance() {
+  const started = performance.now();
+  const deadline = started + 180_000;
+  const remaining = () => {
+    const duration = Math.round(deadline - performance.now());
+    assert.ok(
+      duration > 0,
+      "Timeout preparing the disposable gallery benchmark.",
+    );
+    return duration;
+  };
+  const fixtures = [];
+  report.galleryPagePerformance = {
+    fixtureAssets: 50,
+    pageSize: 36,
+    conditions:
+      "50 imports séquentiels du même petit GLB synthétique texturé ; première visite de ces assets, contenu GLB partagé avec la fixture initiale. Les temps incluent le polling WebDriver. Le maximum WebGL est celui observé après installation de l’instrumentation dans chaque nouveau document.",
+  };
+  try {
+    for (let index = 0; index < 50; index++) {
+      const imported = await job(
+        {
+          kind: "import",
+          source,
+          name: `Performance galerie ${String(index).padStart(2, "0")}`,
+          config: {
+            primaryFile: "model.glb",
+            scene: null,
+            collection: null,
+            applyModifiers: false,
+          },
+        },
+        remaining(),
+      );
+      fixtures.push(imported.asset);
+    }
+    report.galleryPagePerformance.importsMs = Math.round(
+      performance.now() - started,
+    );
+    const coldStarted = performance.now();
+    await reloadWithNavigationAudit(remaining());
+    await until(async () => {
+      const state = await galleryPageSnapshot();
+      return state.cards === 36 && state.fixtureCards === 36;
+    }, remaining());
+    const coldListMs = Math.round(performance.now() - coldStarted);
+    await until(async () => {
+      const state = await galleryPageSnapshot();
+      return (
+        state.visible > 0 &&
+        state.visibleImagesReady === state.visible &&
+        state.visibleValidating === 0
+      );
+    }, remaining());
+    const coldImagesMs = Math.round(performance.now() - coldStarted);
+    await until(
+      async () => (await navigationSnapshot()).contexts === 0,
+      remaining(),
+    );
+    const coldPage = await galleryPageSnapshot();
+    const coldAudit = await navigationSnapshot();
+    assert.equal(coldPage.canvases, 0);
+    assert.ok(coldAudit.maxContexts <= 1);
+    assert.equal(coldAudit.contexts, 0);
+    report.galleryPagePerformance.cold = {
+      listMs: coldListMs,
+      visibleImagesReadyMs: coldImagesMs,
+      ...coldPage,
+      maxContexts: coldAudit.maxContexts,
+      idleContexts: coldAudit.contexts,
+    };
+
+    const warmStarted = performance.now();
+    await reloadWithNavigationAudit(remaining());
+    await until(async () => {
+      const state = await galleryPageSnapshot();
+      return state.cards === 36 && state.fixtureCards === 36;
+    }, remaining());
+    const warmListMs = Math.round(performance.now() - warmStarted);
+    // Cached images should become visible without waiting for source revalidation.
+    await until(async () => {
+      const state = await galleryPageSnapshot();
+      return state.visible > 0 && state.visibleImagesReady === state.visible;
+    }, remaining());
+    const warmImagesMs = Math.round(performance.now() - warmStarted);
+    const warmPage = await galleryPageSnapshot();
+    await until(
+      async () => (await navigationSnapshot()).contexts === 0,
+      remaining(),
+    );
+    const warmAudit = await navigationSnapshot();
+    assert.equal(warmPage.canvases, 0);
+    assert.ok(warmAudit.maxContexts <= 1);
+    assert.equal(warmAudit.contexts, 0);
+    report.galleryPagePerformance.warm = {
+      listMs: warmListMs,
+      visibleCachedImagesMs: warmImagesMs,
+      ...warmPage,
+      maxContexts: warmAudit.maxContexts,
+      idleContexts: warmAudit.contexts,
+    };
+    report.checks.push(
+      "Galerie de 50 assets synthétiques : page de 36 cartes, vignettes visibles froides/chaudes, aucun canvas de carte et un contexte transitoire au maximum observé",
+    );
+  } finally {
+    // Retain every disposable fixture and its history; archiving only removes
+    // them from the active gallery used by the remaining desktop scenarios.
+    for (const asset of fixtures) {
+      await invoke("update_asset", {
+        id: asset.id,
+        name: asset.name,
+        categoryId: asset.categoryId,
+        tags: asset.tags,
+        gameIds: asset.gameIds,
+        archived: true,
+      });
+    }
+    report.galleryPagePerformance.archivedFixtures = fixtures.length;
+    report.galleryPagePerformance.totalMs = Math.round(
+      performance.now() - started,
+    );
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Éclaireur");
+  }
+}
+
+async function testDataUriTexture() {
+  const dataSource = join(testRoot, "source data-uri");
+  await mkdir(dataSource);
+  const glb = animatedTriangle({ dataUri: true });
+  await writeFile(join(dataSource, "data-uri.glb"), glb);
+  const imported = await job({
+    kind: "import",
+    source: dataSource,
+    name: "Texture data URI — test",
+    config: {
+      primaryFile: "data-uri.glb",
+      scene: null,
+      collection: null,
+      applyModifiers: false,
+    },
+  });
+  try {
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Texture data URI");
+    report.texturePixels.dataUriThumbnail = await assertTexturePixels(
+      '.asset-card:has(img[alt*="Texture data URI"]) .asset-thumbnail',
+      "09-data-uri-library.png",
+    );
+    assert.equal(
+      await script('return document.querySelectorAll("canvas").length;'),
+      0,
+    );
+    await clickText("Texture data URI");
+    await waitForModel("data-uri.glb");
+    report.texturePixels.dataUriViewer = await assertTexturePixels(
+      ".viewer-canvas",
+      "10-data-uri-viewer.png",
+    );
+    await clickText("Retour à la bibliothèque");
+    assert.deepEqual(await readFile(join(dataSource, "data-uri.glb")), glb);
+    report.checks.push(
+      "Texture PNG en data URI réellement affichée dans la vignette et la fiche automatique, pixels rouge/vert vérifiés et source préservée",
+    );
+  } finally {
+    const asset = imported.asset;
+    await invoke("update_asset", {
+      id: asset.id,
+      name: asset.name,
+      categoryId: asset.categoryId,
+      tags: asset.tags,
+      gameIds: asset.gameIds,
+      archived: true,
+    });
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Éclaireur");
+  }
 }
 
 async function fileHash(path) {
@@ -367,7 +770,6 @@ async function testKitsune() {
     await until(() =>
       script('return !!document.querySelector(".workspace-panel");'),
     );
-    await clickText("Afficher l’aperçu 3D");
     if (previewRequest.previewFile) {
       await until(() =>
         script(
@@ -450,7 +852,6 @@ async function testKitsune() {
     await until(() =>
       script('return !!document.querySelector(".workspace-panel");'),
     );
-    await clickText("Afficher l’aperçu 3D");
     await waitForModel(generated.sourceFile);
     const warningText = await script(
       'return Array.from(document.querySelectorAll(".inspection-warnings,.preview-notice")).map(element=>element.innerText).join("\\n");',
@@ -576,23 +977,44 @@ try {
     gameIds: [taxonomy.games[0].id],
     archived: false,
   });
+  const libraryFirstStarted = performance.now();
   await script("window.location.reload(); return true;");
   await until(() => script('return !!document.querySelector(".asset-card");'));
-  await screenshot("02-library.png");
+  await waitForThumbnail("Éclaireur");
+  assert.equal(
+    await script('return document.querySelectorAll("canvas").length;'),
+    0,
+    "Library cards must contain static images, not WebGL canvases.",
+  );
+  report.previewPerformance = {
+    libraryFirstImageMs: Math.round(performance.now() - libraryFirstStarted),
+    conditions:
+      "Premier affichage dans cette WebView ; le GLB du premier détail peut déjà avoir été préparé par la galerie. Les temps incluent navigation et polling WebDriver.",
+  };
+  report.texturePixels = {
+    thumbnail: await assertTexturePixels(".asset-thumbnail", "02-library.png"),
+  };
+  const detailFirstStarted = performance.now();
   await clickText("Éclaireur");
   await until(() =>
     script('return !!document.querySelector(".workspace-panel");'),
   );
-  await clickText("Afficher l’aperçu 3D");
-  await until(
-    () =>
-      script(
-        'return !!document.querySelector("canvas") && !!document.querySelector(arguments[0]);',
-        ['[aria-label="Lire l’animation"]'],
-      ),
-    60_000,
+  await waitForModel("model.glb");
+  report.previewPerformance.automaticDetailFirstMs = Math.round(
+    performance.now() - detailFirstStarted,
   );
-  await screenshot("03-viewer.png");
+  assert.ok(
+    await script(
+      "return !!document.querySelector('[aria-label=\"Lire l’animation\"]');",
+    ),
+  );
+  report.texturePixels.viewer = await assertTexturePixels(
+    ".viewer-canvas",
+    "03-viewer.png",
+  );
+  report.checks.push(
+    "Texture PNG rouge et verte réellement visible dans la vignette statique et dans l’aperçu automatique, contrôlée par pixels des captures WebDriver",
+  );
   const play = await request("POST", `/session/${session}/element`, {
     using: "css selector",
     value: '[aria-label="Lire l’animation"]',
@@ -680,6 +1102,9 @@ try {
   report.checks.push(
     "Visionneuse WebGL réelle, chargement local, rotation/zoom/recentrage, lecture/pause animation",
   );
+  await testNavigationPerformance();
+  await testDataUriTexture();
+  await testGalleryPagePerformance();
   await writeFile(join(main.workspacePath, "notes.txt"), "version 2");
   await writeFile(join(main.workspacePath, "rapport.txt"), "nouveau");
   const changes = await job({ kind: "changes", variantId: main.id });
@@ -770,16 +1195,38 @@ try {
       variantId: blenderVariant.id,
       config: { ...blenderVariant.config, collection: "Asset" },
     });
+    const blenderGalleryStarted = performance.now();
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Robot Blender");
+    report.blenderPreviewPerformance = {
+      galleryFirstConversionAndImageMs: Math.round(
+        performance.now() - blenderGalleryStarted,
+      ),
+      conditions:
+        "Premier aperçu de cet import Blender préparé par la galerie avant toute analyse explicite ; durée jusqu’à la vignette complète, polling WebDriver inclus.",
+    };
+    assert.equal(
+      await script('return document.querySelectorAll("canvas").length;'),
+      0,
+    );
+    const blenderWarmStarted = performance.now();
+    const derived = await job({
+      kind: "preview",
+      variantId: blenderVariant.id,
+    });
+    report.blenderPreviewPerformance.warmPreviewJobMs = Math.round(
+      performance.now() - blenderWarmStarted,
+    );
+    report.blenderPreviewPerformance.sourceKind = derived.sourceKind;
+    assert.ok(derived.url.startsWith("http://edge-preview.localhost/"));
+    await invoke("release_preview_resources", {
+      tokens: [new URL(derived.url).pathname.slice(1)],
+    });
     const inspection = await job({
       kind: "inspect",
       variantId: blenderVariant.id,
     });
     assert.equal(inspection.geometry.triangles, 12);
-    const derived = await job({
-      kind: "preview",
-      variantId: blenderVariant.id,
-    });
-    assert.ok(derived.url.startsWith("http://edge-preview.localhost/"));
     const blenderOutput = join(testRoot, "blender-export.glb");
     await job({
       kind: "export",
@@ -810,20 +1257,21 @@ try {
     await until(() =>
       script('return !!document.querySelector(".workspace-panel");'),
     );
-    await clickText("Afficher l’aperçu 3D");
-    await until(
-      () =>
-        script(
-          'return !!document.querySelector("canvas") && !!document.querySelector(arguments[0]);',
-          ['[aria-label="Lire l’animation"]'],
-        ),
-      60_000,
+    await waitForModel("main.blend");
+    assert.ok(
+      await script(
+        "return !!document.querySelector('[aria-label=\"Lire l’animation\"]');",
+      ),
     );
     await screenshot("05-blender-viewer.png");
     report.checks.push(
       "Blender réel via Tauri : détection principale, collection12 triangles, aperçu/export, source inchangée et création native de projet",
     );
   }
+  const thumbnailCacheBeforeRestart = (
+    await fileManifest(join(library, "cache", "thumbnails"))
+  ).filter((entry) => entry.kind === "file" && entry.path.endsWith(".png"));
+  assert.ok(thumbnailCacheBeforeRestart.length > 0);
   await request("DELETE", `/session/${session}`);
   session = undefined;
   await newSession();
@@ -837,6 +1285,44 @@ try {
   });
   assert.equal(history.total, 2);
   await until(() => script('return !!document.querySelector(".asset-card");'));
+  await waitForThumbnail("Éclaireur");
+  assert.equal(
+    await script('return document.querySelectorAll("canvas").length;'),
+    0,
+  );
+  const thumbnailCacheAfterRestart = await fileManifest(
+    join(library, "cache", "thumbnails"),
+  );
+  for (const previous of thumbnailCacheBeforeRestart) {
+    assert.deepEqual(
+      thumbnailCacheAfterRestart.find((entry) => entry.path === previous.path),
+      previous,
+      "Restart must reuse persisted thumbnail PNGs without rewriting them.",
+    );
+  }
+  const cached = await invoke("get_asset_thumbnails", {
+    assetIds: [imported.asset.id],
+  });
+  assert.ok(
+    cached[imported.asset.id]?.resourceToken,
+    "The persisted thumbnail must be available through the cache API after restart.",
+  );
+  try {
+    assert.equal(await resourceAccessible(cached[imported.asset.id].url), true);
+  } finally {
+    await invoke("release_preview_resources", {
+      tokens: [cached[imported.asset.id].resourceToken],
+    });
+  }
+  assert.equal(
+    await resourceAccessible(cached[imported.asset.id].url),
+    false,
+    "An explicitly released thumbnail handle must become inaccessible.",
+  );
+  report.texturePixels.thumbnailAfterRestart = await assertTexturePixels(
+    '.asset-card:has(img[alt*="Éclaireur"]) .asset-thumbnail',
+    "08-library-restarted.png",
+  );
   await clickText("Éclaireur");
   await until(() =>
     script('return !!document.querySelector(".workspace-panel");'),
@@ -847,7 +1333,7 @@ try {
   );
   await screenshot("04-history.png");
   report.checks.push(
-    "Redémarrage : classement, variantes et historique conservés, historique visible",
+    "Redémarrage : vignette texturée persistante réutilisée sans réécriture, classement, variantes et historique conservés",
   );
   report.status = "passed";
   console.log(JSON.stringify(report, null, 2));
@@ -878,83 +1364,4 @@ try {
   );
   await writeFile(join(testRoot, "driver.log"), driverLog);
   console.log(`Rapport : ${join(testRoot, "report.json")}`);
-}
-
-function animatedTriangle() {
-  const binary = Buffer.alloc(76);
-  [-0.8, 0, 0, 0.8, 0, 0, 0, 1.4, 0].forEach((v, i) =>
-    binary.writeFloatLE(v, i * 4),
-  );
-  [0, 1, 2].forEach((v, i) => binary.writeUInt16LE(v, 36 + i * 2));
-  binary.writeFloatLE(0, 44);
-  binary.writeFloatLE(2, 48);
-  [0, 0, 0, 0, 0.5, 0].forEach((v, i) => binary.writeFloatLE(v, 52 + i * 4));
-  const gltf = {
-    asset: { version: "2.0", generator: "Edge Lock disposable E2E fixture" },
-    scene: 0,
-    scenes: [{ nodes: [0] }],
-    nodes: [{ mesh: 0, name: "Éclaireur" }],
-    meshes: [
-      {
-        primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0 }],
-      },
-    ],
-    materials: [
-      {
-        doubleSided: true,
-        pbrMetallicRoughness: {
-          baseColorFactor: [0.12, 0.55, 0.95, 1],
-          metallicFactor: 0.15,
-          roughnessFactor: 0.5,
-        },
-      },
-    ],
-    buffers: [{ byteLength: binary.length }],
-    bufferViews: [
-      { buffer: 0, byteOffset: 0, byteLength: 36 },
-      { buffer: 0, byteOffset: 36, byteLength: 6 },
-      { buffer: 0, byteOffset: 44, byteLength: 8 },
-      { buffer: 0, byteOffset: 52, byteLength: 24 },
-    ],
-    accessors: [
-      {
-        bufferView: 0,
-        componentType: 5126,
-        count: 3,
-        type: "VEC3",
-        min: [-0.8, 0, 0],
-        max: [0.8, 1.4, 0],
-      },
-      { bufferView: 1, componentType: 5123, count: 3, type: "SCALAR" },
-      {
-        bufferView: 2,
-        componentType: 5126,
-        count: 2,
-        type: "SCALAR",
-        min: [0],
-        max: [2],
-      },
-      { bufferView: 3, componentType: 5126, count: 2, type: "VEC3" },
-    ],
-    animations: [
-      {
-        name: "Flottement",
-        samplers: [{ input: 2, output: 3, interpolation: "LINEAR" }],
-        channels: [{ sampler: 0, target: { node: 0, path: "translation" } }],
-      },
-    ],
-  };
-  const json = Buffer.from(JSON.stringify(gltf));
-  const padded = Buffer.alloc(Math.ceil(json.length / 4) * 4, 0x20);
-  json.copy(padded);
-  const header = Buffer.alloc(20);
-  header.write("glTF");
-  header.writeUInt32LE(2, 4);
-  header.writeUInt32LE(28 + padded.length + binary.length, 8);
-  header.writeUInt32LE(padded.length, 12);
-  header.writeUInt32LE(0x4e4f534a, 16);
-  const binaryHeader = Buffer.alloc(8);
-  binaryHeader.writeUInt32LE(binary.length, 0);
-  binaryHeader.writeUInt32LE(0x004e4942, 4);
-  return Buffer.concat([header, padded, binaryHeader, binary]);
 }

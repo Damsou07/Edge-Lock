@@ -937,6 +937,7 @@ dependencies = [
  "dunce",
  "edge-lock-core",
  "notify",
+ "png",
  "serde",
  "serde_json",
  "tauri",
