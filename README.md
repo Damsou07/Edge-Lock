@@ -4,44 +4,50 @@ Edge Lock est une application desktop Windows pour centraliser des dossiers d’
 
 ## Installation Windows
 
-L’installateur **0.1.0 x64** de cette construction se trouve dans `target/automatic-preview/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque est choisie au premier lancement et reste séparée de l’application. WebView2 est requis. Blender est facultatif pour gérer et versionner les dossiers et les GLB, mais requis pour les opérations sur les `.blend`.
+L’installateur **0.2.0 x64** est produit dans `target/release/bundle/nsis/Edge Lock_0.2.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque reste séparée de l’application. WebView2 est requis. Blender est nécessaire pour importer, créer et synchroniser les projets ; un aperçu déjà synchronisé peut être relu sans lancer Blender.
 
-Le binaire et l’installateur ont été construits et leur version vérifiée. L’installation et la mise à niveau en VM jetable restent à valider ; voir [le bilan de validation](docs/validation.md).
+Les contrôles réellement exécutés et leurs limites sont détaillés dans [le bilan de validation](docs/validation.md). L’installation sur le poste personnel ne fait pas partie de ces contrôles.
 
 ## Utilisation
 
 1. Choisir un dossier vide pour créer une bibliothèque, ou ouvrir une bibliothèque Edge Lock existante. Utiliser un disque local ; une seule instance peut ouvrir une même bibliothèque.
-2. Dans les réglages, sélectionner `blender.exe`. Blender est nécessaire pour créer un projet `.blend`, analyser un `.blend` et le convertir en GLB. Un GLB autonome fonctionne sans Blender.
-3. **Importer un dossier** copie son contenu intégral dans la bibliothèque et crée une première version. Utiliser le sélecteur ou déposer un dossier dans la fenêtre, puis confirmer l’import. Le dossier d’origine est conservé. Un unique `.blend` devient automatiquement principal ; à défaut de `.blend`, un unique `.glb` est choisi. En présence de plusieurs `.blend`, choisir explicitement le fichier à utiliser.
-4. **Nouveau projet** crée `main.blend` avec Blender et des dossiers pour textures, références, rapports et captures. Le projet est immédiatement géré par Edge Lock.
-5. Ouvrir le dossier ou le fichier Blender depuis la fiche d’asset. Copier le chemin du dossier pour le transmettre à un agent IA. Enregistrer les modifications dans Blender, puis utiliser **Créer une version** avec un message.
+2. Dans les réglages, sélectionner `blender.exe`.
+3. **Importer un dossier** accepte exactement un `.blend` et au plus un `.glb`, sous-dossiers compris. Utiliser le sélecteur ou déposer un dossier, puis confirmer l’import. Edge Lock copie les fichiers, génère le GLB avec les modificateurs et publie la première version après réussite. Un GLB fourni est régénéré dans la copie ; le dossier d’origine reste intact. Les imports GLB seuls ne sont plus acceptés.
+4. **Nouveau projet** crée `main.blend`, son GLB et des dossiers pour textures, références, rapports et captures. Une scène vide affiche un état adapté.
+5. Ouvrir le dossier ou le fichier Blender depuis la fiche. Enregistrer dans Blender : le GLB et l’aperçu se mettent à jour automatiquement. **Créer une version** devient disponible après détection d’un changement source et synchronisation réussie.
 6. Choisir une ancienne version pour l’inspecter, l’exporter ou **Créer une variante**. Chaque variante possède son propre dossier stable ; créer une variante ne remplace pas le travail courant.
 
 Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieurs tags et plusieurs projets de jeu. Recherche, filtres, tri, archivage et historique paginé permettent de parcourir la bibliothèque. L’archivage conserve les fichiers et les versions.
 
 ## Aperçu et export
 
-La bibliothèque affiche des vignettes texturées fixes, sans rotation ni animation. Les dernières images en cache apparaissent immédiatement, puis les cartes visibles sont vérifiées et préparées une à la fois. Sans aperçu existant, Blender effectue la première conversion en arrière-plan ; les passages suivants réutilisent le GLB et la vignette. La première variante, identique à celle ouverte par défaut dans la fiche, représente l’asset. Une source ambiguë ou une erreur reste indiquée sur la carte et se résout dans la fiche.
+Chaque dossier de travail de variante contient un `.blend` source et un GLB dérivé. La règle s’applique récursivement ; `.blend1` reste une sauvegarde ordinaire. Les variantes, historiques, caches et sauvegardes sont indépendants de ce décompte. Les anciens dossiers non conformes sont conservés avec leur historique ; leur synchronisation et les nouvelles versions restent bloquées jusqu’à correction manuelle.
 
-L’aperçu 3D s’ouvre automatiquement dans la fiche et fournit navigation orbitale et lecture des animations GLB. Les statistiques et dépendances disponibles s’affichent avec le modèle. Il privilégie un GLB déjà présent dans l’asset : choix explicite d’aperçu, GLB principal, GLB portant le nom du `.blend`, puis unique GLB disponible. Si plusieurs candidats restent possibles, un sélecteur permet de choisir sans changer le fichier principal. Sans GLB, Blender produit automatiquement un aperçu en arrière-plan dans le cache local, sans sauvegarder le `.blend` ni écraser un GLB original. L’ouverture d’une fiche ou une opération utilisateur suspend la préparation des vignettes.
+Le `.blend` est l’autorité. La scène active enregistrée est exportée entière, avec ses modificateurs actifs évalués. Edge Lock ne sauvegarde jamais un `.blend` existant et ne lui applique aucun modificateur. Seule la création explicite d’un nouveau projet écrit un nouveau `.blend`. Les sélecteurs de fichier principal, scène, collection et application des modificateurs ont disparu.
+
+La surveillance porte sur les workspaces de la bibliothèque active, même lorsque la fiche est fermée. Les événements sont regroupés pendant 500 ms après la dernière écriture, puis les contenus sont comparés par BLAKE3. Une sauvegarde pendant une conversion impose une nouvelle vérification. L’ouverture et le retour au premier plan réconcilient également l’état ; une défaillance de surveillance active une vérification périodique. Edge Lock doit être ouvert pour synchroniser.
+
+Le GLB unique existant conserve son chemin ; s’il manque, il est créé à côté du `.blend` avec le même nom. La génération vérifie une copie temporaire avant remplacement atomique. Le dernier aperçu reste affiché pendant le traitement ou en cas d’erreur. L’aperçu 3D et la vignette utilisent le même artefact immuable ; les résultats anciens sont ignorés. Une consultation historique ne change pas lorsque le travail courant est sauvegardé.
+
+Les vignettes texturées sont fixes, sans rotation ni animation, et préparées une à la fois pour les cartes visibles. La première variante représente l’asset. L’aperçu 3D fournit navigation orbitale et lecture des animations GLB.
 
 Le rendu conserve les textures, UV, transparences et matériaux pris en charge par glTF. Un environnement de studio généré localement éclaire les matériaux PBR, notamment métalliques, sans téléchargement. Les shaders procéduraux propres à Blender ne sont pas automatiquement convertis en textures : préparer des matériaux compatibles glTF reste nécessaire pour ces cas.
 
-Le choix explicite d’un GLB d’aperçu du travail courant est mémorisé dans le cache pour la fiche et sa vignette, sans modifier le fichier principal ni les versions. Un changement de configuration ou la disparition du GLB invalide ce choix. Les aperçus historiques restent indépendants.
+Les armatures restent représentées par les skins glTF et les animations compatibles sont conservées. Les shape keys sans modificateur restent exportables ; une combinaison shape keys/modificateurs qui ferait perdre les morphs bloque la génération avec un message explicite et conserve le dernier GLB. Aucun baking personnalisé des morphs n’est effectué.
 
-L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. **Analyser la source** actualise explicitement la géométrie, les scènes, les collections et les dépendances de la source enregistrée.
+Les statistiques affichent la géométrie du GLB effectivement généré : objets maillés, sommets, arêtes, faces et triangles. Elles incluent les effets des modificateurs. La triangulation et les séparations de sommets aux coutures UV peuvent différer des comptes de Blender. Un compte d’arêtes trop coûteux reste indisponible sans empêcher l’aperçu.
 
-Les réglages de source et d’export sont enregistrés automatiquement : immédiatement pour les listes et cases, à la sortie du champ ou avec Entrée pour les champs texte Scène et Collection. Les actions qui utilisent la source attendent la sauvegarde ; une erreur conserve la saisie et propose **Réessayer**. La sauvegarde des réglages ne sauvegarde pas le fichier Blender et ne crée aucune version. Les anciennes versions restent en lecture seule.
+Les versions restent manuelles. Une modification du seul GLB dérivé, sa suppression ou sa régénération ne permettent pas de créer une version. Les autres fichiers utilisateur, notamment le `.blend`, les textures, rapports et sauvegardes, restent comparés. La capture d’une version vérifie que ses sources correspondent au GLB synchronisé ; une sauvegarde concurrente entraîne une nouvelle tentative puis un refus si le projet reste instable.
 
-Pour un `.blend`, choisir le fichier principal, éventuellement une scène et une collection racine. Les sous-collections sont incluses. L’application des modificateurs à l’export est désactivée par défaut pour préserver les shape keys et animations compatibles avec glTF. Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
+Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
 
-Les dépendances externes ou manquantes ne bloquent pas l’aperçu. La section **Dépendances** signale les ressources utiles au rendu ; les polices et brosses inutilisées ne déclenchent pas d’alerte. Une texture manquante peut être remplacée uniquement en mémoire pour afficher un modèle dégradé. Un échec de conversion laisse le fichier Blender accessible.
+Les dépendances externes disponibles peuvent alimenter le GLB automatique. Les références manquantes inutilisées, notamment certaines brosses Blender, ne bloquent pas la conversion. Une ressource utilisée manquante bloque la publication : aucune texture de remplacement n’est enregistrée dans le GLB canonique. Un échec laisse le `.blend` accessible.
 
 Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. Il suit le contenu des sources utiles, y compris textures externes et bibliothèques liées ; modifier un rapport ou une capture ne régénère pas l’aperçu. Les vignettes PNG de 512 × 384 sont liées à l’artefact GLB et à la version du rendu. Leur production utilise un seul contexte WebGL temporaire, libéré après la capture. Les temporaires d’aperçu identifiés comme appartenant à l’application sont nettoyés après interruption. Les tâches sont sérialisées et le budget commun des caches, vignettes comprises, reste de 2 Gio.
 
 Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les exports Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut donc influencer un aperçu historique.
 
-Le fichier GLB final est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner l’asset. Les GLB qui exigent des ressources externes ou des extensions non prises en charge sont refusés par l’inspecteur.
+L’export explicite est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner un projet dont le GLB canonique est valide. Les GLB exigeant des ressources externes ou des extensions non prises en charge restent refusés.
 
 ## Stockage et limites du MVP
 
@@ -86,6 +92,6 @@ npm run build
 npm run tauri build
 ```
 
-`npm run dev` seul lance uniquement l’interface web ; les opérations de bibliothèque nécessitent l’application Tauri. La construction Tauri produit par défaut l’exécutable dans `target/release/` et l’installateur NSIS dans `target/release/bundle/nsis/`. `CARGO_TARGET_DIR` permet une construction isolée ; celle validée pour les aperçus automatiques utilise `target/automatic-preview/`. L’installateur vise l’utilisateur courant. Les données sont stockées dans la bibliothèque choisie, séparément du dossier d’installation.
+`npm run dev` seul lance uniquement l’interface web ; les opérations de bibliothèque nécessitent Tauri. La construction produit par défaut l’exécutable dans `target/release/` et l’installateur NSIS dans `target/release/bundle/nsis/`. `CARGO_TARGET_DIR` permet une construction isolée. L’installateur vise l’utilisateur courant ; les données restent dans la bibliothèque choisie.
 
 Les tests Blender, desktop WebView2, performance et installation isolée demandent des prérequis supplémentaires ; leurs commandes et limites sont détaillées dans [docs/validation.md](docs/validation.md).

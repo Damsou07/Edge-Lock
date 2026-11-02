@@ -8,7 +8,7 @@ export const defaultExportConfig: ExportConfig = {
   primaryFile: null,
   scene: null,
   collection: null,
-  applyModifiers: false,
+  applyModifiers: true,
 };
 export interface Asset {
   id: string;
@@ -153,6 +153,15 @@ export interface AppError {
   code: string;
   message: string;
   details?: { candidates?: string[] } | null;
+}
+export interface WorkspaceStatus {
+  variantId: string;
+  revision: number;
+  state: "checking" | "syncing" | "ready" | "failed" | "nonconforming";
+  sourceChanged: boolean;
+  canCreateSnapshot: boolean;
+  artifactKey: string | null;
+  error: AppError | null;
 }
 export type JobRequest =
   | { kind: "thumbnail"; assetId: string }

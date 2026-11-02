@@ -11,7 +11,7 @@ if (-not $DisposableEnvironment -and $env:USERNAME -ne 'WDAGUtilityAccount') {
 $taskInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 $taskFixture = (Resolve-Path -LiteralPath $FixtureLibraryPath).Path
 if (-not (Test-Path -LiteralPath (Join-Path $taskFixture 'library.sqlite3'))) {
-    throw 'Fournir une copie jetable fermée d’une bibliothèque Edge Lock créée par les tests desktop.'
+    throw "Fournir une copie jetable fermée d’une bibliothèque Edge Lock créée par les tests desktop."
 }
 $taskRoot = Join-Path $env:TEMP ('Edge-Lock-installer-test-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $taskRoot | Out-Null
@@ -32,8 +32,8 @@ function Install-Package([string]$Package) {
 if ($PreviousInstallerPath) { Install-Package (Resolve-Path -LiteralPath $PreviousInstallerPath).Path }
 Install-Package $taskInstaller
 $taskVersion = (Get-Item -LiteralPath (Join-Path $taskInstallDir 'edge-lock.exe')).VersionInfo.ProductVersion
-if (-not $taskVersion.StartsWith('0.1.0')) { throw "Version inattendue : $taskVersion" }
-if (Compare-Object $taskBefore (Get-LibraryHashes $taskLibrary)) { throw 'La bibliothèque a changé pendant l’installation.' }
+if ($taskVersion -notmatch '^0\.2\.0(?:\.0)?$') { throw "Version inattendue : $taskVersion" }
+if (Compare-Object $taskBefore (Get-LibraryHashes $taskLibrary)) { throw "La bibliothèque a changé pendant l’installation." }
 Install-Package $taskInstaller
 if (Compare-Object $taskBefore (Get-LibraryHashes $taskLibrary)) { throw 'La bibliothèque a changé pendant la réinstallation.' }
 [pscustomobject]@{ Installer=$taskInstaller; Version=$taskVersion; LibraryPreserved=$true; PreviousVersionTested=[bool]$PreviousInstallerPath; TestRoot=$taskRoot } | ConvertTo-Json

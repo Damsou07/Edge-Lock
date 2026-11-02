@@ -319,6 +319,27 @@ impl BlenderRunner {
         self.export_operation("export", workspace, None, config, destination, context)
     }
 
+    /// Generate the canonical GLB from the unique source, using its complete active scene.
+    /// Available external resources are resolved from the logical source location.
+    /// Missing render inputs and modifier/shape-key incompatibilities remain fatal.
+    pub fn generate_glb(
+        &self,
+        workspace: &Path,
+        logical_workspace: &Path,
+        config: &ExportConfig,
+        destination: &Path,
+        context: &OperationContext,
+    ) -> Result<Inspection> {
+        self.export_operation(
+            "generate",
+            workspace,
+            Some(logical_workspace),
+            config,
+            destination,
+            context,
+        )
+    }
+
     /// Discover preview dependencies without evaluating mesh geometry.
     /// Paths resolve against the logical asset location rather than its temporary copy.
     pub fn inspect_preview(
@@ -391,7 +412,11 @@ impl BlenderRunner {
         }
         let workspace = fs::canonicalize(workspace)?;
         let logical_workspace = logical_workspace.map(absolute_logical_path).transpose()?;
-        let blend_file = primary_blend(&workspace, config)?;
+        let blend_file = if operation == "generate" {
+            primary_blend(&workspace, &ExportConfig::default())?
+        } else {
+            primary_blend(&workspace, config)?
+        };
         let parent = destination
             .parent()
             .ok_or_else(|| CoreError::Invalid("Destination d'export invalide.".into()))?;

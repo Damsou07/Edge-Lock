@@ -359,6 +359,30 @@ impl Library {
         self.publish_asset(&name, config, entries, ctx)
     }
 
+    /// A staged, canonical project prepared by the synchronization service.
+    pub(crate) fn import_prepared(
+        &self,
+        source: &Path,
+        name: &str,
+        config: ExportConfig,
+        ctx: &OperationContext,
+    ) -> Result<AssetDetail> {
+        let _guard = self.write_guard()?;
+        let name = checked_name(name)?;
+        let entries = self.store.capture(source, true, ctx)?;
+        let layout = crate::sync::validate_project(&entries)?;
+        if !entries
+            .iter()
+            .any(|entry| entry.kind == "file" && entry.path == layout.glb_file)
+        {
+            return Err(CoreError::Inconsistent(
+                "Le GLB du projet préparé est absent.".into(),
+            ));
+        }
+        validate_config(&config, &entries)?;
+        self.publish_asset(&name, config, entries, ctx)
+    }
+
     fn publish_asset(
         &self,
         name: &str,
@@ -434,6 +458,26 @@ impl Library {
         message: &str,
         ctx: &OperationContext,
     ) -> Result<Snapshot> {
+        self.create_snapshot_inner(variant_id, message, None, ctx)
+    }
+
+    pub fn create_snapshot_checked(
+        &self,
+        variant_id: &str,
+        message: &str,
+        receipt: &crate::sync::SyncReceipt,
+        ctx: &OperationContext,
+    ) -> Result<Snapshot> {
+        self.create_snapshot_inner(variant_id, message, Some(receipt), ctx)
+    }
+
+    fn create_snapshot_inner(
+        &self,
+        variant_id: &str,
+        message: &str,
+        receipt: Option<&crate::sync::SyncReceipt>,
+        ctx: &OperationContext,
+    ) -> Result<Snapshot> {
         let _guard = self.write_guard()?;
         let message = checked_name(message)?;
         let mut variant = read_variant(&*self.db()?, &self.root, variant_id)?;
@@ -442,7 +486,15 @@ impl Library {
             .store
             .capture(Path::new(&variant.workspace_path), true, ctx)?;
         variant.config = resolve_config(variant.config, &entries)?;
-        if entries == previous.entries && variant.config == previous.config {
+        if let Some(receipt) = receipt {
+            receipt.validate_capture(
+                dunce::simplified(Path::new(&variant.workspace_path)),
+                &entries,
+                ctx,
+            )?;
+            variant.config = crate::sync::validate_project(&entries)?.config();
+        }
+        if !crate::sync::source_changed(&previous.entries, &entries) {
             return Err(CoreError::Invalid(
                 "Aucune modification à versionner.".into(),
             ));
@@ -482,6 +534,34 @@ impl Library {
         let _guard = self.write_guard()?;
         let name = checked_name(name)?;
         let base = self.get_snapshot(snapshot_id)?;
+        self.publish_variant(base.clone(), &name, base.entries, base.config, ctx)
+    }
+
+    pub(crate) fn create_variant_prepared(
+        &self,
+        snapshot_id: &str,
+        name: &str,
+        source: &Path,
+        config: ExportConfig,
+        ctx: &OperationContext,
+    ) -> Result<Variant> {
+        let _guard = self.write_guard()?;
+        let name = checked_name(name)?;
+        let base = self.get_snapshot(snapshot_id)?;
+        let entries = self.store.capture(source, true, ctx)?;
+        crate::sync::validate_project(&entries)?;
+        validate_config(&config, &entries)?;
+        self.publish_variant(base, &name, entries, config, ctx)
+    }
+
+    fn publish_variant(
+        &self,
+        base: Snapshot,
+        name: &str,
+        entries: Vec<ManifestEntry>,
+        config: ExportConfig,
+        ctx: &OperationContext,
+    ) -> Result<Variant> {
         let source = read_variant(&*self.db()?, &self.root, &base.variant_id)?;
         let variant_id = new_id();
         let workspace = format!("workspaces/{}/{variant_id}", source.asset_id);
@@ -496,16 +576,16 @@ impl Library {
                 return Err(CoreError::Invalid("Une variante porte déjà ce nom.".into()));
             }
         }
-        let journal = self.prepare_workspace(&variant_id, &workspace, &base.entries, ctx)?;
+        let journal = self.prepare_workspace(&variant_id, &workspace, &entries, ctx)?;
         let snapshot = Snapshot {
             id: new_id(),
             variant_id: variant_id.clone(),
             parent_id: Some(base.id),
             created_at: now(),
             message: format!("Création de la variante {name}"),
-            config: base.config.clone(),
-            entries: base.entries,
-            logical_bytes: base.logical_bytes,
+            config,
+            logical_bytes: entries.iter().map(|entry| entry.size).sum(),
+            entries,
         };
         ctx.check_cancelled()?;
         let mut db = self.db()?;
@@ -522,26 +602,53 @@ impl Library {
     }
 
     pub fn changes(&self, variant_id: &str, ctx: &OperationContext) -> Result<ChangeSet> {
+        self.changes_inner(variant_id, None, ctx)
+    }
+
+    pub(crate) fn changes_checked(
+        &self,
+        variant_id: &str,
+        receipt: &crate::sync::SyncReceipt,
+        ctx: &OperationContext,
+    ) -> Result<ChangeSet> {
+        self.changes_inner(variant_id, Some(receipt), ctx)
+    }
+
+    fn changes_inner(
+        &self,
+        variant_id: &str,
+        receipt: Option<&crate::sync::SyncReceipt>,
+        ctx: &OperationContext,
+    ) -> Result<ChangeSet> {
         let _guard = self.write_guard()?;
         let variant = read_variant(&*self.db()?, &self.root, variant_id)?;
         let previous = self.get_snapshot(&variant.head_snapshot_id)?;
         let current = self
             .store
             .capture(Path::new(&variant.workspace_path), false, ctx)?;
+        if let Some(receipt) = receipt {
+            receipt.validate_capture(
+                dunce::simplified(Path::new(&variant.workspace_path)),
+                &current,
+                ctx,
+            )?;
+        }
         let old = previous
             .entries
             .iter()
+            .filter(|entry| entry.kind != "file" || !crate::sync::is_glb(&entry.path))
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let new = current
             .iter()
+            .filter(|entry| entry.kind != "file" || !crate::sync::is_glb(&entry.path))
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let mut result = ChangeSet {
             added: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
-            config_changed: previous.config != variant.config,
+            config_changed: false,
             working_bytes: current.iter().map(|entry| entry.size).sum(),
         };
         for (path, entry) in &new {
@@ -561,6 +668,45 @@ impl Library {
             params![sql_size(result.working_bytes)?, variant_id],
         )?;
         Ok(result)
+    }
+
+    pub(crate) fn workspace_manifest(
+        &self,
+        variant_id: &str,
+        ctx: &OperationContext,
+    ) -> Result<Vec<ManifestEntry>> {
+        let _guard = self.write_guard()?;
+        self.store
+            .capture(&self.workspace_path(variant_id)?, false, ctx)
+    }
+
+    pub(crate) fn record_synchronized(
+        &self,
+        variant_id: &str,
+        config: &ExportConfig,
+        triangles: u64,
+        artifact_changed: bool,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut db = self.db()?;
+        let transaction = db.transaction()?;
+        let variant = read_variant(&transaction, &self.root, variant_id)?;
+        transaction.execute(
+            "UPDATE variants SET config=?1,triangles=?2 WHERE id=?3",
+            params![
+                serde_json::to_string(config)?,
+                sql_size(triangles)?,
+                variant_id
+            ],
+        )?;
+        if artifact_changed {
+            transaction.execute(
+                "UPDATE assets SET updated_at=?1 WHERE id=?2",
+                params![now(), variant.asset_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn update_config(&self, variant_id: &str, config: ExportConfig) -> Result<()> {

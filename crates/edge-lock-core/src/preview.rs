@@ -45,15 +45,15 @@ pub enum PreviewOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SourceFile {
-    path: String,
-    hash: Option<String>,
+pub(crate) struct SourceFile {
+    pub(crate) path: String,
+    pub(crate) hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SourceFingerprint {
-    path: String,
-    members: Vec<SourceFile>,
+pub(crate) struct SourceFingerprint {
+    pub(crate) path: String,
+    pub(crate) members: Vec<SourceFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -209,7 +209,7 @@ pub fn cleanup_temporary(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn hash_file(path: &Path, ctx: &OperationContext) -> Result<Option<String>> {
+pub(crate) fn hash_file(path: &Path, ctx: &OperationContext) -> Result<Option<String>> {
     ctx.check_cancelled()?;
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
@@ -324,7 +324,7 @@ fn source_members(
     }
 }
 
-fn fingerprints(
+pub(crate) fn fingerprints(
     paths: &[String],
     root: &Path,
     entries: Option<&[ManifestEntry]>,
@@ -369,7 +369,7 @@ fn fingerprints(
         .collect()
 }
 
-fn source_paths(primary: &Path, inspection: &Inspection) -> Vec<String> {
+pub(crate) fn source_paths(primary: &Path, inspection: &Inspection) -> Vec<String> {
     let mut paths = vec![primary.to_string_lossy().into_owned()];
     paths.extend(
         inspection
@@ -383,7 +383,7 @@ fn source_paths(primary: &Path, inspection: &Inspection) -> Vec<String> {
     paths
 }
 
-fn converter_identity(path: Option<&Path>) -> Option<String> {
+pub(crate) fn converter_identity(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let meta = fs::metadata(path).ok()?;
     Some(format!(
@@ -402,7 +402,7 @@ fn read_record(path: &Path) -> Option<CacheRecord> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize, staging: &Path) -> Result<()> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize, staging: &Path) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(staging)?;
     temporary.write_all(&serde_json::to_vec(value)?)?;
     temporary.as_file().sync_all()?;
@@ -412,7 +412,7 @@ fn atomic_json(path: &Path, value: &impl Serialize, staging: &Path) -> Result<()
     Ok(())
 }
 
-fn copy_file(source: &Path, destination: &Path, ctx: &OperationContext) -> Result<()> {
+pub(crate) fn copy_file(source: &Path, destination: &Path, ctx: &OperationContext) -> Result<()> {
     let mut input = fs::File::open(source)?;
     let mut output = fs::File::create(destination)?;
     let mut buffer = vec![0; 1024 * 1024];

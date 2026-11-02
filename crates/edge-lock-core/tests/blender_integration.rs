@@ -41,6 +41,19 @@ fn rejects_ambiguous_or_escaping_primary_file_before_launch() {
         runner.inspect(directory.path(), &ExportConfig::default(), &context),
         Err(CoreError::Invalid(_))
     ));
+    assert!(matches!(
+        runner.generate_glb(
+            directory.path(),
+            directory.path(),
+            &ExportConfig {
+                primary_file: Some("first.blend".into()),
+                ..Default::default()
+            },
+            &directory.path().join("canonical.glb"),
+            &context,
+        ),
+        Err(CoreError::Invalid(_))
+    ));
     let config = ExportConfig {
         primary_file: Some("../outside.blend".into()),
         ..Default::default()
@@ -68,6 +81,16 @@ fn preview_logical_workspace_can_be_missing_but_must_be_absolute() {
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
+        runner.generate_glb(
+            directory.path(),
+            Path::new("relative"),
+            &config,
+            &directory.path().join("canonical.glb"),
+            &context,
+        ),
+        Err(CoreError::Invalid(_))
+    ));
+    assert!(matches!(
         runner.inspect_preview(
             directory.path(),
             &directory.path().join("missing-original"),
@@ -79,6 +102,15 @@ fn preview_logical_workspace_can_be_missing_but_must_be_absolute() {
 }
 
 fn fixture(root: &Path, external_texture: bool, embedded_script: bool) -> PathBuf {
+    fixture_with_shapes(root, external_texture, embedded_script, false)
+}
+
+fn fixture_with_shapes(
+    root: &Path,
+    external_texture: bool,
+    embedded_script: bool,
+    shape_keys: bool,
+) -> PathBuf {
     let workspace = root.join("asset échantillon");
     fs::create_dir_all(workspace.join("textures")).unwrap();
     let request = root.join("fixture.json");
@@ -86,6 +118,7 @@ fn fixture(root: &Path, external_texture: bool, embedded_script: bool) -> PathBu
         &request,
         serde_json::to_vec(&serde_json::json!({
             "workspace":workspace,"external":external_texture,"embeddedScript":embedded_script,
+            "shapeKeys":shape_keys,
             "outside":root.join("external.png"),"marker":root.join("executed.txt")
         }))
         .unwrap(),
@@ -106,10 +139,11 @@ bpy.ops.mesh.primitive_cube_add()
 cube=bpy.context.object; cube.name='TexturedCube'
 for col in list(cube.users_collection): col.objects.unlink(cube)
 nested.objects.link(cube)
-cube.shape_key_add(name='Basis')
-key=cube.shape_key_add(name='Smile'); key.data[0].co.z+=0.3
-key.value=0; key.keyframe_insert('value',frame=1)
-key.value=1; key.keyframe_insert('value',frame=10)
+if r['shapeKeys']:
+    cube.shape_key_add(name='Basis')
+    key=cube.shape_key_add(name='Smile'); key.data[0].co.z+=0.3
+    key.value=0; key.keyframe_insert('value',frame=1)
+    key.value=1; key.keyframe_insert('value',frame=10)
 image=bpy.data.images.new('Albedo',width=2,height=2)
 image.generated_color=(0.2,0.6,0.9,1)
 texture=Path(r['outside']) if r['external'] else root/'textures'/'albedo.png'
@@ -236,7 +270,20 @@ fn previews_external_and_missing_textures_without_modifying_sources() {
         .preview_glb(&workspace, &workspace, &config, &output, &context)
         .unwrap();
     assert!(guard_preview(&output).is_ok());
+    let canonical = root.path().join("external-canonical.glb");
+    runner
+        .generate_glb(&workspace, &workspace, &config, &canonical, &context)
+        .unwrap();
+    assert!(guard_preview(&canonical).is_ok());
+    let canonical_before = fs::read(&canonical).unwrap();
     fs::remove_file(root.path().join("external.png")).unwrap();
+    let rejected = root.path().join("missing-canonical.glb");
+    let error = runner
+        .generate_glb(&workspace, &workspace, &config, &rejected, &context)
+        .unwrap_err();
+    assert!(error.to_string().contains("manquantes"));
+    assert!(!rejected.exists());
+    assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
     let output = root.path().join("missing-preview.glb");
     let inspection = runner
         .preview_glb(&workspace, &workspace, &config, &output, &context)
@@ -306,6 +353,17 @@ library.unlink()
     );
     assert!(inspection.warnings.is_empty(), "{:?}", inspection.warnings);
     assert!(guard_preview(&output).is_ok());
+    let canonical = root.path().join("secondary-canonical.glb");
+    runner
+        .generate_glb(
+            &workspace,
+            &workspace,
+            &ExportConfig::default(),
+            &canonical,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    assert!(guard_preview(&canonical).is_ok());
     assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
 }
 
@@ -350,6 +408,15 @@ bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False
         fs::canonicalize(root.path().join("external.png")).unwrap()
     );
     assert!(guard_preview(&output).is_ok());
+    runner
+        .generate_glb(
+            &staged,
+            &workspace,
+            &ExportConfig::default(),
+            &root.path().join("relative-canonical.glb"),
+            &OperationContext::default(),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -418,12 +485,21 @@ bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False
         );
     }
     assert!(guard_preview(&output).is_ok());
+    BlenderRunner::new(executable())
+        .generate_glb(
+            &staged,
+            &workspace,
+            &ExportConfig::default(),
+            &root.path().join("linked-canonical.glb"),
+            &OperationContext::default(),
+        )
+        .unwrap();
     assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
 }
 
 #[test]
 #[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
-fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
+fn exports_nested_collection_preserving_rig_animation_and_source() {
     let root = test_directory();
     let workspace = fixture(root.path(), false, false);
     let runner = BlenderRunner::new(executable());
@@ -469,12 +545,6 @@ fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
     let json_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let document: serde_json::Value = serde_json::from_slice(&data[20..20 + json_len]).unwrap();
     assert!(!document["skins"].as_array().unwrap().is_empty());
-    assert!(
-        !document["meshes"][0]["primitives"][0]["targets"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
     assert!(document["images"][0]["bufferView"].is_u64());
     let primitive = &document["meshes"][0]["primitives"][0];
     let material = primitive["material"].as_u64().unwrap() as usize;
@@ -490,21 +560,166 @@ fn exports_nested_collection_preserving_rig_shapes_animation_and_source() {
         .expect("textured geometry must preserve UV coordinates") as usize;
     assert_eq!(document["accessors"][uv]["type"], "VEC2");
     assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
-    let modifiers = ExportConfig {
-        apply_modifiers: true,
-        ..config
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn applies_mirror_even_when_legacy_configuration_disables_modifiers() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), false, false);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; mirror=cube.modifiers.new('Mirror','MIRROR'); mirror.use_mirror_merge=False
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+    );
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let config = ExportConfig {
+        collection: Some("Asset".into()),
+        apply_modifiers: false,
+        ..Default::default()
     };
+    let output = root.path().join("mirrored.glb");
+    BlenderRunner::new(executable())
+        .export_glb(&workspace, &config, &output, &OperationContext::default())
+        .unwrap();
+    assert_eq!(inspect_glb(&output).unwrap().geometry.triangles, 24);
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn rejects_shape_keys_with_modifiers_without_silent_morph_loss() {
+    let root = test_directory();
+    let workspace = fixture_with_shapes(root.path(), false, false, true);
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let output = root.path().join("incompatible.glb");
+    let runner = BlenderRunner::new(executable());
+    let result = runner.export_glb(
+        &workspace,
+        &ExportConfig::default(),
+        &output,
+        &OperationContext::default(),
+    );
+    assert!(
+        result.is_err(),
+        "must not drop morph targets from an evaluated mesh"
+    );
+    assert!(!output.exists());
+    let generated = root.path().join("incompatible-canonical.glb");
     assert!(
         runner
-            .export_glb(
+            .generate_glb(
                 &workspace,
-                &modifiers,
-                &root.path().join("bad.glb"),
-                &context
+                &workspace,
+                &ExportConfig::default(),
+                &generated,
+                &OperationContext::default(),
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("shape keys")
     );
-    assert!(!root.path().join("bad.glb").exists());
+    assert!(!generated.exists());
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn generates_complete_active_scene_with_modifiers_and_keeps_source_intact() {
+    let root = test_directory();
+    let workspace = fixture(root.path(), false, false);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+mirror=bpy.data.objects['TexturedCube'].modifiers.new('Mirror','MIRROR'); mirror.use_mirror_merge=False
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+    );
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let staged = root.path().join("staged");
+    fs::create_dir(&staged).unwrap();
+    fs::copy(workspace.join("main.blend"), staged.join("main.blend")).unwrap();
+    fs::create_dir(staged.join("textures")).unwrap();
+    fs::copy(
+        workspace.join("textures/albedo.png"),
+        staged.join("textures/albedo.png"),
+    )
+    .unwrap();
+    let output = root.path().join("canonical.glb");
+    BlenderRunner::new(executable())
+        .generate_glb(
+            &staged,
+            &workspace,
+            &ExportConfig {
+                scene: Some("obsolete scene selection".into()),
+                collection: Some("Asset".into()),
+                apply_modifiers: false,
+                ..Default::default()
+            },
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    let stats = inspect_glb(&output).unwrap();
+    assert_eq!(stats.geometry.mesh_objects, 2);
+    assert_eq!(stats.geometry.triangles, 36);
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+    assert_eq!(fs::read(staged.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn canonical_generation_preserves_shape_keys_without_modifiers() {
+    let root = test_directory();
+    let workspace = fixture_with_shapes(root.path(), false, false, true);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; cube.modifiers.clear(); cube.parent=None
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+    );
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let output = root.path().join("morph.glb");
+    BlenderRunner::new(executable())
+        .generate_glb(
+            &workspace,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    let bytes = fs::read(&output).unwrap();
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let document: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_length]).unwrap();
+    assert!(document["meshes"].as_array().unwrap().iter().any(|mesh| {
+        mesh["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|primitive| {
+                primitive["targets"]
+                    .as_array()
+                    .is_some_and(|targets| !targets.is_empty())
+            })
+    }));
+    assert!(!inspect_glb(&output).unwrap().animations.is_empty());
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
 }
 
 #[test]
@@ -573,4 +788,17 @@ fn creates_real_empty_project_and_refuses_overwrite() {
         0
     );
     assert!(runner.create_project(&workspace, &context).is_err());
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let output = root.path().join("empty.glb");
+    runner
+        .generate_glb(
+            &workspace,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &context,
+        )
+        .unwrap();
+    assert_eq!(inspect_glb(&output).unwrap().geometry.mesh_objects, 0);
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
 }

@@ -212,6 +212,52 @@ export default function App() {
     runBaseJob,
   );
   const refresh = useCallback(() => setGeneration((value) => value + 1), []);
+  useEffect(() => {
+    if (!library?.root) return;
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    const settled = new Map<string, string>();
+    const revisions = new Map<string, number>();
+    const pending = new Set<string>();
+    void api
+      .onWorkspaceStatus((status) => {
+        if (
+          !active ||
+          status.revision <= (revisions.get(status.variantId) ?? -1)
+        )
+          return;
+        revisions.set(status.variantId, status.revision);
+        if (status.state === "checking" || status.state === "syncing") {
+          pending.add(status.variantId);
+          return;
+        }
+        if (status.state !== "ready") return;
+        const key = JSON.stringify([status.artifactKey, status.sourceChanged]);
+        const checked = pending.delete(status.variantId);
+        if (settled.get(status.variantId) === key && !checked) return;
+        settled.set(status.variantId, key);
+        refresh();
+        void api
+          .bootstrap()
+          .then((value) => {
+            if (active) setBootstrap(value);
+          })
+          .catch(() => {
+            /* Catalog data remains available on metadata read failure. */
+          });
+      })
+      .then((fn) => {
+        if (active) unsubscribe = fn;
+        else fn();
+      })
+      .catch(() => {
+        /* Detail reads recover state if events are unavailable. */
+      });
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [library?.root, refresh]);
   const runJob = useCallback(
     async <T = unknown,>(
       request: JobRequest,
@@ -221,14 +267,7 @@ export default function App() {
       try {
         const result = await runBaseJob<T>(request, options);
         if (
-          [
-            "import",
-            "create",
-            "variant",
-            "snapshot",
-            "inspect",
-            "preview",
-          ].includes(request.kind)
+          ["import", "create", "variant", "snapshot"].includes(request.kind)
         ) {
           try {
             setBootstrap(await api.bootstrap());

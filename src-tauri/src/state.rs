@@ -85,6 +85,10 @@ pub struct AppState {
     pub previews: Mutex<PreviewResources>,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub watcher_generation: std::sync::atomic::AtomicU64,
+    pub workspaces: Mutex<HashMap<String, crate::workspace::WorkspaceEntry>>,
+    pub pending_syncs: AtomicUsize,
+    pub workspace_worker: AtomicBool,
+    pub sync_cancelled: Arc<AtomicBool>,
     // Synchronizes close and library changes with admission of new work.
     pub lifecycle_gate: Mutex<()>,
     pub pending_config_writes: AtomicUsize,
@@ -115,6 +119,7 @@ impl AppState {
     }
     pub fn busy(&self) -> AppResult<bool> {
         Ok(self.pending_config_writes.load(Ordering::SeqCst) > 0
+            || self.pending_syncs.load(Ordering::SeqCst) > 0
             || lock(&self.jobs)?
                 .values()
                 .any(|entry| matches!(entry.job.status.as_str(), "queued" | "running")))
@@ -140,6 +145,7 @@ impl AppState {
     pub fn request_close(&self) -> AppResult<CloseDecision> {
         let _lifecycle = lock(&self.lifecycle_gate)?;
         let already_closing = self.closing.swap(true, Ordering::SeqCst);
+        self.sync_cancelled.store(true, Ordering::Relaxed);
         if !self.busy()? {
             Ok(CloseDecision::Ready)
         } else if already_closing {
@@ -162,6 +168,10 @@ pub fn test_state(library: Arc<Library>) -> AppState {
         previews: Mutex::new(PreviewResources::default()),
         watcher: Mutex::new(None),
         watcher_generation: std::sync::atomic::AtomicU64::new(0),
+        workspaces: Mutex::new(HashMap::new()),
+        pending_syncs: AtomicUsize::new(0),
+        workspace_worker: AtomicBool::new(false),
+        sync_cancelled: Arc::new(AtomicBool::new(false)),
         lifecycle_gate: Mutex::new(()),
         pending_config_writes: AtomicUsize::new(0),
         closing: AtomicBool::new(false),

@@ -138,6 +138,11 @@ pub struct ChangeSet {
     pub config_changed: bool,
     pub working_bytes: u64,
 }
+impl ChangeSet {
+    pub fn has_source_changes(&self) -> bool {
+        !self.added.is_empty() || !self.modified.is_empty() || !self.deleted.is_empty()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Category {

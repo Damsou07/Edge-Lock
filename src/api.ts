@@ -14,6 +14,7 @@ import type {
   Taxonomy,
   ThumbnailResource,
   VariantDetail,
+  WorkspaceStatus,
 } from "./contracts";
 
 export const api = {
@@ -38,6 +39,10 @@ export const api = {
   invalidateThumbnail: (resourceToken: string) =>
     invoke<void>("invalidate_thumbnail", { resourceToken }),
   getVariant: (id: string) => invoke<VariantDetail>("get_variant", { id }),
+  getWorkspaceStatus: (variantId: string) =>
+    invoke<WorkspaceStatus>("get_workspace_status", { variantId }),
+  requestWorkspaceSync: (variantId: string) =>
+    invoke<WorkspaceStatus>("request_workspace_sync", { variantId }),
   getSnapshot: (id: string) => invoke<Snapshot>("get_snapshot", { id }),
   listSnapshots: (variantId: string, offset: number, limit = 50) =>
     invoke<{ items: Snapshot[]; total: number }>("list_snapshots", {
@@ -77,6 +82,10 @@ export const api = {
   onWorkspaceChanged: (callback: (variantId: string) => void) =>
     listen<{ variantId: string }>("edge-lock://workspace-changed", (event) =>
       callback(event.payload.variantId),
+    ),
+  onWorkspaceStatus: (callback: (status: WorkspaceStatus) => void) =>
+    listen<WorkspaceStatus>("edge-lock://workspace-status", (event) =>
+      callback(event.payload),
     ),
   onFolderDrop: async (callback: (paths: string[]) => void) =>
     getCurrentWebview().onDragDropEvent((event) => {

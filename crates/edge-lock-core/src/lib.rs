@@ -6,6 +6,7 @@ mod library;
 pub mod blender;
 pub mod glb;
 pub mod preview;
+pub mod sync;
 
 pub use domain::*;
 pub use library::Library;

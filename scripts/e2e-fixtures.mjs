@@ -1,4 +1,124 @@
 import { deflateSync } from "node:zlib";
+import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+
+/** Run only disposable fixture authoring in a private Blender process. */
+export async function runFixtureBlender(
+  blender,
+  temporaryRoot,
+  script,
+  payload,
+) {
+  await Promise.all(
+    ["config", "scripts", "extensions", "temp"].map((name) =>
+      mkdir(join(temporaryRoot, name), { recursive: true }),
+    ),
+  );
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      blender,
+      [
+        "--background",
+        "--factory-startup",
+        "--disable-autoexec",
+        "--offline-mode",
+        "--python-exit-code",
+        "1",
+        "--python-expr",
+        script,
+        "--",
+        JSON.stringify(payload),
+      ],
+      {
+        cwd: temporaryRoot,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          BLENDER_USER_CONFIG: join(temporaryRoot, "config"),
+          BLENDER_USER_SCRIPTS: join(temporaryRoot, "scripts"),
+          BLENDER_USER_EXTENSIONS: join(temporaryRoot, "extensions"),
+          TEMP: join(temporaryRoot, "temp"),
+          TMP: join(temporaryRoot, "temp"),
+          TMPDIR: join(temporaryRoot, "temp"),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let log = "";
+    const capture = (chunk) => {
+      log = (log + chunk).slice(-32_000);
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("Disposable Blender fixture timed out"));
+    }, 120_000);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(log);
+      else
+        reject(
+          new Error(`Disposable Blender fixture failed (${code}): ${log}`),
+        );
+    });
+  });
+}
+
+/** A single editable .blend with a packed red/green texture and animation; no GLB. */
+export async function prepareBlendFixture(
+  blender,
+  directory,
+  temporaryRoot,
+  options = {},
+) {
+  await mkdir(directory, { recursive: true });
+  await mkdir(temporaryRoot, { recursive: true });
+  const seed = join(temporaryRoot, "seed.glb");
+  await writeFile(seed, animatedTexturedTriangle(options));
+  await runFixtureBlender(
+    blender,
+    temporaryRoot,
+    `
+import bpy,json,sys
+from pathlib import Path
+r=json.loads(sys.argv[-1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.ops.import_scene.gltf(filepath=r['seed'])
+for image in bpy.data.images:
+    if image.has_data and not image.packed_file: image.pack()
+bpy.context.preferences.filepaths.save_version=0
+bpy.context.preferences.filepaths.file_preview_type='NONE'
+bpy.ops.wm.save_as_mainfile(filepath=str(Path(r['directory'])/'model.blend'),check_existing=False)
+`,
+    { seed, directory },
+  );
+}
+
+/** Simulate the user's Save after adding a Mirror; only call on disposable workspaces. */
+export async function saveMirrorFixture(blender, blendFile, temporaryRoot) {
+  await runFixtureBlender(
+    blender,
+    temporaryRoot,
+    `
+import bpy,json,sys
+r=json.loads(sys.argv[-1])
+bpy.ops.wm.open_mainfile(filepath=r['blendFile'],use_scripts=False)
+mesh=next(obj for obj in bpy.context.scene.objects if obj.type=='MESH')
+modifier=mesh.modifiers.new('Edge Lock regression Mirror','MIRROR')
+modifier.use_mirror_merge=False
+bpy.context.preferences.filepaths.save_version=0
+bpy.context.preferences.filepaths.file_preview_type='NONE'
+bpy.ops.wm.save_as_mainfile(filepath=r['blendFile'],check_existing=False)
+`,
+    { blendFile },
+  );
+}
 
 function crc32(bytes) {
   let crc = 0xffffffff;

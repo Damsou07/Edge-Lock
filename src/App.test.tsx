@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { api } from "./api";
-import type { Asset, Bootstrap, Job } from "./contracts";
+import type { Asset, Bootstrap, Job, WorkspaceStatus } from "./contracts";
 
 vi.mock("./api", () => ({
   api: {
@@ -14,6 +14,9 @@ vi.mock("./api", () => ({
     listAssets: vi.fn(),
     onJob: vi.fn(),
     onWorkspaceChanged: vi.fn(),
+    onWorkspaceStatus: vi.fn(),
+    getWorkspaceStatus: vi.fn(),
+    requestWorkspaceSync: vi.fn(),
     onFolderDrop: vi.fn(),
     getAsset: vi.fn(),
     startJob: vi.fn(),
@@ -61,6 +64,7 @@ beforeEach(() => {
   vi.mocked(api.bootstrap).mockResolvedValue(startup);
   vi.mocked(api.onJob).mockResolvedValue(() => {});
   vi.mocked(api.onWorkspaceChanged).mockResolvedValue(() => {});
+  vi.mocked(api.onWorkspaceStatus).mockResolvedValue(() => {});
   dropFolders = undefined;
   vi.mocked(api.onFolderDrop).mockImplementation(async (callback) => {
     dropFolders = callback;
@@ -86,6 +90,41 @@ beforeEach(() => {
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("actualise le catalogue sur un nouvel artefact et ignore les événements anciens ou répétés", async () => {
+    let emit!: (status: WorkspaceStatus) => void;
+    vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
+    vi.mocked(api.listAssets).mockResolvedValue({ items: [sample], total: 1 });
+    vi.mocked(api.onWorkspaceStatus).mockImplementation(async (callback) => {
+      emit = callback;
+      return () => {};
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Robot explorateur" });
+    const initialReads = vi.mocked(api.listAssets).mock.calls.length;
+    const ready: WorkspaceStatus = {
+      variantId: "one",
+      revision: 1,
+      state: "ready",
+      sourceChanged: false,
+      canCreateSnapshot: false,
+      artifactKey: "first",
+      error: null,
+    };
+    await act(async () => emit(ready));
+    await waitFor(() =>
+      expect(api.listAssets).toHaveBeenCalledTimes(initialReads + 1),
+    );
+    await act(async () => emit({ ...ready, revision: 2 }));
+    expect(api.listAssets).toHaveBeenCalledTimes(initialReads + 1);
+    await act(async () =>
+      emit({ ...ready, revision: 4, artifactKey: "second" }),
+    );
+    await waitFor(() =>
+      expect(api.listAssets).toHaveBeenCalledTimes(initialReads + 2),
+    );
+    await act(async () => emit({ ...ready, revision: 3 }));
+    expect(api.listAssets).toHaveBeenCalledTimes(initialReads + 2);
+  });
   it("respecte la navigation choisie pendant l’annulation d’une vignette avant ouverture", async () => {
     vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
     vi.mocked(api.listAssets).mockImplementation(async (filter) =>

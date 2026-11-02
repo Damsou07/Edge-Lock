@@ -88,6 +88,39 @@ fn changes_versions_and_variants_are_isolated_and_deduplicated() {
 }
 
 #[test]
+fn a_derived_glb_change_alone_never_creates_a_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input);
+    fs::write(input.join("model.glb"), b"old derived output").unwrap();
+    let library = Library::open(temp.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&input, "Derived", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    let work = Path::new(&variant.workspace_path);
+    fs::write(work.join("model.glb"), b"regenerated output").unwrap();
+    let changes = library.changes(&variant.id, &ctx).unwrap();
+    assert!(changes.modified.is_empty());
+    assert!(
+        library
+            .create_snapshot(&variant.id, "Only GLB", &ctx)
+            .is_err()
+    );
+    fs::write(work.join("model.blend"), b"source edit").unwrap();
+    let snapshot = library
+        .create_snapshot(&variant.id, "Source edit", &ctx)
+        .unwrap();
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.path == "model.glb")
+    );
+}
+
+#[test]
 fn refuses_unrelated_directories_nested_imports_and_overwriting_outputs() {
     let temp = tempfile::tempdir().unwrap();
     let other = temp.path().join("personal");
@@ -263,7 +296,7 @@ fn corrupt_objects_never_publish_a_partial_restore() {
 }
 
 #[test]
-fn config_is_versioned_and_category_filter_includes_descendants() {
+fn legacy_config_alone_does_not_enable_a_version_and_category_filter_includes_descendants() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
     source(&input);
@@ -279,7 +312,17 @@ fn config_is_versioned_and_category_filter_includes_descendants() {
         ..Default::default()
     };
     library.update_config(&variant.id, config.clone()).unwrap();
-    assert!(library.changes(&variant.id, &ctx).unwrap().config_changed);
+    assert!(!library.changes(&variant.id, &ctx).unwrap().config_changed);
+    assert!(
+        library
+            .create_snapshot(&variant.id, "Only settings", &ctx)
+            .is_err()
+    );
+    fs::write(
+        Path::new(&variant.workspace_path).join("report.txt"),
+        b"source change",
+    )
+    .unwrap();
     let version = library
         .create_snapshot(&variant.id, "Export settings", &ctx)
         .unwrap();

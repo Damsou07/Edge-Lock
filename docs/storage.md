@@ -15,7 +15,10 @@ Bibliothèque/
   cache/previews/             # GLB d’aperçu, index JSON et temporaires marqués
   cache/thumbnails/           # PNG fixes et index par variante, régénérables
   cache/exports/              # résultats dérivés des exports stricts
+  cache/canonical/            # GLB immuables utilisés par aperçu et vignette
+  cache/sync/                 # reçus régénérables source → GLB
   backups/                    # sauvegardes de catalogue avant migration
+  backups/glb/                # GLB non historisés préservés avant adoption
 ```
 
 Les dossiers `cache` et `backups` sont créés lorsqu’ils sont nécessaires. Les noms visibles des assets et variantes résident dans SQLite ; leur renommage ne modifie pas les chemins de travail. Les réglages globaux, dont le chemin de bibliothèque et celui de Blender, sont dans le dossier de configuration Tauri de l’utilisateur, sous `settings.json`.
@@ -27,6 +30,10 @@ Une bibliothèque est reconnue par son marqueur de format. Edge Lock refuse d’
 Chaque manifeste associe un chemin relatif à un dossier ou à un hash et une taille de fichier. Les contenus sont lus en flux avec un tampon de 1 Mio. Les fichiers identiques partagent un objet entre versions, variantes et assets. Les dossiers de travail sont des copies ordinaires, sans hardlinks vers les objets : modifier un `.blend` de travail ne peut donc pas réécrire l’historique.
 
 Les fichiers cachés et sauvegardes Blender font partie de la capture. Aucune exclusion implicite ne supprime les rapports, textures ou captures. Les dossiers vides sont conservés. Le format ne promet pas de reproduire les ACL, flux alternatifs NTFS, permissions Unix ou horodatages d’origine. Les chemins doivent être Unicode et rester relatifs ; liens symboliques, junctions, fichiers spéciaux et échappements de chemin sont refusés.
+
+Depuis 0.2.0, chaque workspace conforme contient un `.blend` source et un GLB dérivé. Les imports exigent un `.blend` unique et au plus un GLB avant génération ; `.blend1` ne compte pas comme second modèle. Le GLB est inclus dans le manifeste d’une version, mais sa seule modification, suppression ou régénération ne suffit pas à autoriser une nouvelle version. Tous les autres fichiers et dossiers restent comparés.
+
+La capture d’une version vérifie ses empreintes de sources et de GLB contre le reçu de synchronisation. Elle refuse de publier un nouveau `.blend` accompagné d’un ancien GLB. Une sauvegarde concurrente impose une nouvelle synchronisation/capture, avec une seule nouvelle tentative. Les anciens manifestes et configurations ne sont pas réécrits. Les dossiers non conformes restent présents et consultables, mais ne peuvent pas publier de nouvelle version avant correction.
 
 L’inventaire est contrôlé avant et après capture. Une modification détectée entraîne une seconde tentative, puis une erreur si l’état reste instable. Cette détection protège les sauvegardes habituelles de Blender, mais ne constitue pas un gel atomique de plusieurs fichiers écrits par d’autres processus. Enregistrer et attendre la fin des écritures avant de versionner.
 
@@ -49,7 +56,9 @@ Les gros transferts sont annulables. Une annulation survenue après une frontiè
 3. Sauvegarder séparément `settings.json` si les réglages globaux doivent aussi être conservés. Les fichiers externes référencés par un `.blend` ne font pas partie de la bibliothèque.
 4. Pour tester une restauration, copier la sauvegarde vers **un nouveau dossier**, ouvrir cette copie et matérialiser une version représentative. Conserver la bibliothèque actuelle jusqu’à validation de la copie restaurée.
 
-Le cache est régénérable, mais copier l’ensemble est le procédé le plus simple. Aperçus GLB, vignettes PNG et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les PNG sont associés à la clé d’artefact et à une version du rendu ; ils ne font pas partie des versions de l’asset. Les fichiers originaux ne sont jamais remplacés par un aperçu. Les anciens caches deviennent simplement non réutilisés et sont évincés selon le budget ; aucun changement de schéma SQLite n’est nécessaire. Ne pas fusionner manuellement deux bibliothèques, ne pas modifier les objets, et ne pas remplacer seulement leur catalogue par celui d’une autre sauvegarde.
+Le cache est régénérable, mais copier l’ensemble est le procédé le plus simple. Aperçus GLB, GLB canoniques, vignettes PNG et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les PNG sont associés à la clé d’artefact et à une version du rendu ; ils ne font pas partie des versions de l’asset. Le `.blend` existant n’est jamais sauvegardé ni modifié par Edge Lock. Le GLB de travail est désormais un dérivé géré, remplacé atomiquement après validation. Avant sa première prise en charge, un GLB non certifié est conservé dans l’historique ou dans `backups/glb/` ; les sorties déjà certifiées ne produisent pas une sauvegarde à chaque conversion. Ces sauvegardes ne sont pas un cache évictable.
+
+Les reçus `cache/sync` contiennent les empreintes du `.blend`, des dépendances de rendu et du GLB, ainsi que l’identité du traitement. Un reçu absent, corrompu ou périmé impose une vérification et éventuellement une régénération. Une panne entre remplacement du GLB et publication du reçu est ainsi récupérable. Les reçus ne sont pas ajoutés au workspace ni à l’historique. Aucun changement de schéma SQLite n’est nécessaire. Ne pas fusionner manuellement deux bibliothèques, ne pas modifier les objets, et ne pas remplacer seulement leur catalogue par celui d’une autre sauvegarde.
 
 Lorsqu’une notice signale une publication interrompue, fermer l’application et sauvegarder l’ensemble avant intervention. Le journal contient `workspace`, relatif à la racine. Si ce dossier existe, en faire une copie hors de la bibliothèque et importer cette copie comme un nouvel asset après vérification. Conserver les temporaires de publication pour diagnostic. Seuls les répertoires d’aperçu `.preview-tmp-*` dotés du marqueur interne attendu sont nettoyés automatiquement ; les données de travail et journaux ne sont pas concernés.
 

@@ -272,27 +272,37 @@ def run(request):
         return None
 
     bpy.ops.wm.open_mainfile(filepath=request["blendFile"], load_ui=False, use_scripts=False)
-    config = request.get("config", {})
+    canonical = operation == "generate"
+    # A canonical GLB always represents the complete saved active scene. Old
+    # per-export selections must never silently narrow the generated asset.
+    config = {} if canonical else request.get("config", {})
     preview = operation in ('preview', 'inspectPreview')
     paths = SourcePaths(request['workspace'], request.get('logicalWorkspace') or request['workspace'])
-    if preview:
+    if preview or canonical:
         rebase_preview_sources(paths)
-    result, scene, collection, objects = inspect_project(request["workspace"], config, include_geometry=operation == "inspect", paths=paths, preview=preview)
+    result, scene, collection, objects = inspect_project(request["workspace"], config, include_geometry=operation == "inspect", paths=paths, preview=preview or canonical)
     if operation in ("inspect", "inspectPreview"):
         return result
-    if operation not in ("export", "preview"):
+    if operation not in ("export", "preview", "generate"):
         raise ValueError("Opération Blender inconnue.")
     unresolved = [item for item in result["dependencies"] if item["status"] in ("external", "missing")]
-    if unresolved and not preview:
+    if canonical:
+        missing = [item for item in unresolved if item["status"] == "missing" and item["renderRelevant"]]
+        if missing:
+            raise ValueError("Génération du GLB impossible : ressources utilisées manquantes : " + "; ".join(item["path"] for item in missing[:10]))
+    elif unresolved and not preview:
         raise ValueError("Export impossible : dépendances non figées dans cette version : " + "; ".join(item["path"] for item in unresolved[:10]))
     if bpy.app.autoexec_fail and not preview:
         raise ValueError("Export impossible : la scène dépend de scripts embarqués désactivés.")
-    apply_modifiers = bool(config.get("applyModifiers", False))
     for obj in objects:
         if obj.type != "MESH":
             continue
-        if apply_modifiers and obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 1:
-            raise ValueError("Désactivez « Appliquer les modificateurs » pour préserver les shape keys.")
+        # Blender's evaluated export drops morph targets when any modifier is
+        # present, including Armature. Fail before exporting instead of silently
+        # discarding shape keys or their animation. Modifier-free meshes retain
+        # their original data and morph targets with export_apply enabled.
+        if obj.modifiers and obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 1:
+            raise ValueError(f"GLB impossible pour {obj.name} : les shape keys sont incompatibles avec l’application des modificateurs. Le fichier .blend reste intact.")
         for modifier in obj.modifiers:
             if modifier.type == "ARMATURE" and modifier.object is not None and modifier.object not in objects:
                 raise ValueError(f"Le rig de {obj.name} se trouve hors de la collection. Exportez la scène ou regroupez le rig dans cette collection.")
@@ -313,7 +323,7 @@ def run(request):
         use_active_collection_with_nested=True, use_selection=False,
         use_visible=False, use_renderable=False,
         export_animations=True, export_animation_mode="ACTIONS",
-        export_skins=True, export_morph=True, export_apply=apply_modifiers,
+        export_skins=True, export_morph=True, export_apply=True,
         export_materials="EXPORT", export_image_format="AUTO",
         export_cameras=False, export_lights=False,
         export_draco_mesh_compression_enable=False, export_use_gltfpack=False,

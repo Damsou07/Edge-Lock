@@ -28,7 +28,7 @@ export default function ModelViewer({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const runtime = useRef<ViewerRuntime | null>(null);
-  const [status, setStatus] = useState<"loading" | "ready" | "error">(
+  const [status, setStatus] = useState<"loading" | "ready" | "empty" | "error">(
     "loading",
   );
   const [error, setError] = useState("");
@@ -118,6 +118,11 @@ export default function ModelViewer({
         loadedModel = model;
         loaded = model.scene;
         scene.add(loaded);
+        if (new THREE.Box3().setFromObject(loaded).isEmpty()) {
+          setStatus("empty");
+          render();
+          return;
+        }
         const frame = () => {
           if (!loaded || !controls) return false;
           let framed: ReturnType<typeof framePreviewModel>;
@@ -231,15 +236,29 @@ export default function ModelViewer({
       {status !== "ready" && (
         <div className="viewer-overlay">
           <Icon
-            name={status === "loading" ? "refresh" : "warning"}
+            name={
+              status === "loading"
+                ? "refresh"
+                : status === "empty"
+                  ? "cube"
+                  : "warning"
+            }
             size={26}
             className={status === "loading" ? "spinning" : ""}
           />
           <strong>
             {status === "loading"
               ? "Chargement du modèle…"
-              : "Aperçu indisponible"}
+              : status === "empty"
+                ? "Votre scène est vide."
+                : "Aperçu indisponible"}
           </strong>
+          {status === "empty" && (
+            <p>
+              Ajoutez un modèle dans Blender et enregistrez pour actualiser
+              l’aperçu.
+            </p>
+          )}
           {error && <p>{error}</p>}
         </div>
       )}

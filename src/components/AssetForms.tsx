@@ -23,7 +23,6 @@ export function CreateAssetModal({
     () => initialSource.split(/[\\/]/).filter(Boolean).at(-1) ?? "",
   );
   const [source, setSource] = useState(initialSource);
-  const [primary, setPrimary] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const choose = async () => {
@@ -47,10 +46,7 @@ export function CreateAssetModal({
           kind: "import",
           source,
           name: name.trim(),
-          config: {
-            ...defaultExportConfig,
-            primaryFile: primary.trim() || null,
-          },
+          config: defaultExportConfig,
         });
       else await runJob({ kind: "create", name: name.trim() });
       onClose();
@@ -94,7 +90,8 @@ export function CreateAssetModal({
             </label>
             <p className="field-help">
               Une copie complète est créée dans Edge Lock. Le dossier source
-              reste intact.
+              reste intact. Un seul fichier .blend est requis ; son GLB est
+              généré automatiquement avec les modificateurs.
             </p>
           </>
         )}
@@ -109,19 +106,6 @@ export function CreateAssetModal({
             placeholder="Ex. Robot explorateur"
           />
         </label>
-        {mode === "import" && (
-          <label>
-            Fichier principal <span className="optional">facultatif</span>
-            <input
-              value={primary}
-              onChange={(event) => setPrimary(event.target.value)}
-              placeholder="Ex. models/robot.blend"
-            />
-            <span className="field-help">
-              Chemin relatif au dossier. Vous pourrez le choisir après l’import.
-            </span>
-          </label>
-        )}
         {mode === "create" && (
           <div className="callout">
             <Icon name="folder" />

@@ -3,20 +3,19 @@ use crate::{
     preview_resources::{self, ResourceUrl},
     settings,
     state::*,
+    workspace,
 };
 use edge_lock_core::{
     AssetDetail, AssetFilter, AssetPage, ExportConfig, Library, LibraryInfo, Taxonomy,
     VariantDetail, blender::BlenderRunner,
 };
-use notify::Watcher;
 use serde::Serialize;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
@@ -56,7 +55,11 @@ pub async fn get_bootstrap(state: State<'_, ManagedState>) -> AppResult<Bootstra
 }
 
 #[tauri::command]
-pub async fn open_library(path: String, state: State<'_, ManagedState>) -> AppResult<LibraryInfo> {
+pub async fn open_library(
+    path: String,
+    app: AppHandle,
+    state: State<'_, ManagedState>,
+) -> AppResult<LibraryInfo> {
     let state = state.0.clone();
     blocking(move || {
         let _gate = lock(&state.operation_gate)?;
@@ -89,6 +92,9 @@ pub async fn open_library(path: String, state: State<'_, ManagedState>) -> AppRe
             previews.clear();
         }
         *lock(&state.startup_error)? = None;
+        drop(_lifecycle);
+        drop(_gate);
+        workspace::install(&app, &state);
         Ok(info)
     })
     .await
@@ -126,46 +132,27 @@ pub async fn list_snapshots(
     blocking(move || Ok(library.list_snapshots(&variant_id, offset, limit)?)).await
 }
 #[tauri::command]
-pub async fn get_variant(
-    id: String,
+pub async fn get_variant(id: String, state: State<'_, ManagedState>) -> AppResult<VariantDetail> {
+    let library = state.0.library()?;
+    blocking(move || Ok(library.get_variant(&id)?)).await
+}
+
+#[tauri::command]
+pub async fn get_workspace_status(
+    variant_id: String,
     app: AppHandle,
     state: State<'_, ManagedState>,
-) -> AppResult<VariantDetail> {
-    let state = state.0.clone();
-    let library = state.library()?;
-    let generation = state.watcher_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    blocking(move || {
-        let detail = library.get_variant(&id)?;
-        let variant_id = id.clone();
-        let mut last_event = Instant::now() - Duration::from_secs(1);
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if let Ok(event) = event
-                && !matches!(event.kind, notify::EventKind::Access(_))
-                && last_event.elapsed() >= Duration::from_millis(500)
-            {
-                last_event = Instant::now();
-                let _ = app.emit(
-                    "edge-lock://workspace-changed",
-                    serde_json::json!({"variantId":variant_id}),
-                );
-            }
-        });
-        if let Ok(mut watcher) = watcher
-            && watcher
-                .watch(
-                    PathBuf::from(&detail.variant.workspace_path).as_path(),
-                    notify::RecursiveMode::Recursive,
-                )
-                .is_ok()
-        {
-            let mut current = lock(&state.watcher)?;
-            if state.watcher_generation.load(Ordering::SeqCst) == generation {
-                *current = Some(watcher);
-            }
-        }
-        Ok(detail)
-    })
-    .await
+) -> AppResult<workspace::WorkspaceStatus> {
+    workspace::status(&app, &state.0, &variant_id)
+}
+
+#[tauri::command]
+pub async fn request_workspace_sync(
+    variant_id: String,
+    app: AppHandle,
+    state: State<'_, ManagedState>,
+) -> AppResult<workspace::WorkspaceStatus> {
+    workspace::request(&app, &state.0, &variant_id)
 }
 #[tauri::command]
 pub async fn get_taxonomy(state: State<'_, ManagedState>) -> AppResult<Taxonomy> {
@@ -311,7 +298,11 @@ pub fn copy_text(text: String, app: AppHandle) -> AppResult<()> {
         .map_err(|e| AppError::new("clipboard", e))
 }
 #[tauri::command]
-pub async fn set_blender_path(path: String, state: State<'_, ManagedState>) -> AppResult<String> {
+pub async fn set_blender_path(
+    path: String,
+    app: AppHandle,
+    state: State<'_, ManagedState>,
+) -> AppResult<String> {
     let state = state.0.clone();
     blocking(move || {
         let path = std::fs::canonicalize(path)?;
@@ -325,6 +316,8 @@ pub async fn set_blender_path(path: String, state: State<'_, ManagedState>) -> A
         settings::save(&state.settings_file, &settings)
             .map_err(|e| AppError::new("settings", e))?;
         *lock(&state.settings)? = settings;
+        drop(_gate);
+        workspace::reconcile(&app, &state);
         Ok(version.version)
     })
     .await
@@ -351,10 +344,11 @@ pub async fn open_blender(variant_id: String, state: State<'_, ManagedState>) ->
     let state = state.0.clone();
     let library = state.library()?;
     blocking(move || {
-        let variant = library.get_variant(&variant_id)?.variant;
-        let path = variant.config.primary_file.ok_or_else(|| {
-            AppError::new("primary_missing", "Choisissez un fichier principal .blend.")
-        })?;
+        let detail = library.get_variant(&variant_id)?;
+        let path = edge_lock_core::sync::validate_project(&detail.files)
+            .map(|layout| layout.blend_file)
+            .or_else(|error| detail.variant.config.primary_file.clone().ok_or(error))?;
+        let variant = detail.variant;
         let workspace = std::fs::canonicalize(variant.workspace_path)?;
         let primary = std::fs::canonicalize(workspace.join(path))?;
         if !primary.starts_with(&workspace)

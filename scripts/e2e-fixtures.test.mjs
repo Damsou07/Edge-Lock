@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { inflateSync } from "node:zlib";
-import { animatedTexturedTriangle } from "./e2e-fixtures.mjs";
+import { mkdir, mkdtemp, readdir, readFile } from "node:fs/promises";
+import { resolve, join } from "node:path";
+import {
+  animatedTexturedTriangle,
+  prepareBlendFixture,
+  saveMirrorFixture,
+  runFixtureBlender,
+} from "./e2e-fixtures.mjs";
 
 test("desktop fixture embeds a contrasting PNG used by its UV-mapped material", () => {
   const glb = animatedTexturedTriangle();
@@ -46,3 +53,37 @@ test("data URI fixture loads its texture through a PNG data URL without an image
   assert.equal(document.bufferViews.length, 5);
   assert.equal(document.buffers[0].byteLength, 100);
 });
+
+test(
+  "desktop Blender fixture is source-only and saved Mirror remains editable",
+  {
+    skip: !process.env.EDGE_LOCK_E2E_BLENDER,
+  },
+  async () => {
+    await mkdir(resolve(".test-data"), { recursive: true });
+    const root = await mkdtemp(resolve(".test-data", "blend-fixture-"));
+    const source = join(root, "source");
+    const blender = resolve(process.env.EDGE_LOCK_E2E_BLENDER);
+    await prepareBlendFixture(blender, source, join(root, "author"));
+    assert.deepEqual(await readdir(source), ["model.blend"]);
+    const blendFile = join(source, "model.blend");
+    const original = await readFile(blendFile);
+    assert.ok(original.length > 1024);
+    await saveMirrorFixture(blender, blendFile, join(root, "edit"));
+    assert.notDeepEqual(await readFile(blendFile), original);
+    await runFixtureBlender(
+      blender,
+      join(root, "verify"),
+      `
+import bpy,json,sys
+r=json.loads(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=r['blendFile'],use_scripts=False)
+mesh=next(obj for obj in bpy.context.scene.objects if obj.type=='MESH')
+assert len(mesh.modifiers)==1 and mesh.modifiers[0].type=='MIRROR'
+assert any(image.packed_file for image in bpy.data.images)
+assert len(bpy.data.actions)>0
+`,
+      { blendFile },
+    );
+    assert.deepEqual(await readdir(source), ["model.blend"]);
+  },
+);

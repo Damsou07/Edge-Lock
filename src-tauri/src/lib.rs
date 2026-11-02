@@ -3,6 +3,7 @@ mod jobs;
 mod preview_resources;
 mod settings;
 mod state;
+mod workspace;
 
 use state::{AppState, CloseDecision, ManagedState};
 use std::{
@@ -59,13 +60,23 @@ pub fn run() {
                 previews: Mutex::new(preview_resources::PreviewResources::default()),
                 watcher: Mutex::new(None),
                 watcher_generation: std::sync::atomic::AtomicU64::new(0),
+                workspaces: Mutex::new(HashMap::new()),
+                pending_syncs: std::sync::atomic::AtomicUsize::new(0),
+                workspace_worker: std::sync::atomic::AtomicBool::new(false),
+                sync_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 lifecycle_gate: Mutex::new(()),
                 pending_config_writes: std::sync::atomic::AtomicUsize::new(0),
                 closing: std::sync::atomic::AtomicBool::new(false),
             })));
+            workspace::install(app.handle(), &app.state::<ManagedState>().0);
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Focused(true)) {
+                let app = window.app_handle().clone();
+                let state = window.state::<ManagedState>().0.clone();
+                tauri::async_runtime::spawn_blocking(move || workspace::reconcile(&app, &state));
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<ManagedState>().0.clone();
                 match state.request_close() {
@@ -155,6 +166,8 @@ pub fn run() {
             commands::list_assets,
             commands::get_asset,
             commands::get_variant,
+            commands::get_workspace_status,
+            commands::request_workspace_sync,
             commands::get_snapshot,
             commands::list_snapshots,
             commands::get_taxonomy,

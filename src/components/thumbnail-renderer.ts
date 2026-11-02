@@ -1,4 +1,5 @@
 import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
+import { Box3 } from "three";
 import {
   createPreviewRenderer,
   createPreviewStage,
@@ -26,7 +27,8 @@ export async function renderThumbnail(
     model = await loadPreviewModel(url, signal);
     signal?.throwIfAborted();
     stage.scene.add(model.scene);
-    framePreviewModel(model.scene, stage.camera);
+    if (!new Box3().setFromObject(model.scene).isEmpty())
+      framePreviewModel(model.scene, stage.camera);
     renderer.render(stage.scene, stage.camera);
     const png = await new Promise<Blob>((resolve, reject) => {
       renderer.domElement.toBlob((blob) => {

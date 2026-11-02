@@ -10,13 +10,13 @@ import {
   readdir,
   realpath,
   lstat,
-  unlink,
+  copyFile,
 } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve, join, relative, isAbsolute, sep } from "node:path";
 import { createHash } from "node:crypto";
-import { animatedTexturedTriangle as animatedTriangle } from "./e2e-fixtures.mjs";
+import { prepareBlendFixture, saveMirrorFixture } from "./e2e-fixtures.mjs";
 
 const root = resolve(".");
 await mkdir(".test-data", { recursive: true });
@@ -24,19 +24,21 @@ const testRoot = await mkdtemp(resolve(".test-data", "desktop-"));
 const settings = join(testRoot, "settings");
 const library = join(testRoot, "library");
 const source = join(testRoot, "source é");
-const unavailableBlender = join(testRoot, "unavailable-blender.exe");
+const blender = resolve(
+  process.env.EDGE_LOCK_E2E_BLENDER ??
+    "C:/Program Files/Blender Foundation/Blender 5.1/blender.exe",
+);
+await access(blender);
 await mkdir(source);
 await mkdir(settings);
-if (process.env.EDGE_LOCK_E2E_KITSUNE_SOURCE) {
-  await assert.rejects(() => access(unavailableBlender), { code: "ENOENT" });
-  await writeFile(
-    join(settings, "settings.json"),
-    JSON.stringify({ libraryPath: null, blenderPath: unavailableBlender }),
-  );
-}
+await writeFile(
+  join(settings, "settings.json"),
+  JSON.stringify({ libraryPath: null, blenderPath: blender }),
+);
 await mkdir(join(source, "empty"));
-await writeFile(join(source, "model.glb"), animatedTriangle());
+await prepareBlendFixture(blender, source, join(testRoot, "fixture-blender"));
 await writeFile(join(source, "notes.txt"), "original");
+const sourceOriginal = await fileManifest(source);
 const executable = resolve(
   process.env.EDGE_LOCK_E2E_EXE ?? "target/debug/edge-lock.exe",
 );
@@ -87,6 +89,12 @@ child.stderr.on(
 );
 let session;
 const report = { testRoot, startedAt: new Date().toISOString(), checks: [] };
+const canonicalConfig = {
+  primaryFile: null,
+  scene: null,
+  collection: null,
+  applyModifiers: false,
+};
 async function request(method, path, data) {
   const response = await fetch(base + path, {
     method,
@@ -384,7 +392,7 @@ async function assertBlueButton(selector, capture) {
   return idle;
 }
 
-async function testVisualRefreshAndAutosave(variantId) {
+async function testVisualRefreshAndCanonicalRules() {
   report.visualRefresh = {};
   for (const [width, height] of [
     [1440, 940],
@@ -419,55 +427,95 @@ async function testVisualRefreshAndAutosave(variantId) {
     await waitForModel("model.glb");
   }
   await viewport(1440, 940);
-  const primary = await assertBlueButton(
-    ".detail-heading .button.primary",
-    "ui-primary-hover.png",
-  );
-  const blender = await assertBlueButton(
-    ".blender-button",
-    "ui-blender-hover.png",
-  );
-  assert.equal(blender.gradient, primary.gradient);
-  assert.equal(blender.color, primary.color);
+  await assertBlueButton(".blender-button", "ui-blender-hover.png");
   assert.equal(
-    await script(`return document.body.innerText.includes('Enregistrer les réglages') ||
-    document.body.innerText.includes('Ces réglages définissent la source');`),
+    await script('return !!document.querySelector(".config-form");'),
     false,
   );
-  await clickSelector('.config-form input[type="checkbox"]');
-  await until(
-    async () =>
-      (await invoke("get_variant", { id: variantId })).variant.config
-        .applyModifiers,
-  );
-  await until(() =>
-    script(
-      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
-    ),
-  );
-  await clickText("Retour à la bibliothèque");
-  await clickText("Éclaireur");
-  await until(() =>
-    script(
-      'return document.querySelector(".config-form input[type=checkbox]")?.checked;',
-    ),
-  );
-  await waitForModel("model.glb");
-  // Restore the fixture before the existing version/configuration scenarios.
-  await clickSelector('.config-form input[type="checkbox"]');
-  await until(
-    async () =>
-      !(await invoke("get_variant", { id: variantId })).variant.config
-        .applyModifiers,
-  );
-  await until(() =>
-    script(
-      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
-    ),
-  );
-  await waitForModel("model.glb");
   report.checks.push(
-    "Thème bleu glass à 1440/1024 px : police locale, logo agrandi, points roses, grille/liste/tableau/modales et survol bleu sans flash ni déplacement ; sauvegarde automatique persistée après réouverture",
+    "Thème à 1440/1024 px : police locale, logo, grille/liste/tableau/modales ; aucun ancien menu de source ou choix des modificateurs",
+  );
+}
+
+async function testAutomaticMirror(variant) {
+  assertWithin(await realpath(testRoot), await realpath(variant.workspacePath));
+  await until(() =>
+    script(
+      `const button = Array.from(document.querySelectorAll('button')).find(el => el.textContent.includes('Créer une version')); return button?.disabled && document.querySelector('.workspace-state')?.textContent.includes('À jour');`,
+    ),
+  );
+  await assert.rejects(
+    () =>
+      job({
+        kind: "snapshot",
+        variantId: variant.id,
+        message: "Version vide refusée",
+      }),
+    /Aucune modification/,
+  );
+  const blendFile = join(variant.workspacePath, "model.blend");
+  const glbFile = join(variant.workspacePath, "model.glb");
+  const beforeGlb = await fileHash(glbFile);
+  await saveMirrorFixture(blender, blendFile, join(testRoot, "fixture-edit"));
+  const savedBlend = await fileHash(blendFile);
+  // No refresh/job call here: only the filesystem save may trigger generation.
+  await until(async () => (await fileHash(glbFile)) !== beforeGlb, 300_000);
+  await until(
+    () =>
+      script(`
+    const metric = Array.from(document.querySelectorAll('.asset-metrics > div')).find(el => el.querySelector('span')?.textContent === 'Triangles');
+    const button = Array.from(document.querySelectorAll('button')).find(el => el.textContent.includes('Créer une version'));
+    return metric?.querySelector('strong')?.textContent.trim() === '2' && button && !button.disabled && !!document.querySelector('.viewer-help');
+  `),
+    300_000,
+  );
+  assert.equal(
+    await fileHash(blendFile),
+    savedBlend,
+    "Synchronization must not save or apply modifiers in the .blend",
+  );
+  await screenshot("11-mirror-autosync.png");
+  report.checks.push(
+    "Sauvegarde réelle d’un Mirror : GLB et géométrie d’aperçu passent de 1 à 2 triangles automatiquement, .blend inchangé par Edge Lock, version vide refusée",
+  );
+}
+
+async function testStrictImportRules(variant) {
+  const invalidRoot = join(testRoot, "invalid-projects");
+  await mkdir(invalidRoot);
+  for (const [name, files] of [
+    ["GLB seul", ["only.glb"]],
+    ["Deux sources", ["first.blend", "nested/second.blend"]],
+    ["Deux GLB", ["model.blend", "first.glb", "second.glb"]],
+  ]) {
+    const directory = join(invalidRoot, name);
+    await mkdir(directory);
+    for (const file of files) {
+      const target = join(directory, file);
+      await mkdir(resolve(target, ".."), { recursive: true });
+      await copyFile(
+        join(
+          variant.workspacePath,
+          file.endsWith(".blend") ? "model.blend" : "model.glb",
+        ),
+        target,
+      );
+    }
+    const before = await fileManifest(directory);
+    await assert.rejects(
+      () =>
+        job({
+          kind: "import",
+          source: directory,
+          name,
+          config: canonicalConfig,
+        }),
+      /non conforme/i,
+    );
+    assert.deepEqual(await fileManifest(directory), before);
+  }
+  report.checks.push(
+    "Imports GLB seul, plusieurs .blend ou plusieurs GLB refusés sans modifier leurs fichiers",
   );
 }
 
@@ -695,7 +743,7 @@ async function galleryPageSnapshot() {
 
 async function testGalleryPagePerformance() {
   const started = performance.now();
-  const deadline = started + 180_000;
+  const deadline = started + 900_000;
   const remaining = () => {
     const duration = Math.round(deadline - performance.now());
     assert.ok(
@@ -709,7 +757,7 @@ async function testGalleryPagePerformance() {
     fixtureAssets: 50,
     pageSize: 36,
     conditions:
-      "50 imports séquentiels du même petit GLB synthétique texturé ; première visite de ces assets, contenu GLB partagé avec la fixture initiale. Les temps incluent le polling WebDriver. Le maximum WebGL est celui observé après installation de l’instrumentation dans chaque nouveau document.",
+      "50 imports séquentiels du même .blend synthétique texturé avec génération canonique réelle ; première visite de ces assets. Les temps incluent Blender et le polling WebDriver.",
   };
   try {
     for (let index = 0; index < 50; index++) {
@@ -719,7 +767,7 @@ async function testGalleryPagePerformance() {
           source,
           name: `Performance galerie ${String(index).padStart(2, "0")}`,
           config: {
-            primaryFile: "model.glb",
+            primaryFile: "model.blend",
             scene: null,
             collection: null,
             applyModifiers: false,
@@ -821,15 +869,19 @@ async function testGalleryPagePerformance() {
 
 async function testDataUriTexture() {
   const dataSource = join(testRoot, "source data-uri");
-  await mkdir(dataSource);
-  const glb = animatedTriangle({ dataUri: true });
-  await writeFile(join(dataSource, "data-uri.glb"), glb);
+  await prepareBlendFixture(
+    blender,
+    dataSource,
+    join(testRoot, "fixture-data-uri"),
+    { dataUri: true },
+  );
+  const original = await fileManifest(dataSource);
   const imported = await job({
     kind: "import",
     source: dataSource,
     name: "Texture data URI — test",
     config: {
-      primaryFile: "data-uri.glb",
+      primaryFile: "model.blend",
       scene: null,
       collection: null,
       applyModifiers: false,
@@ -847,13 +899,13 @@ async function testDataUriTexture() {
       0,
     );
     await clickText("Texture data URI");
-    await waitForModel("data-uri.glb");
+    await waitForModel("model.glb");
     report.texturePixels.dataUriViewer = await assertTexturePixels(
       ".viewer-canvas",
       "10-data-uri-viewer.png",
     );
     await clickText("Retour à la bibliothèque");
-    assert.deepEqual(await readFile(join(dataSource, "data-uri.glb")), glb);
+    assert.deepEqual(await fileManifest(dataSource), original);
     report.checks.push(
       "Texture PNG en data URI réellement affichée dans la vignette et la fiche automatique, pixels rouge/vert vérifiés et source préservée",
     );
@@ -917,10 +969,6 @@ async function fileManifest(directory) {
   return entries.sort((a, b) => a.path.localeCompare(b.path, "en"));
 }
 
-function contentManifest(entries) {
-  return entries.map(({ modifiedAt: _modifiedAt, ...entry }) => entry);
-}
-
 function assertWithin(directory, target) {
   const path = relative(directory, target);
   assert.ok(
@@ -944,242 +992,53 @@ async function testKitsune() {
   const personalSource = await realpath(
     resolve(process.env.EDGE_LOCK_E2E_KITSUNE_SOURCE),
   );
-  assert.ok(
-    process.env.EDGE_LOCK_E2E_BLENDER,
-    "Kitsune validation requires EDGE_LOCK_E2E_BLENDER.",
-  );
   const original = await fileManifest(personalSource);
-  const glbs = original.filter(
-    (entry) => entry.kind === "file" && /\.glb$/i.test(entry.path),
-  );
-  assert.ok(
-    glbs.length > 0,
-    "Kitsune fixture must include its original GLB to test preview priority.",
-  );
-  const beforeSettings = await invoke("get_bootstrap");
-  assert.equal(
-    beforeSettings.settings.blenderPath,
-    unavailableBlender,
-    "The original GLB must work with an unavailable Blender executable.",
-  );
-  report.kitsune = {
-    source: personalSource,
-    sourceFileCount: original.filter((entry) => entry.kind === "file").length,
-  };
+  report.kitsune = { source: personalSource };
   try {
     const asset = await job(
       {
         kind: "import",
         source: personalSource,
-        name: "Sniper Kitsune — dépendances",
-        config: {
-          primaryFile: null,
-          scene: null,
-          collection: null,
-          applyModifiers: false,
-        },
+        name: "Sniper Kitsune — synchronisation",
+        config: canonicalConfig,
       },
-      300_000,
+      600_000,
     );
     const variant = asset.variants[0];
-    assert.ok(
-      /\.blend$/i.test(variant.config.primaryFile),
-      "Kitsune must retain its Blender primary source.",
+    assertWithin(
+      await realpath(testRoot),
+      await realpath(variant.workspacePath),
     );
-    const workspace = await realpath(variant.workspacePath);
-    assertWithin(await realpath(testRoot), workspace);
-    assertWithin(await realpath(library), workspace);
-    assert.notEqual(
-      workspace,
-      personalSource,
-      "The imported workspace must be separate from personal files.",
+    const blend = original.find(
+      (entry) => entry.kind === "file" && /\.blend$/i.test(entry.path),
     );
-    const importedFiles = await fileManifest(workspace);
-    assert.deepEqual(
-      contentManifest(importedFiles),
-      contentManifest(original),
-      "Import must preserve every Kitsune source file.",
-    );
-    const originalConfig = structuredClone(variant.config);
-    const previewRequest = { kind: "preview", variantId: variant.id };
-    const directStarted = performance.now();
-    let direct;
-    try {
-      direct = await job(previewRequest, 300_000);
-    } catch (error) {
-      if (error.code !== "preview_ambiguous") throw error;
-      assert.ok(error.details?.candidates?.includes(glbs[0].path));
-      previewRequest.previewFile = glbs[0].path;
-      direct = await job(previewRequest, 300_000);
-    }
-    report.kitsune.originalGlbMs = Math.round(
-      performance.now() - directStarted,
-    );
-    assert.equal(direct.sourceKind, "assetGlb");
-    assert.ok(glbs.some((entry) => entry.path === direct.sourceFile));
-    assert.ok(direct.inspection.geometry.triangles > 0);
+    assert.ok(blend, "Kitsune must have exactly one editable Blender source");
     assert.equal(
-      (await invoke("get_bootstrap")).settings.blenderPath,
-      unavailableBlender,
+      await fileHash(join(variant.workspacePath, blend.path)),
+      blend.hash,
     );
-    assert.equal(
-      (await invoke("get_variant", { id: variant.id })).variant.triangles,
-      variant.triangles,
-      "An adjacent GLB must not overwrite Blender source metrics.",
-    );
-    const cache = join(library, "cache", "previews");
-    const directCache = await fileManifest(cache);
-    const directWarm = await concurrentPreviews(previewRequest);
-    for (const result of directWarm) {
-      assert.equal(result.sourceKind, "assetGlb");
-      assert.equal(result.sourceFile, direct.sourceFile);
-    }
-    assert.deepEqual(
-      await fileManifest(cache),
-      directCache,
-      "Concurrent warm original-GLB previews must reuse the cached files.",
-    );
-    await script("window.location.reload(); return true;");
-    await until(() =>
-      script('return document.body.innerText.includes("Sniper Kitsune");'),
-    );
-    await clickText("Sniper Kitsune");
-    await until(() =>
-      script('return !!document.querySelector(".workspace-panel");'),
-    );
-    if (previewRequest.previewFile) {
-      await until(() =>
-        script(
-          'return !!document.querySelector(".preview-source-choice select");',
-        ),
-      );
-      await script(
-        'const select=document.querySelector(".preview-source-choice select"); const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,"value").set; setter.call(select, arguments[0]); select.dispatchEvent(new Event("change",{bubbles:true})); return true;',
-        [previewRequest.previewFile],
-      );
-      await clickText("Utiliser ce GLB");
-    }
-    await waitForModel(direct.sourceFile);
-    await screenshot("06-kitsune-original-glb.png");
-    assert.match(
-      await script(
-        'return document.querySelector(".inspection-note").innerText;',
-      ),
-      /arêtes/,
-    );
-
-    // Only unlink GLBs in the canonical, imported workspace. Personal inputs and
-    // immutable history objects remain untouched; the existing .blend is never saved.
-    for (const entry of glbs) {
-      const target = await realpath(join(workspace, entry.path));
-      assertWithin(workspace, target);
-      assertWithin(await realpath(testRoot), target);
-      assert.ok(/\.glb$/i.test(target));
-      assert.ok((await lstat(target)).isFile());
-      await unlink(target);
-    }
-    delete previewRequest.previewFile;
-    const expectedWorkspace = importedFiles.filter(
-      (entry) => !glbs.some((glb) => glb.path === entry.path),
-    );
-    assert.deepEqual(await fileManifest(workspace), expectedWorkspace);
-    await invoke("set_blender_path", {
-      path: resolve(process.env.EDGE_LOCK_E2E_BLENDER),
+    const before = await fileManifest(variant.workspacePath);
+    const previews = await concurrentPreviews({
+      kind: "preview",
+      variantId: variant.id,
     });
-    const generatedStarted = performance.now();
-    const generated = await job(previewRequest, 300_000);
-    report.kitsune.generatedMs = Math.round(
-      performance.now() - generatedStarted,
-    );
-    assert.equal(generated.sourceKind, "generatedGlb");
-    assert.equal(generated.sourceFile, variant.config.primaryFile);
-    assert.ok(generated.inspection.geometry.edges > 0);
-    assert.ok(generated.inspection.geometry.triangles > 0);
-    const font = generated.inspection.dependencies.find((dependency) =>
-      /msyhbd\.ttc/i.test(dependency.path),
-    );
-    const brush = generated.inspection.dependencies.find((dependency) =>
-      /essentials_brushes-gp_draw\.blend/i.test(dependency.path),
-    );
-    assert.ok(font, "Kitsune's external font must be identified.");
-    assert.ok(brush, "Kitsune's missing brush library must be identified.");
-    assert.equal(font.status, "external");
-    assert.equal(brush.status, "missing");
-    assert.equal(font.renderRelevant, false);
-    assert.equal(brush.renderRelevant, false);
-    const generatedCache = await fileManifest(cache);
-    const warmStarted = performance.now();
-    const warm = await concurrentPreviews(previewRequest);
-    report.kitsune.warmMs = Math.round(performance.now() - warmStarted);
-    report.kitsune.concurrentPreviewJobs = warm.length;
-    for (const result of warm) {
-      assert.equal(result.sourceKind, "generatedGlb");
-      assert.deepEqual(result.inspection, generated.inspection);
-    }
-    assert.deepEqual(
-      await fileManifest(cache),
-      generatedCache,
-      "Concurrent warm Blender previews must not rewrite the GLB or its metadata.",
-    );
-    await script("window.location.reload(); return true;");
-    await until(() =>
-      script('return document.body.innerText.includes("Sniper Kitsune");'),
-    );
-    await clickText("Sniper Kitsune");
-    await until(() =>
-      script('return !!document.querySelector(".workspace-panel");'),
-    );
-    await waitForModel(generated.sourceFile);
-    const warningText = await script(
-      'return Array.from(document.querySelectorAll(".inspection-warnings,.preview-notice")).map(element=>element.innerText).join("\\n");',
-    );
-    assert.doesNotMatch(
-      warningText,
-      /msyhbd\.ttc|essentials_brushes-gp_draw\.blend/i,
-    );
-    const counts = await script(
-      'return document.querySelector(".inspection-note").innerText;',
-    );
-    assert.match(counts, /arêtes/);
-    await screenshot("07-kitsune-generated-glb.png");
-    assert.deepEqual(
-      await fileManifest(workspace),
-      expectedWorkspace,
-      "Blender preview must never modify imported source files.",
-    );
-    const after = await invoke("get_variant", { id: variant.id });
-    assert.deepEqual(after.variant.config, originalConfig);
-    assert.equal(after.variant.headSnapshotId, variant.headSnapshotId);
-    const snapshot = await invoke("get_snapshot", {
-      id: variant.headSnapshotId,
-    });
-    for (const glb of glbs)
-      assert.ok(snapshot.entries.some((entry) => entry.path === glb.path));
-    assert.ok(
-      (await readdir(cache)).every((name) => !name.startsWith(".preview-tmp-")),
-      "Preview temporary directories must be cleaned.",
-    );
-    report.kitsune.geometry = generated.inspection.geometry;
-    report.kitsune.secondaryDependencies = [font, brush].map(
-      ({ path, kind, status, renderRelevant }) => ({
-        path,
-        kind,
-        status,
-        renderRelevant,
-      }),
-    );
+    assert.equal(previews[0].artifactKey, previews[1].artifactKey);
+    assert.ok(previews[0].inspection.geometry.triangles > 0);
+    assert.deepEqual(await fileManifest(variant.workspacePath), before);
+    report.kitsune.geometry = previews[0].inspection.geometry;
     report.checks.push(
-      "Sniper Kitsune importé dans une bibliothèque jetable : GLB original sans Blender, conversion réelle avec police/brosse non bloquantes, cache réutilisé, arêtes et rendu WebGL capturés",
+      "Kitsune facultatif : copie jetable, GLB canonique, cache réutilisé et source personnelle préservée",
     );
   } finally {
     assert.deepEqual(
       await fileManifest(personalSource),
       original,
-      "Every personal Kitsune file and its modification time must remain unchanged.",
+      "Every personal Kitsune file and its modification time must remain unchanged",
     );
     report.kitsune.sourcePreserved = true;
   }
 }
+
 try {
   await until(async () => {
     const response = await fetch(base + "/status", {
@@ -1228,7 +1087,7 @@ try {
     source,
     name: "Éclaireur — prototype",
     config: {
-      primaryFile: "model.glb",
+      primaryFile: "model.blend",
       scene: null,
       collection: null,
       applyModifiers: false,
@@ -1236,6 +1095,16 @@ try {
   });
   const main = imported.variants[0];
   const first = main.headSnapshotId;
+  assert.equal(
+    (await readdir(source)).filter((name) => /\.glb$/i.test(name)).length,
+    0,
+  );
+  assert.equal(
+    (await readdir(main.workspacePath)).filter((name) => /\.glb$/i.test(name))
+      .length,
+    1,
+  );
+  await testStrictImportRules(main);
   assert.equal(await readFile(join(source, "notes.txt"), "utf8"), "original");
   await access(join(main.workspacePath, "empty"));
   report.checks.push(
@@ -1291,7 +1160,8 @@ try {
     ".viewer-canvas",
     "03-viewer.png",
   );
-  await testVisualRefreshAndAutosave(main.id);
+  await testVisualRefreshAndCanonicalRules();
+  await testAutomaticMirror(main);
   report.checks.push(
     "Texture PNG rouge et verte réellement visible dans la vignette statique et dans l’aperçu automatique, contrôlée par pixels des captures WebDriver",
   );
@@ -1388,7 +1258,7 @@ try {
   await writeFile(join(main.workspacePath, "notes.txt"), "version 2");
   await writeFile(join(main.workspacePath, "rapport.txt"), "nouveau");
   const changes = await job({ kind: "changes", variantId: main.id });
-  assert.deepEqual(changes.modified, ["notes.txt"]);
+  assert.deepEqual(changes.modified, ["model.blend", "notes.txt"]);
   assert.deepEqual(changes.added, ["rapport.txt"]);
   const second = await job({
     kind: "snapshot",
@@ -1424,9 +1294,15 @@ try {
     destination: output,
     overwrite: false,
   });
-  assert.deepEqual(
-    await readFile(output),
-    await readFile(join(source, "model.glb")),
+  const exported = await readFile(output);
+  const exportedJson = JSON.parse(
+    exported.subarray(20, 20 + exported.readUInt32LE(12)).toString(),
+  );
+  const primitive = exportedJson.meshes[0].primitives[0];
+  assert.equal(
+    exportedJson.accessors[primitive.indices].count,
+    3,
+    "Historical export must keep the pre-Mirror geometry",
   );
   await assert.rejects(
     () =>
@@ -1447,124 +1323,12 @@ try {
     "Export historique vérifié, remplacement refusé sans consentement, travail courant intact",
   );
   if (process.env.EDGE_LOCK_E2E_KITSUNE_SOURCE) await testKitsune();
-  if (
-    process.env.EDGE_LOCK_E2E_BLEND_SOURCE &&
-    process.env.EDGE_LOCK_E2E_BLENDER
-  ) {
-    const blendSource = resolve(process.env.EDGE_LOCK_E2E_BLEND_SOURCE);
-    const before = createHash("sha256")
-      .update(await readFile(join(blendSource, "main.blend")))
-      .digest("hex");
-    await invoke("set_blender_path", {
-      path: resolve(process.env.EDGE_LOCK_E2E_BLENDER),
-    });
-    const blenderAsset = await job({
-      kind: "import",
-      source: blendSource,
-      name: "Robot Blender — test",
-      config: {
-        primaryFile: null,
-        scene: null,
-        collection: null,
-        applyModifiers: false,
-      },
-    });
-    const blenderVariant = blenderAsset.variants[0];
-    assert.equal(blenderVariant.config.primaryFile, "main.blend");
-    await invoke("update_config", {
-      variantId: blenderVariant.id,
-      config: { ...blenderVariant.config, collection: "Asset" },
-    });
-    const blenderGalleryStarted = performance.now();
-    await script("window.location.reload(); return true;");
-    await waitForThumbnail("Robot Blender");
-    report.blenderPreviewPerformance = {
-      galleryFirstConversionAndImageMs: Math.round(
-        performance.now() - blenderGalleryStarted,
-      ),
-      conditions:
-        "Premier aperçu de cet import Blender préparé par la galerie avant toute analyse explicite ; durée jusqu’à la vignette complète, polling WebDriver inclus.",
-    };
-    assert.equal(
-      await script('return document.querySelectorAll("canvas").length;'),
-      0,
-    );
-    const blenderWarmStarted = performance.now();
-    const derived = await job({
-      kind: "preview",
-      variantId: blenderVariant.id,
-    });
-    report.blenderPreviewPerformance.warmPreviewJobMs = Math.round(
-      performance.now() - blenderWarmStarted,
-    );
-    report.blenderPreviewPerformance.sourceKind = derived.sourceKind;
-    assert.ok(derived.url.startsWith("http://edge-preview.localhost/"));
-    await invoke("release_preview_resources", {
-      tokens: [new URL(derived.url).pathname.slice(1)],
-    });
-    const inspection = await job({
-      kind: "inspect",
-      variantId: blenderVariant.id,
-    });
-    assert.equal(inspection.geometry.triangles, 12);
-    const blenderOutput = join(testRoot, "blender-export.glb");
-    await job({
-      kind: "export",
-      variantId: blenderVariant.id,
-      destination: blenderOutput,
-      overwrite: false,
-    });
-    assert.equal(
-      (await readFile(blenderOutput)).subarray(0, 4).toString(),
-      "glTF",
-    );
-    assert.equal(
-      createHash("sha256")
-        .update(await readFile(join(blendSource, "main.blend")))
-        .digest("hex"),
-      before,
-    );
-    const created = await job({
-      kind: "create",
-      name: "Nouveau projet Blender",
-    });
-    await access(join(created.variants[0].workspacePath, "main.blend"));
-    await script("window.location.reload(); return true;");
-    await until(() =>
-      script('return document.body.innerText.includes("Robot Blender");'),
-    );
-    await clickText("Robot Blender");
-    await until(() =>
-      script('return !!document.querySelector(".workspace-panel");'),
-    );
-    await waitForModel("main.blend");
-    assert.ok(
-      await script(
-        "return !!document.querySelector('[aria-label=\"Lire l’animation\"]');",
-      ),
-    );
-    await screenshot("05-blender-viewer.png");
-    report.checks.push(
-      "Blender réel via Tauri : détection principale, collection12 triangles, aperçu/export, source inchangée et création native de projet",
-    );
-  }
+  const created = await job({ kind: "create", name: "Nouveau projet Blender" });
+  await access(join(created.variants[0].workspacePath, "main.blend"));
+  await access(join(created.variants[0].workspacePath, "main.glb"));
+  assert.equal(created.variants[0].triangles, 0);
   if (await script('return !!document.querySelector(".workspace-panel");'))
     await clickText("Retour à la bibliothèque");
-  await waitForThumbnail("Éclaireur");
-  await clickText("Éclaireur");
-  await waitForModel("model.glb");
-  await clickSelector('.config-form input[type="checkbox"]');
-  await until(
-    async () =>
-      (await invoke("get_variant", { id: main.id })).variant.config
-        .applyModifiers,
-  );
-  await until(() =>
-    script(
-      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
-    ),
-  );
-  await clickText("Retour à la bibliothèque");
   await waitForThumbnail("Éclaireur");
   const thumbnailCacheBeforeRestart = (
     await fileManifest(join(library, "cache", "thumbnails"))
@@ -1639,19 +1403,23 @@ try {
   await until(() =>
     script('return !!document.querySelector(".history-banner");'),
   );
+  await waitForModel("model.glb");
   assert.equal(
     await script('return document.querySelector(".blender-button").disabled;'),
     true,
   );
   assert.equal(
-    await script(
-      'return Array.from(document.querySelectorAll(".config-form input,.config-form select")).every(el=>el.disabled);',
-    ),
+    await script('return !document.querySelector(".config-form");'),
     true,
   );
   await screenshot("ui-history-readonly.png");
   report.checks.push(
-    "Redémarrage : réglage sauvegardé automatiquement conservé, vignette texturée persistante réutilisée sans réécriture, classement, variantes et historique conservés",
+    "Redémarrage : standard GLB conservé, vignette texturée persistante réutilisée, classement, variantes et historique conservés",
+  );
+  assert.deepEqual(
+    await fileManifest(source),
+    sourceOriginal,
+    "The imported source folder must remain unchanged throughout the desktop scenarios",
   );
   report.status = "passed";
   console.log(JSON.stringify(report, null, 2));

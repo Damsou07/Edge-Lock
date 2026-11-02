@@ -1,76 +1,67 @@
-# Architecture du MVP
+# Architecture
 
-## Composants
+## Responsabilités
 
 | Composant | Responsabilité |
 | --- | --- |
-| `src/` | Interface React/TypeScript, navigation, formulaires, suivi des tâches et lecteur Three.js. Aucun accès direct arbitraire aux fichiers. |
-| `src-tauri/` | Commandes IPC typées, dialogues natifs, réglages, lancement des tâches, watcher et diffusion contrôlée des aperçus. |
-| `crates/edge-lock-core/` | Domaine sérialisable, catalogue SQLite, versions, variantes, stockage de fichiers, inspection GLB et adaptation Blender. Indépendant de Tauri et testable sur dossiers temporaires. |
-| `blender/edge_lock.py` | Worker lancé dans un processus Blender isolé : création, analyse des dépendances et de la géométrie, export glTF. |
+| `src/` | Interface React/TypeScript, tâches, vignettes et lecteur Three.js. Aucun accès arbitraire aux fichiers. |
+| `src-tauri/` | IPC, dialogues, réglages, coordination de synchronisation, surveillance de bibliothèque et ressources contrôlées. |
+| `crates/edge-lock-core/` | Domaine, SQLite, versions, stockage, validation des projets, synchronisation canonique, inspection GLB et adaptation Blender. Indépendant de Tauri. |
+| `blender/edge_lock.py` | Worker isolé : création explicite, analyse, génération canonique et export glTF. |
 
-Le domaine ne dépend ni de React ni de Tauri. `Library` expose des opérations synchrones réutilisables ; l’adaptateur desktop les exécute dans des workers pour ne pas bloquer le thread de l’interface. Les frontières reposent sur des types explicites plutôt que sur un framework d’injection ou des abstractions génériques inutiles au MVP.
+Le cœur expose des opérations synchrones testables avec des dossiers jetables. L’adaptateur les exécute hors du thread d’interface. Les opérations longues utilisent la porte d’opération existante, sans framework supplémentaire.
 
-## Parcours d’une opération
+## Source et dérivé canonique
 
-1. Le frontend envoie une commande ou une demande de tâche avec des identifiants d’assets, variantes ou versions.
-2. L’adaptateur valide l’état de la bibliothèque et enregistre une tâche annulable. Les opérations longues sont sérialisées ; la file accepte jusqu’à 32 tâches actives/en attente.
-3. Le cœur résout les identifiants, vérifie les chemins et exécute la lecture/copie en flux. Le catalogue est verrouillé pendant les accès SQLite, sans conserver le verrou SQL pendant les gros transferts.
-4. La progression est diffusée avec phase, quantité traitée et total lorsqu’il est connu. L’UI peut aussi relire l’état de la tâche après un événement manqué.
-5. La publication du résultat arrive après vérification des données. Un échec laisse les sources et les versions précédemment publiées intactes.
+Chaque workspace conforme contient exactement un `.blend` et, après synchronisation, un GLB. La recherche est récursive et insensible à la casse ; `.blend1` reste un fichier utilisateur. Le module `sync` centralise la validation. Les variantes et archives sont indépendantes du décompte.
 
-Les états de tâche sont `queued`, `running`, `completed`, `failed` et `cancelled`. Le changement de bibliothèque est refusé pendant une tâche ; l’identité de la bibliothèque est également vérifiée avant exécution d’une tâche déjà enregistrée.
+Le travail courant impose le `.blend` unique, la scène active entière et les modificateurs actifs évalués. Les anciens champs restent désérialisables et les configurations historiques ne sont pas réécrites.
 
-La fermeture normale annule les tâches en cours et attend leur terminaison, notamment l’arrêt des processus Blender, avant de quitter. Le watcher utilise une génération de sélection pour empêcher une lecture ancienne de réinstaller la surveillance d’une autre variante.
+Le worker `generate` ouvre une copie cohérente avec les scripts désactivés, rebase les références en mémoire et applique les modificateurs à l’export. Aucun chemin d’export ou de génération ne sauvegarde le `.blend`. Seule l’opération explicite `create` écrit un nouveau fichier dans un dossier neuf.
 
-## Interfaces et modèle
+Les dépendances externes disponibles sont autorisées pour le GLB canonique ; les dépendances utilisées manquantes sont refusées. Les références secondaires inutilisées n’empêchent pas la conversion. Aucune substitution magenta n’est publiée dans le GLB canonique. L’export explicite conserve sa validation stricte des dépendances figées.
 
-Les contrats IPC utilisent `camelCase`. Un asset rassemble métadonnées et variantes ; une variante associe un dossier de travail, une configuration d’export et une tête d’historique. Une version possède un parent unique, un message, une date, la configuration et un manifeste des fichiers. Créer une variante ajoute une version dont le parent est la version d’origine ; la lecture de son historique inclut donc cette ascendance.
+Les armatures sont exportées sous forme de skins glTF. Les shape keys sans modificateur sont autorisées ; une combinaison dont l’évaluation perdrait les morphs est refusée explicitement. Les fonctionnalités propres à Blender restent soumises aux limites de glTF.
 
-`list_assets` propose recherche, filtre catégorie avec descendants, tag, jeu, archivage, tri et pagination. `list_snapshots` retourne des résumés paginés avec `total`, sans charger les manifestes complets. `get_snapshot` fournit le manifeste de la version choisie. Le détail d’une variante inclut les 100 premiers résumés ; la pagination permet d’atteindre l’ensemble de l’historique.
+## Synchronisation et publication
 
-La configuration versionnée comprend `primaryFile`, `scene`, `collection` et `applyModifiers`. Le fichier principal est relatif au dossier. Sans choix explicite, un unique `.blend` est sélectionné ; lorsqu’aucun `.blend` n’existe, un unique `.glb` est sélectionné. Plusieurs `.blend` restent ambigus même s’il existe un seul GLB. L’utilisateur choisit alors le fichier qui pilote analyse et export. Les détails de variante exposent leurs propres `workingBytes` et `triangles`, distincts des agrégats de l’asset.
+1. Le watcher surveille récursivement les workspaces de la bibliothèque active, indépendamment de la fiche.
+2. Un événement invalide immédiatement l’autorisation de versionner et repousse le traitement à 500 ms après la dernière écriture. Un seul worker parcourt les variantes en attente ; les conversions restent sérialisées.
+3. Le cœur vérifie son reçu avant de lancer Blender. Celui-ci contient l’identité du traitement/exporteur, les empreintes BLAKE3 du `.blend` et des dépendances utiles, le chemin et le hash du GLB.
+4. Si nécessaire, une capture temporaire est exportée, puis les empreintes sont revérifiées. Une source instable entraîne une seconde tentative. Les rapports et captures ne déclenchent pas de conversion si les entrées de rendu sont inchangées.
+5. Le GLB validé est conservé dans `cache/canonical/<hash>.glb`, remplacé atomiquement dans le workspace, puis certifié dans `cache/sync/`. Il ne fait jamais partie des entrées de conversion. Les événements de publication appartenant au traitement ne créent pas de boucle.
+6. Les statistiques proviennent du GLB généré, y compris courbes converties et géométrie après modificateurs. Le catalogue et les vignettes sont invalidés lorsque l’artefact change.
 
-La taille de travail est recalculée lors des captures/actualisations, et non à chaque rendu de la galerie. La taille d’historique d’un asset additionne ses objets distincts ; elle ne doit pas être additionnée entre assets pour mesurer le disque, car des objets peuvent être partagés. `LibraryInfo.physicalBytes` mesure la bibliothèque complète, caches inclus.
+Un reçu absent, corrompu ou incohérent impose une vérification et éventuellement une régénération. Une panne entre GLB et reçu reste détectable au prochain passage. Avant le premier remplacement d’un GLB non certifié, son contenu est conservé dans l’historique ou dans les sauvegardes gérées. Une sortie déjà certifiée ne produit pas une sauvegarde à chaque conversion.
 
-## Blender, GLB et cache
+L’ouverture et le retour au premier plan réconcilient la bibliothèque. Les erreurs/débordements du watcher déclenchent un réexamen ; une impossibilité d’installation active une vérification périodique. La fermeture annule Blender et attend les traitements admis. Les générations de bibliothèque empêchent les anciens watchers de publier dans une autre bibliothèque.
 
-Blender est invoqué avec un exécutable configuré, des arguments séparés, les réglages d’usine, l’auto-exécution de scripts désactivée et des dossiers utilisateur temporaires. Les requêtes et résultats transitent par JSON. Les sorties de processus sont bornées ; l’annulation et le délai maximal arrêtent le processus. L’application interactive Blender est ouverte séparément sur le fichier de travail demandé.
+## Contrats IPC et interface
 
-Analyse et export travaillent sur une matérialisation temporaire. Pour un snapshot, les objets sont vérifiés par hash lors de la copie. Pour le travail courant, une capture temporaire vérifiée ne crée ni version ni objets permanents. Une dépendance Blender absolue vers l’ancien emplacement reste une dépendance externe : elle doit être rendue relative ou incorporée par l’utilisateur, sans réécriture silencieuse du source.
+Les contrats utilisent `camelCase`. `get_workspace_status(variantId)` et `edge-lock://workspace-status` exposent le même état : `variantId`, `revision`, `state`, `sourceChanged`, `canCreateSnapshot`, `artifactKey` et `error`. Les états sont `checking`, `syncing`, `ready`, `failed` et `nonconforming`. `request_workspace_sync(variantId)` demande une vérification ou reprise.
 
-Le module `preview` du cœur résout les GLB existants avant Blender et gère les empreintes et la publication du cache. La demande IPC `preview` accepte `previewFile?`, relatif à l’asset. Une ambiguïté renvoie `preview_ambiguous` avec `details.candidates`. Le résultat conserve `url`, `inspection`, `sourceLabel` et ajoute `sourceFile` et `sourceKind` (`assetGlb` ou `generatedGlb`). Le choix d’aperçu ne modifie pas la configuration versionnée.
+La fiche s’abonne avant sa lecture initiale, ignore les révisions anciennes et recharge l’aperçu courant pour un nouvel artefact réussi. Elle garde le dernier affichage pendant le traitement et libère les ressources obsolètes. La clé d’aperçu ne dépend pas du rafraîchissement global du catalogue, évitant les boucles. Les événements courants ne déplacent pas une consultation historique.
 
-La fiche déclenche l’aperçu lorsque la sélection et sa configuration persistée sont prêtes. Sa clé de préparation ne dépend pas du rafraîchissement global du catalogue, pour éviter une boucle après la mise à jour des statistiques. Les résultats obsolètes sont ignorés et leurs jetons libérés. Les réglages sont sauvegardés via la commande existante `update_config` : listes et cases au changement, champs texte au blur ou avec Entrée. Une écriture à la fois est admise par la fiche ; les contrôles sont désactivés pendant celle-ci et les actions dépendantes restent bloquées tant que la configuration est modifiée ou en cours de sauvegarde. Un échec conserve le brouillon et permet un nouvel essai. Après succès, la configuration canonique est relue pour la sélection encore active, puis l’aperçu est renouvelé une seule fois. Aucun snapshot ni fichier Blender n’est sauvegardé par cette opération.
+Les fichiers et changements sont renouvelés après stabilisation. Le bouton de version utilise l’autorisation backend et reste indisponible pendant vérification, conversion, erreur ou non-conformité. Les contrôles de source/export et de GLB courant ont disparu. Un GLB vide valide affiche un état calme. Les erreurs gardent l’accès au dossier et à Blender et proposent une reprise.
 
-Les écritures de configuration soumises participent au cycle d’activité natif : la fermeture attend leur terminaison et aucune nouvelle écriture n’est admise pendant la fermeture. Une écriture vérifie que sa bibliothèque est toujours active après acquisition de la porte d’opération. Les réponses tardives d’une ancienne fiche ne réinstallent pas son état ni son watcher. Le contrat IPC et le stockage versionné sont inchangés.
+La galerie lit les dernières PNG via `get_asset_thumbnails`, puis prépare les seules cartes visibles avec un job `thumbnail` à la fois. La première variante représente l’asset ; sa vignette et son aperçu utilisent le même GLB canonique.
 
-Le choix GLB explicite d’un aperçu courant est mémorisé en meilleur effort dans un sidecar `choice-<hash(variantId)>.json` du cache, associé à la configuration exacte. Il est ignoré si le candidat disparaît, si la configuration change ou si le sidecar est invalide. Une demande historique ne consulte ni ne modifie cette préférence. Cela permet à une sélection faite dans la fiche de résoudre aussi sa vignette, sans migration ni changement de configuration versionnée.
+## Versions et compatibilité
 
-La galerie lit les dernières PNG via `get_asset_thumbnails(assetIds)`, sans parcourir les sources ni modifier le watcher. Un coordinateur React prépare ensuite les seules cartes visibles, avec un job `thumbnail { assetId }` à la fois. Le cœur choisit la première variante selon l’ordre existant et réutilise `prepare_preview`. Le résultat `ready` fournit une image validée ; `render` fournit le GLB à rasteriser une fois en PNG 512 × 384. Le module Three.js commun conserve matériaux, textures, UV et transparences et emploie un environnement PBR généré localement. Aucun canvas permanent n’est monté dans une carte.
+L’import copie et valide le dossier dans un staging, génère le GLB, puis publie workspace et première version. L’original reste intact. Nouveau projet et création de variante depuis un historique conforme suivent la même préparation.
 
-`store_thumbnail(previewToken, pngBytes)` déduit la destination depuis le jeton GLB délivré par le serveur, vérifie et décode le PNG borné, puis publie l’image et son index atomiquement dans le cache. L’index associe variante, clé d’artefact et version du rendu. `invalidate_thumbnail(resourceToken)` répare une image indécodable et `release_preview_resources(tokens)` termine sa détention. Les ressources GLB/PNG sont typées, bornées et servies par des jetons opaques ; le changement de bibliothèque les révoque. Les PNG participent au budget commun de 2 Gio. Aucune migration SQLite n’est nécessaire.
+Le prédicat commun des changements compare les fichiers et dossiers utilisateur en excluant uniquement les fichiers `.glb`. Les anciennes options d’export ne créent pas de changement artificiel. Le GLB reste inclus dans les manifestes et comptes d’octets.
 
-La CSP autorise le protocole local `edge-preview` dans les images et connexions ainsi que `blob:` et `data:` dans les connexions. Ces permissions sont nécessaires : `GLTFLoader` crée des URL blob pour les images embarquées dans les buffers et `ImageBitmapLoader` charge avec `fetch` ces URL ou les images incorporées sous forme de data URI. Les ressources restent contrôlées par le chargeur. Autoriser uniquement `img-src blob: data:` laisse le modèle visible mais ses textures absentes dans WebView2. Aucun hôte distant n’est ajouté.
+La création backend synchronise puis capture le workspace. Les sources et le GLB capturés doivent correspondre au reçu : une sauvegarde externe entre conversion et capture entraîne un nouvel essai puis un refus si le projet reste instable. La porte d’opération protège contre les opérations Edge Lock concurrentes ; les empreintes protègent contre Blender.
 
-L’option `runJob(request, { signal })` transmet l’annulation même lorsque l’identifiant arrive tardivement et attend l’état terminal du worker. Une opération utilisateur suspend la file de galerie et attend ce nettoyage avant de démarrer. Les erreurs et attentes des vignettes restent locales aux cartes. Le retour dans la galerie revalide les cartes visibles, y compris après des modifications externes sans changement de métadonnées du catalogue.
+Les anciens assets non conformes ne sont ni supprimés ni réorganisés. Les historiques restent lisibles ; synchronisation et nouvelles versions sont bloquées avec diagnostic. Les aperçus historiques utilisent les données immuables ; les nouvelles générations GLB appliquent toujours les modificateurs. Le schéma SQLite reste inchangé, les reçus étant régénérables.
 
-La recherche de cache précède la copie et tout lancement de Blender. Pour un GLB existant, seule son empreinte est suivie. Pour une conversion, les entrées sont le `.blend`, les options, le worker, l’identité de l’exécutable Blender et les dépendances utiles au rendu. Le contenu est haché en flux avec BLAKE3 ; l’absence et les membres des motifs UDIM/séquences font partie des empreintes. Les fichiers internes historiques utilisent les hashes du manifeste. Un cache valide peut être réutilisé même si Blender est devenu indisponible. Les modifications documentaires ne provoquent pas de conversion.
+## Ressources et rendu
 
-Sur défaut de cache, Blender utilise une copie cohérente ; les références externes relatives sont résolues depuis l’emplacement logique de leur `.blend` propriétaire et rebasées en mémoire. Les bibliothèques imbriquées sont rechargées avant l’analyse. Les sources pertinentes sont contrôlées avant/après conversion ; une instabilité entraîne une seconde tentative. Une capture froide peut encore occuper environ deux copies supplémentaires du dossier.
+GLB et PNG sont servis par des jetons opaques du protocole local `edge-preview`. Le registre vérifie la bibliothèque active, borne les ressources et révoque les jetons au changement de bibliothèque. Le lecteur libère textures, buffers et animations lors d’un remplacement.
 
-L’opération Blender `preview` autorise les dépendances non autonomes, conserve les scripts désactivés et peut substituer en mémoire une texture manquante. `inspectPreview` découvre les dépendances sans compter la géométrie. Les dépendances exposent `kind`, `renderRelevant` et `sourcePath`, en plus de `path` et `status`. Le graphe des utilisateurs sélectionnés distingue les ressources utiles des références secondaires. Les alertes pertinentes sont présentées séparément dans « Dépendances ». L’export explicite conserve sa vérification stricte.
+Les PNG 512 × 384 sont associés à la variante, à l’artefact et à la version du rendu. `store_thumbnail` les valide avant publication atomique. Leur production utilise un contexte WebGL temporaire libéré après capture. Le rendu commun conserve matériaux, textures, UV et transparences et emploie un environnement PBR local. La CSP autorise les ressources locales, blob et data nécessaires aux textures.
 
-Les caches `previews` et `exports` sont séparés ; leurs GLB partagent un budget de 2 Gio et les entrées actives sont protégées. La publication GLB/JSON est atomique ; les répertoires temporaires d’aperçu marqués sont nettoyés au démarrage et avant une nouvelle préparation. La porte d’opération existante évite les conversions simultanées ; une demande suivante réutilise le résultat. Les fichiers dérivés ne participent pas à l’historique. Le frontend accède à un aperçu via un jeton opaque du protocole `edge-preview`, jamais par un chemin arbitraire.
+Aperçus historiques, exports, GLB canoniques et vignettes partagent le budget de 2 Gio ; les ressources actives sont protégées. Les reçus ne certifient un artefact que si ses empreintes correspondent. Les anciennes préférences de GLB courant ne pilotent plus la synchronisation.
 
-L’inspecteur GLB vérifie structure binaire, plages de données, références de scène et ressources autonomes avant affichage. Le lecteur limite la taille du GLB et les budgets de géométrie/textures. Le lecteur libère textures, buffers et animations lorsqu’un aperçu est remplacé.
-
-La géométrie Blender est évaluée dans la scène choisie, instances comprises, avec `len(mesh.edges)` pour les arêtes. Le GLB fournit les comptes de la scène exportée ; ses arêtes sont des paires non orientées de sommets, dédupliquées par maillage/accessor POSITION. Les indices sparse et modes points/lignes/triangles sont pris en charge. Le travail de comptage est borné à 64 Mio ; `edges` est nullable et les anciens JSON restent lisibles. Les validations structurelles ne recomptent pas les arêtes.
-
-L’interface conserve l’analyse source séparément de l’inspection d’aperçu. Un GLB voisin ne remplace ni ses options scène/collection ni ses métriques mémorisées. La carte d’asset utilise la première variante disposant d’un compte de triangles ; ce n’est pas une somme de variantes. Après des modifications externes, relancer l’analyse pour obtenir un compte à jour. Les paramètres d’export ou une nouvelle version invalident le compte mémorisé.
-
-## Choix de périmètre
-
-Le stockage par fichiers complets évite la complexité d’un format de deltas binaires. SQLite reste un catalogue de métadonnées, pas un conteneur de gros blobs. Les dossiers indépendants évitent un checkout qui pourrait remplacer un fichier ouvert dans Blender. Aucune fusion, synchronisation cloud, suppression d’historique, collaboration simultanée ni découpe de blocs n’est incluse.
-
-Les mesures initiales, les commandes de validation et les limites encore non validées sont consignées dans [validation.md](validation.md).
+L’inspecteur GLB vérifie structure, plages, scène et autonomie des ressources. Les budgets de lecture 3D ne bloquent pas le versionnage d’un GLB canonique valide. Le comptage des arêtes reste borné et peut être indisponible. Les shaders procéduraux, simulations et dépendances externes non capturées restent des limites documentées.

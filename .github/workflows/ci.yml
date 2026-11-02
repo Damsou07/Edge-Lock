@@ -53,6 +53,21 @@ jobs:
       - name: Install frontend dependencies from the lockfile
         run: npm ci
 
+      - name: Install the pinned Blender worker
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taskBlenderVersion = '5.1.1'
+          $taskBlenderArchive = Join-Path $env:RUNNER_TEMP 'edge-lock-blender.zip'
+          $taskBlenderRoot = Join-Path $env:GITHUB_WORKSPACE '.tools\blender'
+          Invoke-WebRequest -Uri "https://download.blender.org/release/Blender5.1/blender-$taskBlenderVersion-windows-x64.zip" -OutFile $taskBlenderArchive -MaximumRetryCount 3
+          Expand-Archive -LiteralPath $taskBlenderArchive -DestinationPath $taskBlenderRoot -Force
+          $taskBlenderExe = Get-ChildItem -LiteralPath $taskBlenderRoot -Filter 'blender.exe' -Recurse -File | Select-Object -First 1
+          if (-not $taskBlenderExe) { throw 'Blender executable missing from the official archive.' }
+          $taskBlenderReported = & $taskBlenderExe.FullName --version
+          if ($LASTEXITCODE -ne 0 -or $taskBlenderReported[0] -ne "Blender $taskBlenderVersion") { throw 'Unexpected Blender version.' }
+          "EDGE_LOCK_E2E_BLENDER=$($taskBlenderExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EDGE_LOCK_TEST_BLENDER=$($taskBlenderExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Check frontend formatting
         run: npm run format:check
 
@@ -65,6 +80,9 @@ jobs:
       - name: Test frontend behavior
         run: npm test
 
+      - name: Verify disposable Blender desktop fixtures
+        run: node --test scripts/e2e-fixtures.test.mjs
+
       - name: Build frontend assets
         run: npm run build
 
@@ -76,6 +94,9 @@ jobs:
 
       - name: Test Rust storage and application contracts
         run: cargo test --workspace --locked
+
+      - name: Test real Blender export and source preservation
+        run: cargo test -p edge-lock-core --test blender_integration --test preview --test sync --locked -- --ignored --test-threads=2
 
       - name: Build the real desktop test application
         # The Tauri build embeds dist in the debug binary. Plain cargo build

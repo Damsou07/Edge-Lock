@@ -5,6 +5,7 @@ import {
   createPreviewRenderer,
   createPreviewStage,
   disposePreviewRenderer,
+  framePreviewModel,
   loadPreviewModel,
   releaseModel,
 } from "./viewer-runtime";
@@ -25,6 +26,7 @@ let png: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(framePreviewModel).mockReset();
   disposeStage = vi.fn();
   render = vi.fn();
   setSize = vi.fn();
@@ -60,6 +62,32 @@ describe("capture statique de bibliothèque", () => {
     expect(disposeStage).toHaveBeenCalledTimes(1);
     expect(releaseModel).toHaveBeenCalledTimes(1);
     expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+  });
+
+  it("capture une scène vide sans tenter de cadrer une géométrie absente", async () => {
+    vi.mocked(framePreviewModel).mockImplementation(() => {
+      throw new Error("Cette scène ne contient aucune géométrie visible.");
+    });
+    expect(await renderThumbnail("preview://empty")).toEqual([137, 80, 78, 71]);
+    expect(framePreviewModel).not.toHaveBeenCalled();
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(releaseModel).toHaveBeenCalledTimes(1);
+    expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+  });
+
+  it("cadre les modèles contenant de la géométrie avant de capturer", async () => {
+    const scene = new THREE.Group();
+    scene.add(
+      new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()),
+    );
+    vi.mocked(loadPreviewModel).mockResolvedValue({ scene } as Awaited<
+      ReturnType<typeof loadPreviewModel>
+    >);
+    await renderThumbnail("preview://box");
+    expect(framePreviewModel).toHaveBeenCalledWith(
+      scene,
+      expect.any(THREE.PerspectiveCamera),
+    );
   });
 
   it("n’alloue pas de contexte pour une requête déjà annulée", async () => {

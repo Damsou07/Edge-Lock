@@ -13,14 +13,13 @@ import type {
   AppError,
   AssetDetail,
   ChangeSet,
-  ExportConfig,
-  Inspection,
   PreviewResult,
   Snapshot,
   Taxonomy,
   VariantDetail,
 } from "../contracts";
 import { defaultExportConfig } from "../contracts";
+import { useWorkspaceStatus } from "../lib/useWorkspaceStatus";
 import {
   errorMessage,
   extension,
@@ -35,15 +34,6 @@ import { Modal } from "./Modal";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
-function sameConfig(left: ExportConfig, right: ExportConfig) {
-  return (
-    left.primaryFile === right.primaryFile &&
-    left.scene === right.scene &&
-    left.collection === right.collection &&
-    left.applyModifiers === right.applyModifiers
-  );
-}
-
 function releasePreview(url: string) {
   const token = new URL(url).pathname.slice(1);
   void api.releasePreviewResources([token]).catch(() => {
@@ -57,18 +47,21 @@ function VersionModal({
   variantId,
   runJob,
   onClose,
+  allowed = true,
 }: {
   mode: "snapshot" | "variant";
   snapshotId: string;
   variantId: string;
   runJob: RunJob;
   onClose: () => void;
+  allowed?: boolean;
 }) {
   const [value, setValue] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (!allowed) return;
     setBusy(true);
     setError("");
     try {
@@ -125,7 +118,10 @@ function VersionModal({
           <button type="button" className="button secondary" onClick={onClose}>
             {busy ? "Fermer" : "Annuler"}
           </button>
-          <button className="button primary" disabled={busy || !value.trim()}>
+          <button
+            className="button primary"
+            disabled={busy || !value.trim() || !allowed}
+          >
             <Icon
               name={busy ? "refresh" : mode === "snapshot" ? "save" : "branch"}
               className={busy ? "spinning" : ""}
@@ -170,18 +166,13 @@ export function AssetDetailView({
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [changes, setChanges] = useState<ChangeSet | null>(null);
-  const [inspection, setInspection] = useState<Inspection | null>(null);
+  const [comparedKey, setComparedKey] = useState("");
+  const [changesBusy, setChangesBusy] = useState(false);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [previewCandidates, setPreviewCandidates] = useState<string[]>([]);
   const [previewFile, setPreviewFile] = useState("");
-  const [inspectionBusy, setInspectionBusy] = useState(false);
-  const [changesBusy, setChangesBusy] = useState(false);
-  const [externalChanged, setExternalChanged] = useState(false);
-  const [config, setConfig] = useState<ExportConfig>(defaultExportConfig);
-  const [configBusy, setConfigBusy] = useState(false);
-  const [configError, setConfigError] = useState("");
   const [localRefresh, setLocalRefresh] = useState(0);
   const [tab, setTab] = useState<"files" | "history" | "changes">("files");
   const [fileLimit, setFileLimit] = useState(100);
@@ -191,34 +182,34 @@ export function AssetDetailView({
   const [copyDone, setCopyDone] = useState(false);
   const [replacePath, setReplacePath] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
-  const selection = `${id}:${variantId}:${snapshotId ?? "current"}`;
+  const selection = [id, variantId, snapshotId ?? "current"].join(":");
   const currentSelection = useRef(selection);
   currentSelection.current = selection;
-  const configEdited = useRef(false);
-  const configVariant = useRef("");
   const alive = useRef(true);
   const previewRequest = useRef(0);
+  const changesRequest = useRef(0);
   const autoPreviewAttempt = useRef("");
-  const configSaving = useRef(false);
-  const configRevision = useRef(0);
-  const editConfig = (
-    update: (previous: ExportConfig) => ExportConfig,
-    persist = false,
-  ) => {
-    if (configSaving.current) return;
-    const next = update(config);
-    configEdited.current =
-      !variantDetail || !sameConfig(next, variantDetail.variant.config);
-    setConfig(next);
-    setConfigError("");
-    if (persist) void saveConfig(next);
-  };
+  const workspace = useWorkspaceStatus(variantId);
+  const currentWorkspaceStatus = workspace.current;
+  const status = workspace.status;
+  const settledRevision = workspace.settledRevision;
+  const comparisonKey = [
+    variantId,
+    generation,
+    localRefresh,
+    settledRevision,
+  ].join(":");
+  const syncBusy =
+    (!status && !workspace.error) ||
+    status?.state === "checking" ||
+    status?.state === "syncing";
 
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
       previewRequest.current += 1;
+      changesRequest.current += 1;
     };
   }, []);
   useEffect(() => {
@@ -227,7 +218,6 @@ export function AssetDetailView({
       if (url) releasePreview(url);
     };
   }, [preview?.url]);
-
   useEffect(() => {
     let active = true;
     void api
@@ -252,30 +242,18 @@ export function AssetDetailView({
   useEffect(() => {
     if (!variantId) return;
     let active = true;
-    const revision = configRevision.current;
-    const isCurrent = () => active && configRevision.current === revision;
     void api
       .getVariant(variantId)
       .then((value) => {
-        if (isCurrent()) {
-          setVariantDetail(value);
-          if (
-            !configEdited.current ||
-            configVariant.current !== value.variant.id
-          ) {
-            setConfig(value.variant.config);
-            configEdited.current = false;
-            configVariant.current = value.variant.id;
-          }
-        }
+        if (active) setVariantDetail(value);
       })
       .catch((reason) => {
-        if (isCurrent()) onError(errorMessage(reason));
+        if (active) onError(errorMessage(reason));
       });
     return () => {
       active = false;
     };
-  }, [variantId, generation, localRefresh, onError]);
+  }, [variantId, generation, localRefresh, settledRevision, onError]);
   useEffect(() => {
     if (!variantId) return;
     let active = true;
@@ -318,57 +296,44 @@ export function AssetDetailView({
     previewRequest.current += 1;
     autoPreviewAttempt.current = "";
     setPreview(null);
-    setInspection(null);
     setPreviewBusy(false);
     setPreviewError("");
     setPreviewCandidates([]);
     setPreviewFile("");
-    setInspectionBusy(false);
-    setConfigError("");
     setFileLimit(100);
   }, [selection]);
   useEffect(() => {
     if (!variantId) return;
     let active = true;
-    const revision = configRevision.current;
-    const isCurrent = () => active && configRevision.current === revision;
+    const request = ++changesRequest.current;
     setChangesBusy(true);
     setChanges(null);
-    setExternalChanged(false);
     void runJob<ChangeSet>({ kind: "changes", variantId })
       .then((value) => {
-        if (isCurrent()) setChanges(value);
+        if (active && changesRequest.current === request) {
+          setChanges(value);
+          setComparedKey(comparisonKey);
+        }
       })
       .catch((reason) => {
-        if (isCurrent()) onError(errorMessage(reason));
+        if (active && changesRequest.current === request)
+          onError(errorMessage(reason));
       })
       .finally(() => {
-        if (isCurrent()) setChangesBusy(false);
+        if (active && changesRequest.current === request) setChangesBusy(false);
       });
     return () => {
       active = false;
     };
-  }, [variantId, generation, localRefresh, runJob, onError]);
-  useEffect(() => {
-    let active = true;
-    let unsubscribe: (() => void) | undefined;
-    void api
-      .onWorkspaceChanged((changedId) => {
-        if (active && changedId === variantId) setExternalChanged(true);
-      })
-      .then((fn) => {
-        if (active) unsubscribe = fn;
-        else fn();
-      })
-      .catch(() => {
-        /* Manual refresh is always available. */
-      });
-    return () => {
-      active = false;
-      unsubscribe?.();
-    };
-  }, [variantId]);
-
+  }, [
+    variantId,
+    generation,
+    localRefresh,
+    settledRevision,
+    comparisonKey,
+    runJob,
+    onError,
+  ]);
   const selectedSnapshot =
     snapshotDetail?.id === snapshotId
       ? snapshotDetail
@@ -380,133 +345,72 @@ export function AssetDetailView({
         : (variantDetail?.files ?? []),
     [snapshotId, selectedSnapshot?.entries, variantDetail?.files],
   );
-  const activeConfig = selectedSnapshot?.config ?? config;
-  const configurationDirty =
-    !snapshotId &&
-    !!variantDetail &&
-    !sameConfig(config, variantDetail.variant.config);
-  const configurationPending = configurationDirty || configBusy;
+  const activeConfig =
+    selectedSnapshot?.config ??
+    variantDetail?.variant.config ??
+    defaultExportConfig;
   const pendingCount = changes
     ? changes.added.length +
       changes.modified.length +
       changes.deleted.length +
       Number(changes.configChanged)
     : null;
-  const dirty = externalChanged || (pendingCount ?? 0) > 0;
-  const fileCandidates =
-    variantDetail?.files.filter(
-      (file) => file.kind === "file" && /\.(blend|glb)$/i.test(file.path),
-    ) ?? [];
-  const showFailure = (reason: unknown) => onError(errorMessage(reason));
-  const sourceInspection =
-    inspection ??
-    (preview?.sourceKind === "generatedGlb" ? preview.inspection : null);
-  const displayInspection = sourceInspection ?? preview?.inspection;
-  const warnings = [
-    ...new Set([
-      ...(inspection?.warnings ?? []),
-      ...(preview?.inspection.warnings ?? []),
-    ]),
-  ];
-  const dependencies = [
-    ...new Map(
-      [
-        ...(inspection?.dependencies ?? []),
-        ...(preview?.inspection.dependencies ?? []),
-      ]
-        .filter(
-          (dependency) =>
-            dependency.renderRelevant !== false &&
-            !["internal", "packed", "embedded", "ok"].includes(
-              dependency.status,
-            ),
-        )
-        .map((dependency) => [dependency.path, dependency]),
-    ).values(),
-  ];
-  const previewDegraded = preview?.inspection.dependencies.some(
+  const dirty = status?.sourceChanged ?? false;
+  const canCreateSnapshot =
+    !!variantDetail &&
+    !snapshotId &&
+    !changesBusy &&
+    comparedKey === comparisonKey &&
+    pendingCount != null &&
+    pendingCount > 0 &&
+    !workspace.error &&
+    status?.state === "ready" &&
+    status.canCreateSnapshot;
+  const displayInspection = preview?.inspection;
+  const warnings = preview?.inspection.warnings ?? [];
+  const dependencies = (preview?.inspection.dependencies ?? []).filter(
     (dependency) =>
-      dependency.renderRelevant !== false && dependency.status === "missing",
+      dependency.renderRelevant !== false &&
+      !["internal", "packed", "embedded", "ok"].includes(dependency.status),
   );
-
-  const inspect = async () => {
-    const target = selection;
-    const revision = configRevision.current;
-    const isCurrent = () =>
-      alive.current &&
-      currentSelection.current === target &&
-      configRevision.current === revision;
-    setInspectionBusy(true);
-    try {
-      const result = await runJob<Inspection>({
-        kind: "inspect",
-        variantId,
-        snapshotId,
-      });
-      if (isCurrent()) setInspection(result);
-    } catch (reason) {
-      if (isCurrent()) showFailure(reason);
-    } finally {
-      if (isCurrent()) setInspectionBusy(false);
-    }
-  };
-  const loadPreviewFiles = useCallback(
-    async (target: string) => {
-      if (snapshotId) return files;
-      const revision = configRevision.current;
-      const updated = await api.getVariant(variantId);
-      if (
-        !alive.current ||
-        currentSelection.current !== target ||
-        configRevision.current !== revision
-      )
-        return null;
-      setVariantDetail(updated);
-      return updated.files;
-    },
-    [snapshotId, files, variantId],
+  const previewDegraded = dependencies.some(
+    (dependency) => dependency.status === "missing",
   );
+  const syncError = workspace.error || status?.error?.message || "";
+  const showFailure = (reason: unknown) => onError(errorMessage(reason));
   const generatePreview = useCallback(
-    async (selectedFile = previewFile) => {
+    async (selectedFile = "") => {
       const target = selection;
+      const artifact = snapshotId
+        ? null
+        : currentWorkspaceStatus.current?.artifactKey;
       const request = ++previewRequest.current;
       const isCurrent = () =>
         alive.current &&
         currentSelection.current === target &&
-        previewRequest.current === request;
+        previewRequest.current === request &&
+        (snapshotId ||
+          currentWorkspaceStatus.current?.artifactKey === artifact);
       setPreviewBusy(true);
       setPreviewError("");
       setPreviewFile(selectedFile);
       try {
-        if (selectedFile && !snapshotId) {
-          const currentFiles = await loadPreviewFiles(target);
-          if (!currentFiles || !isCurrent()) return;
-          if (
-            !currentFiles.some(
-              (file) => file.kind === "file" && file.path === selectedFile,
-            )
-          ) {
-            selectedFile = "";
-            setPreviewFile("");
-          }
-        }
         const result = await runJob<PreviewResult>({
           kind: "preview",
           variantId,
           snapshotId,
-          ...(selectedFile ? { previewFile: selectedFile } : {}),
+          ...(snapshotId && selectedFile ? { previewFile: selectedFile } : {}),
         });
         if (isCurrent()) {
           setPreview(result);
-          if (result.sourceKind === "generatedGlb") setInspection(null);
           setPreviewCandidates([]);
-          setExternalChanged(false);
         } else releasePreview(result.url);
       } catch (reason) {
         if (!isCurrent()) return;
         const error = reason as AppError | null;
         const candidates = error?.details?.candidates;
         if (
+          snapshotId &&
           error?.code === "preview_ambiguous" &&
           Array.isArray(candidates) &&
           candidates.length > 0 &&
@@ -514,132 +418,36 @@ export function AssetDetailView({
         ) {
           setPreviewCandidates(candidates);
           setPreviewFile("");
-        } else {
-          if (error?.code === "invalid" && selectedFile && !snapshotId)
-            setPreviewFile("");
-          setPreviewError(errorMessage(reason));
-        }
+        } else setPreviewError(errorMessage(reason));
       } finally {
-        if (isCurrent()) setPreviewBusy(false);
+        if (
+          alive.current &&
+          currentSelection.current === target &&
+          previewRequest.current === request
+        )
+          setPreviewBusy(false);
       }
     },
-    [selection, variantId, snapshotId, previewFile, loadPreviewFiles, runJob],
+    [selection, snapshotId, variantId, runJob, currentWorkspaceStatus],
   );
-  const persistedConfig = snapshotId
-    ? snapshotDetail?.id === snapshotId
-      ? snapshotDetail.config
-      : null
-    : variantDetail?.variant.id === variantId &&
-        variantDetail.variant.assetId === id
-      ? variantDetail.variant.config
-      : null;
-  const autoPreviewKey = persistedConfig
-    ? JSON.stringify([selection, persistedConfig])
-    : "";
+  const autoPreviewKey = snapshotId
+    ? selection
+    : status?.state === "ready" && status.artifactKey
+      ? [selection, status.artifactKey].join(":")
+      : "";
   useEffect(() => {
     if (
+      !variantDetail ||
       !autoPreviewKey ||
-      configurationDirty ||
-      configBusy ||
       autoPreviewAttempt.current === autoPreviewKey
     )
       return;
     autoPreviewAttempt.current = autoPreviewKey;
-    void generatePreview("");
-  }, [autoPreviewKey, configurationDirty, configBusy, generatePreview]);
-  const changePreviewFile = async () => {
-    const target = selection;
-    const revision = configRevision.current;
-    const isCurrent = () =>
-      alive.current &&
-      currentSelection.current === target &&
-      configRevision.current === revision;
-    setPreviewBusy(true);
-    setPreviewError("");
-    try {
-      const currentFiles = await loadPreviewFiles(target);
-      if (!currentFiles) return;
-      const candidates = currentFiles
-        .filter((file) => file.kind === "file" && /\.glb$/i.test(file.path))
-        .map((file) => file.path);
-      setPreviewFile("");
-      setPreviewCandidates(candidates);
-      if (candidates.length === 0) await generatePreview("");
-    } catch (reason) {
-      if (isCurrent()) setPreviewError(errorMessage(reason));
-    } finally {
-      if (isCurrent()) setPreviewBusy(false);
-    }
-  };
+    void generatePreview();
+  }, [variantDetail, autoPreviewKey, generatePreview]);
   const refreshChanges = async () => {
-    const targetId = variantId;
-    const revision = configRevision.current;
-    const isCurrent = () =>
-      alive.current &&
-      currentSelection.current.startsWith(`${id}:${targetId}:`) &&
-      configRevision.current === revision;
-    setChangesBusy(true);
-    try {
-      const result = await runJob<ChangeSet>({ kind: "changes", variantId });
-      if (!isCurrent()) return;
-      const updated = await api.getVariant(targetId);
-      if (isCurrent()) {
-        setChanges(result);
-        setVariantDetail(updated);
-        setExternalChanged(false);
-      }
-    } catch (reason) {
-      if (isCurrent()) showFailure(reason);
-    } finally {
-      if (isCurrent()) setChangesBusy(false);
-    }
-  };
-  const saveConfig = async (next: ExportConfig = config) => {
-    if (
-      snapshotId ||
-      configSaving.current ||
-      variantDetail?.variant.id !== variantId ||
-      variantDetail.variant.assetId !== id ||
-      sameConfig(next, variantDetail.variant.config)
-    )
-      return;
-    const target = selection;
-    const targetVariant = variantId;
-    const isCurrent = () =>
-      alive.current && currentSelection.current === target;
-    configSaving.current = true;
-    configRevision.current += 1;
-    previewRequest.current += 1;
-    setConfigBusy(true);
-    setConfigError("");
-    setPreview(null);
-    setPreviewBusy(false);
-    setInspection(null);
-    setInspectionBusy(false);
-    setChangesBusy(false);
-    setPreviewError("");
-    setPreviewCandidates([]);
-    setPreviewFile("");
-    try {
-      await api.updateConfig(targetVariant, next);
-      if (!isCurrent()) return;
-      const updated = await api.getVariant(targetVariant);
-      if (!isCurrent()) return;
-      configRevision.current += 1;
-      configEdited.current = false;
-      configVariant.current = targetVariant;
-      setConfig(updated.variant.config);
-      setVariantDetail(updated);
-      autoPreviewAttempt.current = "";
-      setLocalRefresh((value) => value + 1);
-      onChanged();
-    } catch (reason) {
-      if (isCurrent()) setConfigError(errorMessage(reason));
-      else onError(errorMessage(reason));
-    } finally {
-      configSaving.current = false;
-      if (alive.current) setConfigBusy(false);
-    }
+    setLocalRefresh((value) => value + 1);
+    if (!snapshotId) await workspace.retry();
   };
   const exportTo = async (destination: string, overwrite: boolean) => {
     setExportBusy(true);
@@ -759,7 +567,11 @@ export function AssetDetailView({
           </button>
           <button
             className="button primary"
-            disabled={!variant || exportBusy || configurationPending}
+            disabled={
+              !variant ||
+              exportBusy ||
+              (!snapshotId && status?.state !== "ready")
+            }
             onClick={() => void exportGlb()}
           >
             <Icon
@@ -782,7 +594,6 @@ export function AssetDetailView({
               setSnapshotId(null);
               setVariantDetail(null);
               setSnapshots([]);
-              configEdited.current = false;
             }}
           >
             {detail.variants.map((item) => (
@@ -805,11 +616,17 @@ export function AssetDetailView({
           <span className="live-dot" />
           {snapshotId
             ? "Version enregistrée"
-            : changesBusy
-              ? "Vérification…"
-              : dirty
-                ? "Modifications non versionnées"
-                : "À jour"}
+            : syncBusy || changesBusy
+              ? status?.state === "syncing"
+                ? "Synchronisation…"
+                : "Vérification…"
+              : status?.state === "nonconforming"
+                ? "Projet non conforme"
+                : status?.state === "failed"
+                  ? "Synchronisation interrompue"
+                  : dirty
+                    ? "Modifications non versionnées"
+                    : "À jour"}
         </span>
       </div>
       {snapshotId && (
@@ -865,10 +682,10 @@ export function AssetDetailView({
                   disabled={
                     !variant ||
                     previewBusy ||
-                    configurationPending ||
+                    (!snapshotId && status?.state !== "ready") ||
                     previewCandidates.length > 0
                   }
-                  onClick={() => void generatePreview()}
+                  onClick={() => void generatePreview(previewFile)}
                 >
                   <Icon
                     name={previewBusy ? "refresh" : "play"}
@@ -886,23 +703,16 @@ export function AssetDetailView({
             {preview && (
               <div className="preview-caption">
                 <span title={preview.sourceFile}>
-                  {externalChanged
-                    ? "Le dossier a changé : actualisez l’aperçu."
+                  {syncBusy && !snapshotId
+                    ? "Synchronisation du modèle…"
                     : `${preview.sourceLabel} · ${preview.sourceFile}`}
                 </span>
-                {preview.sourceKind === "assetGlb" && (
-                  <button
-                    className="text-button"
-                    disabled={previewBusy || configurationPending}
-                    onClick={() => void changePreviewFile()}
-                  >
-                    Changer le GLB
-                  </button>
-                )}
                 <button
                   className="text-button"
-                  disabled={previewBusy || configurationPending}
-                  onClick={() => void generatePreview()}
+                  disabled={
+                    previewBusy || (!snapshotId && status?.state !== "ready")
+                  }
+                  onClick={() => void generatePreview(previewFile)}
                 >
                   <Icon
                     name="refresh"
@@ -919,7 +729,7 @@ export function AssetDetailView({
               className="preview-source-choice"
               onSubmit={(event) => {
                 event.preventDefault();
-                void generatePreview();
+                void generatePreview(previewFile);
               }}
             >
               <label>
@@ -939,7 +749,11 @@ export function AssetDetailView({
               </label>
               <button
                 className="button secondary small-button"
-                disabled={!previewFile || previewBusy || configurationPending}
+                disabled={
+                  !previewFile ||
+                  previewBusy ||
+                  (!snapshotId && status?.state !== "ready")
+                }
               >
                 Utiliser ce GLB
               </button>
@@ -1020,22 +834,8 @@ export function AssetDetailView({
                   ? displayInspection.blenderVersion
                   : `Blender ${displayInspection.blenderVersion}`}
               </span>
-              <span
-                className="inspection-provenance"
-                title={
-                  sourceInspection
-                    ? "Dernière analyse de la source ; utilisez Analyser la source pour l’actualiser."
-                    : undefined
-                }
-              >
-                {sourceInspection
-                  ? "Analyse de la source"
-                  : "Géométrie de l’aperçu"}
-                {" · "}
-                {inspection
-                  ? (selectedSnapshot?.config.primaryFile ??
-                    variantDetail?.variant.config.primaryFile)
-                  : preview?.sourceFile}
+              <span className="inspection-provenance">
+                Géométrie du modèle exporté · {preview?.sourceFile}
               </span>
             </div>
           )}
@@ -1073,7 +873,7 @@ export function AssetDetailView({
             </button>
             <button
               className="button blender-button"
-              disabled={!variant || !!snapshotId || configurationPending}
+              disabled={!variant || !!snapshotId}
               title={
                 snapshotId
                   ? "Créez une variante pour ouvrir cette version dans Blender."
@@ -1086,205 +886,41 @@ export function AssetDetailView({
             </button>
           </div>
           <div className="panel-divider" />
-          <form
-            className="config-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void saveConfig();
-            }}
-          >
-            <div className="panel-heading">
-              <h3>Source de l’asset</h3>
-              <span className="format-badge">
-                {extension(activeConfig.primaryFile)}
-              </span>
-            </div>
-            <label>
-              Fichier principal
-              <select
-                value={activeConfig.primaryFile ?? ""}
-                disabled={!!snapshotId || configBusy || !variant}
-                onChange={(event) =>
-                  editConfig(
-                    (previous) => ({
-                      ...previous,
-                      primaryFile: event.target.value || null,
-                      scene: null,
-                      collection: null,
-                    }),
-                    true,
-                  )
-                }
-              >
-                <option value="">Détection automatique</option>
-                {fileCandidates.map((file) => (
-                  <option value={file.path} key={file.path}>
-                    {file.path}
-                  </option>
-                ))}
-                {activeConfig.primaryFile &&
-                  !fileCandidates.some(
-                    (file) => file.path === activeConfig.primaryFile,
-                  ) && (
-                    <option value={activeConfig.primaryFile}>
-                      {activeConfig.primaryFile}
-                    </option>
-                  )}
-              </select>
-            </label>
-            <div className="config-fields">
-              <label>
-                Scène
-                {sourceInspection ? (
-                  <select
-                    disabled={!!snapshotId || configBusy || !variant}
-                    value={activeConfig.scene ?? ""}
-                    onChange={(event) =>
-                      editConfig(
-                        (previous) => ({
-                          ...previous,
-                          scene: event.target.value || null,
-                          collection: null,
-                        }),
-                        true,
-                      )
-                    }
-                  >
-                    <option value="">Scène active</option>
-                    {sourceInspection.scenes.map((scene) => (
-                      <option key={scene} value={scene}>
-                        {scene}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    disabled={!!snapshotId || configBusy || !variant}
-                    value={activeConfig.scene ?? ""}
-                    placeholder="Scène active"
-                    onChange={(event) =>
-                      editConfig((previous) => ({
-                        ...previous,
-                        scene: event.target.value || null,
-                      }))
-                    }
-                    onBlur={() => void saveConfig()}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        event.currentTarget.blur();
-                      }
-                    }}
-                  />
-                )}
-              </label>
-              <label>
-                Collection
-                {sourceInspection ? (
-                  <select
-                    disabled={!!snapshotId || configBusy || !variant}
-                    value={activeConfig.collection ?? ""}
-                    onChange={(event) =>
-                      editConfig(
-                        (previous) => ({
-                          ...previous,
-                          collection: event.target.value || null,
-                        }),
-                        true,
-                      )
-                    }
-                  >
-                    <option value="">Scène entière</option>
-                    {sourceInspection.collections.map((collection) => (
-                      <option key={collection} value={collection}>
-                        {collection}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    disabled={!!snapshotId || configBusy || !variant}
-                    value={activeConfig.collection ?? ""}
-                    placeholder="Scène entière"
-                    onChange={(event) =>
-                      editConfig((previous) => ({
-                        ...previous,
-                        collection: event.target.value || null,
-                      }))
-                    }
-                    onBlur={() => void saveConfig()}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        event.currentTarget.blur();
-                      }
-                    }}
-                  />
-                )}
-              </label>
-            </div>
-            <label className="checkbox-label">
-              <input
-                disabled={!!snapshotId || configBusy || !variant}
-                type="checkbox"
-                checked={activeConfig.applyModifiers}
-                onChange={(event) =>
-                  editConfig(
-                    (previous) => ({
-                      ...previous,
-                      applyModifiers: event.target.checked,
-                    }),
-                    true,
-                  )
-                }
-              />
-              Appliquer les modificateurs à l’export
-            </label>
-            <div className="config-actions">
-              <button
-                type="button"
-                className="text-button"
-                disabled={!variant || inspectionBusy || configurationPending}
-                onClick={() => void inspect()}
-                title="Actualiser la géométrie, les scènes, les collections et les dépendances de la source enregistrée."
-              >
-                <Icon
-                  name="refresh"
-                  size={13}
-                  className={inspectionBusy ? "spinning" : ""}
-                />
-                {inspectionBusy ? "Analyse…" : "Analyser la source"}
-              </button>
-            </div>
-            {configBusy && (
-              <p className="field-help" role="status">
-                Enregistrement…
-              </p>
-            )}
-            {configError && (
-              <div className="inline-error" role="alert">
-                <p>{configError}</p>
+          {!snapshotId && syncBusy && (
+            <p className="field-help" role="status">
+              {status?.state === "syncing"
+                ? "Mise à jour du GLB et de l’aperçu…"
+                : "Vérification des fichiers…"}
+            </p>
+          )}
+          {!snapshotId && syncError && (
+            <div className="inline-error" role="alert">
+              <p>{syncError}</p>
+              {status?.state !== "nonconforming" && (
                 <button
                   type="button"
                   className="text-button"
-                  onClick={() => void saveConfig()}
+                  onClick={() => void workspace.retry()}
                 >
-                  Réessayer
+                  Réessayer la synchronisation
                 </button>
-              </div>
-            )}
-          </form>
+              )}
+            </div>
+          )}
           <div className="panel-divider" />
           <div className="version-callout">
             <Icon name="history" size={21} />
             <div>
               <strong>Gardez une trace de vos avancées.</strong>
-              <p>Enregistrez dans Blender, puis créez une version ici.</p>
+              <p>
+                Enregistrez dans Blender : le GLB et l’aperçu se mettent à jour
+                automatiquement.
+              </p>
             </div>
           </div>
           <button
             className="button primary full-width"
-            disabled={!variant || !!snapshotId || configurationPending}
+            disabled={!canCreateSnapshot}
             onClick={() => setModal("snapshot")}
           >
             <Icon name="save" />
@@ -1488,8 +1124,6 @@ export function AssetDetailView({
             <p className="changes-description">
               Comparaison du dossier de travail avec sa dernière version
               enregistrée.
-              {externalChanged &&
-                " De nouvelles modifications ont été détectées ; actualisez la liste."}
             </p>
             {changes && pendingCount === 0 ? (
               <div className="small-empty">
@@ -1556,6 +1190,7 @@ export function AssetDetailView({
           variantId={variantId}
           snapshotId={snapshotId ?? variant.headSnapshotId}
           runJob={runJob}
+          allowed={modal !== "snapshot" || canCreateSnapshot}
           onClose={() => setModal(null)}
         />
       )}

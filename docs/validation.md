@@ -1,6 +1,57 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne la refonte visuelle et la sauvegarde automatique des réglages. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas la nouvelle livraison.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne la synchronisation canonique de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette livraison.
+
+## Synchronisation canonique — 0.2.0 — 2 novembre 2026
+
+### TDD et contrôles automatisés
+
+Les régressions ont été reproduites avant correction : Mirror ignoré à l’export lorsque l’ancienne option était fausse, GLB seul autorisant une version, et cinq comportements manquants de synchronisation dans la fiche. Les tests ont ensuite été étendus aux sauvegardes concurrentes, reçus manquants/corrompus, réponses IPC anciennes et conservation des données.
+
+- **73 tests Rust ordinaires passent**, dont 21 pour l’adaptateur desktop, 12 unités du cœur, 20 de stockage et 12 de validation GLB. Le test d’arrêt brutal et les tests d’aperçus historiques passent également.
+- **12 scénarios du worker passent avec Blender 5.1.1**, sur des fixtures synthétiques : modificateurs forcés, scène active complète, textures, rigs/animation, shape keys compatibles ou refus explicite, sources inchangées, scripts désactivés, annulation et délai maximal.
+- **Le parcours Blender de synchronisation canonique passe** : import sans GLB, Mirror 24→48 triangles après sauvegarde, GLB historique immuable, snapshot cohérent, refus des versions vides/GLB seuls, sauvegarde d’un GLB non certifié et variante historique. Retirer une texture utilisée refuse la publication en conservant le dernier GLB et le hash du `.blend`.
+- **77 tests frontend passent dans onze fichiers**, notamment les états de synchronisation, réponses obsolètes, récupération d’événement perdu, refus des versions sans changement source, conservation du dernier aperçu, historique et scènes vides dans le lecteur et les vignettes.
+- Les trois tests Node des fixtures passent avec Blender réel. Le typage, le lint frontend, Prettier et le build Vite passent.
+- Les quatre intégrations Blender de cache/aperçu passent également : dépendances externes, corruption du cache, sources historiques immuables et sauvegarde pendant conversion. Avec les douze tests du worker et le parcours canonique, **17 scénarios Blender réels** ont été exécutés avec succès.
+- Clippy du workspace et de toutes ses cibles avec `-D warnings`, `cargo fmt --all --check` et la vérification du diff passent. Les 21 tests desktop ont été réexécutés après le dernier ajout du contrôle de budget des GLB canoniques.
+
+Les temporaires Rust sont dirigés vers `target/` dans l’environnement restreint : le temporaire système refuse certaines publications atomiques. Les avertissements de liens physiques du cache incrémental entraînent une copie et ne constituent pas une erreur de compilation.
+
+Commandes de validation Blender, après choix explicite d’un exécutable :
+
+```powershell
+$env:EDGE_LOCK_TEST_BLENDER = 'C:\chemin\vers\blender.exe'
+cargo test -p edge-lock-core --test blender_integration --test preview --test sync -- --include-ignored --test-threads=2
+node --test scripts/e2e-fixtures.test.mjs
+```
+
+La CI fournit désormais Blender 5.1.1 et adapte les parcours desktop aux imports `.blend` uniques. Son exécution distante et l’installation/mise à niveau en VM restent des validations distinctes des tests locaux. Aucun test ne modifie la bibliothèque personnelle ; les scénarios utilisent des dossiers et réglages jetables. Les anciennes versions, leurs configurations et les objets immuables sont conservés sans migration de schéma.
+
+### Application Windows et artefacts
+
+Le rapport `.test-data/desktop-Vw9TEL/report.json` porte **`status: passed` pour quatorze groupes de scénarios**, dont un contrôle complémentaire après le parcours complet, avec bibliothèque, réglages et profil WebView2 jetables :
+
+- Import réel d’un `.blend` seul et refus des dossiers non conformes sans modifier leurs sources.
+- Sauvegarde réelle d’un Mirror : GLB et statistiques passent automatiquement de 1 à 2 triangles sans actualisation manuelle ; le hash du `.blend` enregistré reste inchangé pendant la synchronisation. La capture `11-mirror-autosync.png` a été examinée.
+- Absence du menu source, blocage des versions vides, création de version et variante indépendante, export historique conservant la géométrie d’avant Mirror, et projet vide avec `.blend` et GLB.
+- Textures rouge/verte vérifiées par pixels dans le lecteur et les vignettes, animation, navigation 3D et interface à 1440/1024 pixels CSS.
+- Dix allers-retours : au maximum un contexte WebGL dans la fiche, zéro dans la galerie et aucune URL blob conservée. Galerie de cinquante imports `.blend`, pagination à 36 cartes, vignettes et cache persistant.
+- Redémarrage : classement, variantes, historique et vignettes conservés. Le manifeste du dossier source initial est inchangé à la fin.
+- Contrôle complémentaire : rendu historique effectivement terminé et contrôles d’édition verrouillés ; nouveau projet affichant « Votre scène est vide. », avec zéro triangle et zéro objet maillé. Les captures `history-render-ready.png` et `empty-project-ready.png` ont été examinées.
+
+Les cinquante imports synthétiques ont pris environ 232 secondes ; la médiane d’ouverture de fiche à chaud était de 935 ms sur ce passage. Ces mesures ont été recueillies pendant une construction release parallèle et ne constituent pas un benchmark contrôlé ni une garantie sur des scènes complexes. Le scénario optionnel du Sniper Kitsune personnel n’a pas été exécuté, aucun chemin de fixture personnelle n’ayant été fourni.
+
+Le premier lancement WebDriver a été refusé par les restrictions localhost du sandbox ; le parcours isolé a réussi avec l’accès approprié. Le build release et l’empaquetage NSIS ont réussi après autorisation du téléchargement de l’outil officiel NSIS. Aucune installation sur le poste personnel n’a été effectuée.
+
+Les métadonnées des deux artefacts indiquent **Edge Lock, versions fichier et produit 0.2.0**. L’application est PE x64 (`0x8664`) ; le bootstrap NSIS est PE x86 (`0x014C`) embarquant l’application x64.
+
+| Artefact | Taille en octets | SHA-256 |
+| --- | --- | --- |
+| `target/release/edge-lock.exe` | 16 852 992 | `186170299D9AFF4E5C051280CF9F03501198F2926456FE53C5EF8857D1C47910` |
+| `target/release/bundle/nsis/Edge Lock_0.2.0_x64-setup.exe` | 6 402 241 | `EBB6C7CD372B0793E84A45F967B46D1211FCF9BB730CDC142348E088E42E884A` |
+
+**Installation et mise à niveau en VM : non exécutées**, Windows Sandbox étant indisponible. Le script de validation isolée a été mis à jour pour 0.2.0 et sa syntaxe PowerShell vérifiée ; deux anciennes chaînes contenant des apostrophes typographiques ont été corrigées. Produire et inspecter l’installateur ne valide pas son installation. La CI a été adaptée mais n’a pas été exécutée sur un service distant durant cette livraison. Les artefacts et mesures 0.1.0 ci-dessous restent historiques.
 
 ## Refonte visuelle et sauvegarde automatique — 2 novembre 2026
 
