@@ -5,10 +5,39 @@ import { mkdir, mkdtemp, readdir, readFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import {
   animatedTexturedTriangle,
+  texturedStudioScene,
   prepareBlendFixture,
   saveMirrorFixture,
   runFixtureBlender,
 } from "./e2e-fixtures.mjs";
+
+test("studio regression fixture keeps two textured volumes and its oversized blue floor", () => {
+  const glb = texturedStudioScene();
+  assert.equal(glb.readUInt32LE(8), glb.length);
+  const length = glb.readUInt32LE(12);
+  const document = JSON.parse(glb.subarray(20, 20 + length).toString());
+  assert.equal(document.nodes.length, 3);
+  assert.equal(document.animations, undefined);
+  for (const node of document.nodes.slice(0, 2)) {
+    assert.ok(node.scale.every((value) => value > 1));
+    const primitive = document.meshes[node.mesh].primitives[0];
+    assert.equal(document.accessors[primitive.attributes.TEXCOORD_0].count, 24);
+    assert.equal(
+      document.materials[primitive.material].pbrMetallicRoughness
+        .baseColorTexture.index,
+      0,
+    );
+  }
+  const floor = document.nodes[2];
+  assert.deepEqual(floor.scale, [200, 0.06, 200]);
+  assert.deepEqual(floor.translation, [0, 0.045, 0]);
+  const primitive = document.meshes[floor.mesh].primitives[0];
+  assert.deepEqual(
+    document.materials[primitive.material].pbrMetallicRoughness.baseColorFactor,
+    [0, 0, 1, 1],
+  );
+  assert.equal(document.images[0].mimeType, "image/png");
+});
 
 test("desktop fixture embeds a contrasting PNG used by its UV-mapped material", () => {
   const glb = animatedTexturedTriangle();

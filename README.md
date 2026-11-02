@@ -33,6 +33,8 @@ Les vignettes texturées sont fixes, sans rotation ni animation, et préparées 
 
 Le rendu conserve les textures, UV, transparences et matériaux pris en charge par glTF. Un environnement de studio généré localement éclaire les matériaux PBR, notamment métalliques, sans téléchargement. Les shaders procéduraux propres à Blender ne sont pas automatiquement convertis en textures : préparer des matériaux compatibles glTF reste nécessaire pour ces cas.
 
+La fiche et les vignettes cadrent uniquement la géométrie visible. Un sol de studio horizontal démesuré peut être masqué dans la copie chargée en mémoire, selon des critères géométriques conservateurs, pour rendre le sujet lisible. Le GLB, ses sources et les statistiques restent inchangés. Un sol seul et les cas ambigus reconnus sont conservés ; une grande plaque portant plusieurs accessoires peut toutefois ressembler géométriquement à un sol.
+
 Les armatures restent représentées par les skins glTF et les animations compatibles sont conservées. Les shape keys sans modificateur restent exportables ; une combinaison shape keys/modificateurs qui ferait perdre les morphs bloque la génération avec un message explicite et conserve le dernier GLB. Aucun baking personnalisé des morphs n’est effectué.
 
 Les statistiques affichent la géométrie du GLB effectivement généré : objets maillés, sommets, arêtes, faces et triangles. Elles incluent les effets des modificateurs. La triangulation et les séparations de sommets aux coutures UV peuvent différer des comptes de Blender. Un compte d’arêtes trop coûteux reste indisponible sans empêcher l’aperçu.
@@ -44,6 +46,8 @@ Les limites de conversion de matériaux, simulations et fonctionnalités propres
 Les dépendances externes disponibles peuvent alimenter le GLB automatique. Les références manquantes inutilisées, notamment certaines brosses Blender, ne bloquent pas la conversion. Une ressource utilisée manquante bloque la publication : aucune texture de remplacement n’est enregistrée dans le GLB canonique. Un échec laisse le `.blend` accessible.
 
 Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. Il suit le contenu des sources utiles, y compris textures externes et bibliothèques liées ; modifier un rapport ou une capture ne régénère pas l’aperçu. Les vignettes PNG de 512 × 384 sont liées à l’artefact GLB et à la version du rendu. Leur production utilise un seul contexte WebGL temporaire, libéré après la capture. Les temporaires d’aperçu identifiés comme appartenant à l’application sont nettoyés après interruption. Les tâches sont sérialisées et le budget commun des caches, vignettes comprises, reste de 2 Gio.
+
+La version 2 du rendu régénère automatiquement les anciennes vignettes visibles avec ce cadrage. Elle n’invalide pas le cache GLB et ne déclenche pas de réexport Blender lorsque les sources et le GLB certifié sont inchangés.
 
 Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les exports Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut donc influencer un aperçu historique.
 

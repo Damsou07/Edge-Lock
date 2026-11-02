@@ -17,7 +17,8 @@ vi.mock("three/addons/controls/OrbitControls.js", () => ({
     dispose() {}
   },
 }));
-vi.mock("./viewer-runtime", () => ({
+vi.mock("./viewer-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./viewer-runtime")>()),
   createPreviewRenderer: () => ({
     domElement: document.createElement("canvas"),
     setSize: vi.fn(),
@@ -45,28 +46,41 @@ beforeEach(() => {
   );
 });
 
-it("présente une scène vide sans erreur et libère ses ressources", async () => {
-  const scene = new THREE.Group();
-  vi.mocked(loadPreviewModel).mockResolvedValue({
-    scene,
-    scenes: [scene],
-    animations: [],
-  } as unknown as GLTF);
-  const rendered = render(
-    <ModelViewer
-      url="http://edge-preview.localhost/empty"
-      label="DOSSIER DE TRAVAIL"
-    />,
-  );
-  expect(await screen.findByText("Votre scène est vide.")).toBeInTheDocument();
-  expect(screen.queryByText("Aperçu indisponible")).not.toBeInTheDocument();
-  expect(
-    screen.getByRole("button", { name: "Recentrer le modèle" }),
-  ).toBeDisabled();
-  rendered.unmount();
-  expect(releaseModel).toHaveBeenCalledWith(scene, scene);
-  expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
-});
+it.each([false, true])(
+  "présente une scène vide ou masquée sans erreur (masquée : %s)",
+  async (hidden) => {
+    const scene = new THREE.Group();
+    if (hidden) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(),
+        new THREE.MeshBasicMaterial(),
+      );
+      mesh.visible = false;
+      scene.add(mesh);
+    }
+    vi.mocked(loadPreviewModel).mockResolvedValue({
+      scene,
+      scenes: [scene],
+      animations: [],
+    } as unknown as GLTF);
+    const rendered = render(
+      <ModelViewer
+        url="http://edge-preview.localhost/empty"
+        label="DOSSIER DE TRAVAIL"
+      />,
+    );
+    expect(
+      await screen.findByText("Votre scène est vide."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Aperçu indisponible")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Recentrer le modèle" }),
+    ).toBeDisabled();
+    rendered.unmount();
+    expect(releaseModel).toHaveBeenCalledWith(scene, scene);
+    expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+  },
+);
 
 it("affiche normalement la géométrie et recharge le modèle quand l’URL change", async () => {
   const scene = new THREE.Group();

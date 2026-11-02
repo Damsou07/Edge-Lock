@@ -1,6 +1,39 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne la synchronisation canonique de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette livraison.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne le cadrage des aperçus 3D de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette correction.
+
+## Cadrage des aperçus 3D — 0.2.0 — 2 novembre 2026
+
+Le GLB Kitsune lu sans modification contient 127 maillages : son sol de studio mesure 200 × 0,06 × 200, contre 8,59 × 2,82 × 1,67 pour le sujet. L'ancien cadrage global réduit le sujet à environ 8 pixels de large dans une vignette de 512 pixels. Le correctif masque uniquement ce type de support démesuré dans la scène décodée en mémoire et partage les bounds visibles entre fiche et vignette. Les critères et leurs limites sont décrits dans l'architecture ; le GLB, les sources et les statistiques restent conservés.
+
+### TDD et contrôles automatisés
+
+- Cinq régressions frontend ont été constatées en échec avant correction : sol restant visible, transformations parentes, objets invisibles inclus, matrices d'instances périmées et pose de skin périmée au recentrage. Le nouveau test Rust refusant l'ancien cache de rendu a également échoué avant le passage à la version 2.
+- **100 tests frontend passent dans onze fichiers**, dont les scénarios de conservation des plans, plaques, sols normaux, scènes ambiguës, animations, morphs et états vides/masqués des deux vues. Trois ratios de fenêtre, dont le portrait et la fiche large, vérifient que le modèle entier reste dans le champ avec la marge de cadrage resserrée.
+- **74 tests Rust ordinaires passent**, dont 22 de l'adaptateur desktop et les 7 tests de ressources/cache. Les 19 cas opt-in ou helpers ignorés par cette commande ne sont pas comptés comme exécutés.
+- **4 tests Node des fixtures passent avec Blender 5.1.1**, y compris la nouvelle scène de deux volumes texturés et son sol bleu démesuré.
+- Typage TypeScript, ESLint, Prettier, build Vite, Clippy du workspace et de toutes ses cibles avec `-D warnings`, et `cargo fmt --all --check` passent.
+
+Les temporaires Rust utilisent `.test-data/preview-fix-temp` : le temporaire système refuse certaines publications atomiques dans l'environnement restreint. Les avertissements de liens physiques du cache incrémental entraînent une copie et n'empêchent pas les vérifications.
+
+### Application Windows
+
+Le build Tauri debug sans bundle réussit. Le binaire de contrôle isolé `.test-data/preview-fix-bin/edge-lock.exe` porte les versions fichier et produit **0.2.0**, mesure **23 656 448 octets** et a pour SHA-256 `5D56F9329202BFDB401AA8C56A1A773683B66A073B680854D0535C7E53C38D2A`.
+
+Le scénario WebView2 synthétique vérifie dans la vignette et la fiche des textures couvrant au moins 25 % de la largeur et au plus 5 pixels bleus du sol. Les captures `12-studio-floor-library.png` et `13-studio-floor-viewer.png` ont été examinées ; le sujet est lisible et le sol absent.
+
+Le premier démarrage du pilote dans le sandbox a échoué avant ouverture de l'application (`connect EACCES` vers localhost). Le contrôle desktop utilise ensuite l'accès local nécessaire, avec un exécutable debug, une bibliothèque, des réglages et un profil WebView jetables.
+
+Le passage final `.test-data/desktop-Wa9Rnm/report.json` est **`passed`**, avec 14 contrôles consignés, dont la navigation, les textures, l'historique et la réutilisation des PNG après redémarrage. Les captures attendent la fin du chargement et de la transition d'opacité de la galerie. La largeur du sujet réel est mesurée sur ses pixels clairs et colorés dans la zone centrale, sans badge ni texte ; le seuil de 25 % reste identique.
+
+| Scène | Largeur en vignette | Largeur dans la fiche | Pixels bleus du sol |
+| --- | ---: | ---: | ---: |
+| Deux volumes texturés et grand sol | 42,8 % | 30,6 % | 0 dans les deux vues |
+| Copie de Sniper Kitsune | 36,6 % | 25,9 % | Sans objet : sol original neutre |
+
+Les captures `14-kitsune-library.png` et `15-kitsune-viewer.png` du passage final ont été examinées. Le sniper est visible avec ses textures et le sol est absent. Les hashes et dates de tous les fichiers source personnels ainsi que le contenu du workspace importé sont conservés. Les statistiques du GLB restent de 127 maillages et 79 774 triangles.
+
+Le benchmark de 50 imports a réussi dans les passages `.test-data/desktop-Hd6TJV` et `.test-data/desktop-IW7I7N`, avant leur arrêt sur les assertions de capture/cadrage Kitsune corrigées ensuite. Le passage final utilise `EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1` pour omettre uniquement ce benchmark déjà exécuté ; cette omission est explicite dans son rapport. Les dix allers-retours restent contrôlés : un contexte WebGL au maximum, zéro contexte actif dans la galerie et aucune URL blob conservée. Sans cette variable, `npm run test:desktop` inclut le benchmark de 50 imports.
 
 ## Synchronisation canonique — 0.2.0 — 2 novembre 2026
 

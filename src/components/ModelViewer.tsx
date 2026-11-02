@@ -8,6 +8,7 @@ import {
   createPreviewStage,
   disposePreviewRenderer,
   framePreviewModel,
+  getVisiblePreviewBounds,
   loadPreviewModel,
   releaseModel,
 } from "./viewer-runtime";
@@ -118,7 +119,7 @@ export default function ModelViewer({
         loadedModel = model;
         loaded = model.scene;
         scene.add(loaded);
-        if (new THREE.Box3().setFromObject(loaded).isEmpty()) {
+        if (getVisiblePreviewBounds(loaded).isEmpty()) {
           setStatus("empty");
           render();
           return;

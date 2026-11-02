@@ -519,7 +519,22 @@ async function testStrictImportRules(variant) {
   );
 }
 
-async function assertTexturePixels(selector, name) {
+async function previewPixels(selector, name) {
+  await until(() =>
+    script(
+      `
+      const element = document.querySelector(arguments[0]);
+      if (!element || element.getBoundingClientRect().width <= 0) return false;
+      const results = element.closest('.asset-results');
+      if (results?.getAttribute('aria-busy') === 'true' || results?.classList.contains('is-loading')) return false;
+      // The gallery fades while catalog results load; wait for the transition too.
+      for (let parent = element; parent; parent = parent.parentElement)
+        if (Number(getComputedStyle(parent).opacity) < 0.999) return false;
+      return true;
+    `,
+      [selector],
+    ),
+  );
   const base64 = await screenshot(name);
   const result = await request("POST", `/session/${session}/execute/async`, {
     script: `
@@ -543,15 +558,36 @@ async function assertTexturePixels(selector, name) {
           const context = canvas.getContext('2d');
           context.drawImage(image, x, y, width, height, 0, 0, width, height);
           const pixels = context.getImageData(0, 0, width, height).data;
-          let red = 0, green = 0;
+          let red = 0, green = 0, blue = 0;
+          let textureMin = width, textureMax = -1, brightMin = width, brightMax = -1;
+          let subjectMin = width, subjectMax = -1;
           for (let i = 0; i < pixels.length; i += 4) {
             const [r, g, b] = [pixels[i], pixels[i + 1], pixels[i + 2]];
-            if (r > 60 && r > g * 1.5 && r > b * 1.5) red++;
+            const isRed = r > 60 && r > g * 1.5 && r > b * 1.5;
             // ACES and studio image-based lighting brighten saturated greens.
             // White/missing textures still fail both chromatic dominance checks.
-            if (g > 60 && g > r * 1.12 && g > b * 1.25) green++;
+            const isGreen = g > 60 && g > r * 1.12 && g > b * 1.25;
+            if (isRed) red++;
+            if (isGreen) green++;
+            const px = (i / 4) % width, py = Math.floor(i / 4 / width);
+            // Exclude the viewer badge, controls and help text from framing checks.
+            if (py < height * 0.2 || py > height * 0.8) continue;
+            if (b > 60 && b > r * 1.5 && b > g * 1.5) blue++;
+            if (isRed || isGreen) {
+              textureMin = Math.min(textureMin, px); textureMax = Math.max(textureMax, px);
+            }
+            const isBright = r > 160 && g > 160 && b > 160;
+            if (isBright) {
+              brightMin = Math.min(brightMin, px); brightMax = Math.max(brightMax, px);
+            }
+            if (isRed || isGreen || isBright) {
+              subjectMin = Math.min(subjectMin, px); subjectMax = Math.max(subjectMax, px);
+            }
           }
-          done({ red, green, width, height });
+          done({ red, green, blue, width, height,
+            textureWidthRatio: Math.max(0, textureMax - textureMin + 1) / width,
+            brightWidthRatio: Math.max(0, brightMax - brightMin + 1) / width,
+            subjectWidthRatio: Math.max(0, subjectMax - subjectMin + 1) / width });
         } catch (error) { done({ error: String(error) }); }
       };
       image.src = 'data:image/png;base64,' + base64;
@@ -559,10 +595,32 @@ async function assertTexturePixels(selector, name) {
     args: [base64, selector],
   });
   assert.ok(!result.error, result.error);
+  return result;
+}
+
+async function assertTexturePixels(selector, name) {
+  const result = await previewPixels(selector, name);
   assert.ok(
     result.red > 20 && result.green > 20,
     `Embedded texture missing in ${selector}: ${JSON.stringify(result)}`,
   );
+  return result;
+}
+
+async function assertPreviewFraming(selector, name, textured = false) {
+  const result = textured
+    ? await assertTexturePixels(selector, name)
+    : await previewPixels(selector, name);
+  const ratio = textured ? result.textureWidthRatio : result.subjectWidthRatio;
+  assert.ok(
+    ratio >= 0.25,
+    `The subject must occupy at least 25% of the preview width: ${JSON.stringify(result)}`,
+  );
+  if (textured)
+    assert.ok(
+      result.blue <= 5,
+      `The blue studio floor must be hidden: ${JSON.stringify(result)}`,
+    );
   return result;
 }
 
@@ -924,6 +982,69 @@ async function testDataUriTexture() {
   }
 }
 
+async function testStudioFloor() {
+  const directory = join(testRoot, "source studio-floor");
+  await prepareBlendFixture(
+    blender,
+    directory,
+    join(testRoot, "fixture-studio-floor"),
+    { studioFloor: true },
+  );
+  const original = await fileManifest(directory);
+  const imported = await job({
+    kind: "import",
+    source: directory,
+    name: "Socle de studio — cadrage",
+    config: canonicalConfig,
+  });
+  const glb = join(imported.variants[0].workspacePath, "model.glb");
+  const originalGlb = await fileHash(glb);
+  try {
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Socle de studio");
+    const thumbnail = await assertPreviewFraming(
+      '.asset-card:has(img[alt*="Socle de studio"]) .asset-thumbnail',
+      "12-studio-floor-library.png",
+      true,
+    );
+    await clickText("Socle de studio");
+    await waitForModel("model.glb");
+    const viewer = await assertPreviewFraming(
+      ".viewer-canvas",
+      "13-studio-floor-viewer.png",
+      true,
+    );
+    report.studioFloor = {
+      thumbnail,
+      viewer,
+      sourcePreserved: true,
+      glbPreserved: true,
+    };
+    report.checks.push(
+      "Socle synthétique 200 × 0,06 × 200 masqué dans la vignette et la fiche ; deux volumes texturés couvrent au moins 25 % de la largeur ; source et GLB conservés",
+    );
+    await clickText("Retour à la bibliothèque");
+  } finally {
+    assert.deepEqual(await fileManifest(directory), original);
+    assert.equal(
+      await fileHash(glb),
+      originalGlb,
+      "Previewing must not rewrite the GLB",
+    );
+    const asset = imported.asset;
+    await invoke("update_asset", {
+      id: asset.id,
+      name: asset.name,
+      categoryId: asset.categoryId,
+      tags: asset.tags,
+      gameIds: asset.gameIds,
+      archived: true,
+    });
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Éclaireur");
+  }
+}
+
 async function fileHash(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -1024,10 +1145,26 @@ async function testKitsune() {
     });
     assert.equal(previews[0].artifactKey, previews[1].artifactKey);
     assert.ok(previews[0].inspection.geometry.triangles > 0);
+    await invoke("release_preview_resources", {
+      tokens: previews.map((preview) => preview.resourceToken),
+    });
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Sniper Kitsune");
+    report.kitsune.thumbnail = await assertPreviewFraming(
+      '.asset-card:has(img[alt*="Sniper Kitsune"]) .asset-thumbnail',
+      "14-kitsune-library.png",
+    );
+    await clickText("Sniper Kitsune");
+    await waitForModel(previews[0].sourceFile);
+    report.kitsune.viewer = await assertPreviewFraming(
+      ".viewer-canvas",
+      "15-kitsune-viewer.png",
+    );
+    await clickText("Retour à la bibliothèque");
     assert.deepEqual(await fileManifest(variant.workspacePath), before);
     report.kitsune.geometry = previews[0].inspection.geometry;
     report.checks.push(
-      "Kitsune facultatif : copie jetable, GLB canonique, cache réutilisé et source personnelle préservée",
+      "Kitsune facultatif : sniper visible sur au moins 25 % de la largeur en vignette et fiche, GLB canonique et source personnelle préservés",
     );
   } finally {
     assert.deepEqual(
@@ -1254,7 +1391,14 @@ try {
   );
   await testNavigationPerformance();
   await testDataUriTexture();
-  await testGalleryPagePerformance();
+  await testStudioFloor();
+  if (process.env.EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK === "1")
+    report.galleryPagePerformance = {
+      skipped: true,
+      reason:
+        "EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1 : benchmark de 50 imports ignoré explicitement.",
+    };
+  else await testGalleryPagePerformance();
   await writeFile(join(main.workspacePath, "notes.txt"), "version 2");
   await writeFile(join(main.workspacePath, "rapport.txt"), "nouveau");
   const changes = await job({ kind: "changes", variantId: main.id });

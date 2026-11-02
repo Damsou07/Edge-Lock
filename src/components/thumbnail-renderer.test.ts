@@ -10,7 +10,8 @@ import {
   releaseModel,
 } from "./viewer-runtime";
 
-vi.mock("./viewer-runtime", () => ({
+vi.mock("./viewer-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./viewer-runtime")>()),
   createPreviewRenderer: vi.fn(),
   createPreviewStage: vi.fn(),
   disposePreviewRenderer: vi.fn(),
@@ -64,16 +65,33 @@ describe("capture statique de bibliothèque", () => {
     expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
   });
 
-  it("capture une scène vide sans tenter de cadrer une géométrie absente", async () => {
-    vi.mocked(framePreviewModel).mockImplementation(() => {
-      throw new Error("Cette scène ne contient aucune géométrie visible.");
-    });
-    expect(await renderThumbnail("preview://empty")).toEqual([137, 80, 78, 71]);
-    expect(framePreviewModel).not.toHaveBeenCalled();
-    expect(render).toHaveBeenCalledTimes(1);
-    expect(releaseModel).toHaveBeenCalledTimes(1);
-    expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
-  });
+  it.each([false, true])(
+    "capture une scène vide ou masquée sans cadrage (masquée : %s)",
+    async (hidden) => {
+      if (hidden) {
+        const scene = new THREE.Group();
+        const mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(),
+          new THREE.MeshBasicMaterial(),
+        );
+        mesh.visible = false;
+        scene.add(mesh);
+        vi.mocked(loadPreviewModel).mockResolvedValue({ scene } as Awaited<
+          ReturnType<typeof loadPreviewModel>
+        >);
+      }
+      vi.mocked(framePreviewModel).mockImplementation(() => {
+        throw new Error("Cette scène ne contient aucune géométrie visible.");
+      });
+      expect(await renderThumbnail("preview://empty")).toEqual([
+        137, 80, 78, 71,
+      ]);
+      expect(framePreviewModel).not.toHaveBeenCalled();
+      expect(render).toHaveBeenCalledTimes(1);
+      expect(releaseModel).toHaveBeenCalledTimes(1);
+      expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("cadre les modèles contenant de la géométrie avant de capturer", async () => {
     const scene = new THREE.Group();

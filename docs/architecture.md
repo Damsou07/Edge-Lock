@@ -62,6 +62,12 @@ GLB et PNG sont servis par des jetons opaques du protocole local `edge-preview`.
 
 Les PNG 512 × 384 sont associés à la variante, à l’artefact et à la version du rendu. `store_thumbnail` les valide avant publication atomique. Leur production utilise un contexte WebGL temporaire libéré après capture. Le rendu commun conserve matériaux, textures, UV et transparences et emploie un environnement PBR local. La CSP autorise les ressources locales, blob et data nécessaires aux textures.
 
+Après décodage du GLB, le chargement commun peut masquer en mémoire un sol horizontal très mince et surdimensionné, contenant l’emprise d’un sujet distinct et situé à sa base. La détection utilise les dimensions mondiales et écarte les candidats animés, déformables ou instanciés ainsi que les cas ambigus reconnus. Un sol seul reste affiché. Cette heuristique ne distingue pas parfaitement une grande plaque portant plusieurs accessoires d’un décor de studio.
+
+La fiche et la capture PNG partagent les mêmes bounds de géométrie visible pour détecter une scène vide et cadrer le modèle ; les objets et descendants masqués en sont exclus. Le recentrage prend en compte les matrices d’instances et la pose courante des skins. Seule la visibilité de la copie décodée change : sources, GLB, hiérarchie, matériaux et statistiques sont conservés.
+
+`RENDERER_VERSION = 2` invalide les anciens index de vignettes et publie les nouvelles images sous un nom versionné. La galerie régénère les PNG visibles depuis l’artefact certifié existant ; les versions des caches GLB et des reçus de synchronisation restent identiques. Une mise à jour du seul rendu n’impose donc aucun réexport Blender ni migration des données.
+
 Aperçus historiques, exports, GLB canoniques et vignettes partagent le budget de 2 Gio ; les ressources actives sont protégées. Les reçus ne certifient un artefact que si ses empreintes correspondent. Les anciennes préférences de GLB courant ne pilotent plus la synchronisation.
 
 L’inspecteur GLB vérifie structure, plages, scène et autonomie des ressources. Les budgets de lecture 3D ne bloquent pas le versionnage d’un GLB canonique valide. Le comptage des arêtes reste borné et peut être indisponible. Les shaders procéduraux, simulations et dépendances externes non capturées restent des limites documentées.

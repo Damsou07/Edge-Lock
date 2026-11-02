@@ -2,6 +2,7 @@ import { deflateSync } from "node:zlib";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { BoxGeometry } from "three";
 
 /** Run only disposable fixture authoring in a private Blender process. */
 export async function runFixtureBlender(
@@ -70,7 +71,7 @@ export async function runFixtureBlender(
   });
 }
 
-/** A single editable .blend with a packed red/green texture and animation; no GLB. */
+/** A single editable .blend with a packed texture; animated by default, no GLB. */
 export async function prepareBlendFixture(
   blender,
   directory,
@@ -80,7 +81,12 @@ export async function prepareBlendFixture(
   await mkdir(directory, { recursive: true });
   await mkdir(temporaryRoot, { recursive: true });
   const seed = join(temporaryRoot, "seed.glb");
-  await writeFile(seed, animatedTexturedTriangle(options));
+  await writeFile(
+    seed,
+    options.studioFloor
+      ? texturedStudioScene()
+      : animatedTexturedTriangle(options),
+  );
   await runFixtureBlender(
     blender,
     temporaryRoot,
@@ -256,6 +262,100 @@ export function animatedTexturedTriangle({ dataUri = false } = {}) {
       },
     ],
   };
+  return encodeGlb(gltf, binary);
+}
+
+/** Two textured volumes touching a huge blue studio slab reproduce the framing bug. */
+export function texturedStudioScene() {
+  const geometry = new BoxGeometry();
+  const parts = [
+    geometry.getAttribute("position").array,
+    geometry.getAttribute("normal").array,
+    geometry.getAttribute("uv").array,
+    geometry.index.array,
+  ].map((array) =>
+    Buffer.from(array.buffer, array.byteOffset, array.byteLength),
+  );
+  parts.push(contrastingPng());
+  const bufferViews = [];
+  let offset = 0;
+  for (const part of parts) {
+    bufferViews.push({
+      buffer: 0,
+      byteOffset: offset,
+      byteLength: part.length,
+    });
+    offset += Math.ceil(part.length / 4) * 4;
+  }
+  const binary = Buffer.alloc(offset);
+  parts.forEach((part, index) =>
+    part.copy(binary, bufferViews[index].byteOffset),
+  );
+  geometry.dispose();
+  const primitive = (material) => ({
+    primitives: [
+      {
+        attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 },
+        indices: 3,
+        material,
+      },
+    ],
+  });
+  return encodeGlb(
+    {
+      asset: {
+        version: "2.0",
+        generator: "Edge Lock studio regression fixture",
+      },
+      scene: 0,
+      scenes: [{ nodes: [0, 1, 2] }],
+      nodes: [
+        { mesh: 0, translation: [-2.1, 1.475, 0], scale: [4, 2.8, 1.7] },
+        { mesh: 0, translation: [2.1, 1.475, 0], scale: [4, 2.8, 1.7] },
+        { mesh: 1, translation: [0, 0.045, 0], scale: [200, 0.06, 200] },
+      ],
+      meshes: [primitive(0), primitive(1)],
+      materials: [
+        {
+          pbrMetallicRoughness: {
+            baseColorFactor: [1, 1, 1, 1],
+            baseColorTexture: { index: 0 },
+            metallicFactor: 0,
+            roughnessFactor: 1,
+          },
+        },
+        {
+          pbrMetallicRoughness: {
+            baseColorFactor: [0, 0, 1, 1],
+            metallicFactor: 0,
+            roughnessFactor: 1,
+          },
+        },
+      ],
+      textures: [{ sampler: 0, source: 0 }],
+      samplers: [{ magFilter: 9728, minFilter: 9728 }],
+      images: [{ bufferView: 4, mimeType: "image/png" }],
+      buffers: [{ byteLength: binary.length }],
+      bufferViews,
+      accessors: [
+        {
+          bufferView: 0,
+          componentType: 5126,
+          count: 24,
+          type: "VEC3",
+          min: [-0.5, -0.5, -0.5],
+          max: [0.5, 0.5, 0.5],
+        },
+        { bufferView: 1, componentType: 5126, count: 24, type: "VEC3" },
+        { bufferView: 2, componentType: 5126, count: 24, type: "VEC2" },
+        { bufferView: 3, componentType: 5123, count: 36, type: "SCALAR" },
+      ],
+    },
+    binary,
+  );
+}
+
+function encodeGlb(gltf, binary) {
   const json = Buffer.from(JSON.stringify(gltf));
   const padded = Buffer.alloc(Math.ceil(json.length / 4) * 4, 0x20);
   json.copy(padded);

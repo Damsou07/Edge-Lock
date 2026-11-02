@@ -12,7 +12,7 @@ use std::{
 
 pub const MAX_THUMBNAIL_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RESOURCES: usize = 128;
-const RENDERER_VERSION: u32 = 1;
+const RENDERER_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub struct ThumbnailSource {
@@ -498,6 +498,58 @@ mod tests {
             std::fs::read(root.path().join("keep.txt")).unwrap(),
             b"keep"
         );
+    }
+
+    #[test]
+    fn obsolete_renderer_thumbnail_is_ignored_and_regenerated() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "a".repeat(64);
+        let bytes = png();
+        let directory = cache_directory(root.path(), true).unwrap().unwrap();
+        let old_path = directory.join(format!("{key}-v1.png"));
+        fs::write(&old_path, &bytes).unwrap();
+        let old_record = ThumbnailRecord {
+            version: 1,
+            artifact_key: key.clone(),
+            image_hash: blake3::hash(&bytes).to_hex().to_string(),
+        };
+        fs::write(
+            index_path(&directory, "variant"),
+            serde_json::to_vec(&old_record).unwrap(),
+        )
+        .unwrap();
+        let unrelated = root.path().join("keep.txt");
+        fs::write(&unrelated, b"keep").unwrap();
+
+        assert!(
+            find_thumbnail(root.path(), "variant", None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_thumbnail(root.path(), "variant", Some(&key))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cached_thumbnail_resource(root.path(), "variant")
+                .unwrap()
+                .is_none()
+        );
+
+        let current = save_thumbnail(root.path(), "variant", &key, &bytes).unwrap();
+        assert_eq!(current, directory.join(format!("{key}-v2.png")));
+        assert_eq!(
+            find_thumbnail(root.path(), "variant", Some(&key)).unwrap(),
+            Some(current.clone())
+        );
+        let resource = cached_thumbnail_resource(root.path(), "variant")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resource.path, current);
+        assert_eq!(resource.read().unwrap(), bytes);
+        assert_eq!(fs::read(old_path).unwrap(), bytes);
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
     }
 
     #[test]

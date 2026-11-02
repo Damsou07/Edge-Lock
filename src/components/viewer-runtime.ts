@@ -85,14 +85,156 @@ export async function loadPreviewModel(url: string, signal?: AbortSignal) {
     releaseModel(model.scene, ...model.scenes);
     signal.throwIfAborted();
   }
+  try {
+    hideOversizedStudioFloor(model.scene, model.animations);
+  } catch (reason) {
+    releaseModel(model.scene, ...model.scenes);
+    throw reason;
+  }
   return model;
+}
+
+type PreviewGeometry = THREE.Mesh | THREE.Line | THREE.Points;
+
+function isPreviewGeometry(object: THREE.Object3D): object is PreviewGeometry {
+  return (
+    object instanceof THREE.Mesh ||
+    object instanceof THREE.Line ||
+    object instanceof THREE.Points
+  );
+}
+
+function visitVisibleGeometry(
+  root: THREE.Object3D,
+  visit: (object: PreviewGeometry, bounds: THREE.Box3) => void,
+) {
+  for (
+    let ancestor: THREE.Object3D | null = root;
+    ancestor;
+    ancestor = ancestor.parent
+  )
+    if (!ancestor.visible) return;
+  root.updateWorldMatrix(true, false);
+  root.updateMatrixWorld(true);
+  root.traverseVisible((object) => {
+    if (!isPreviewGeometry(object)) return;
+    // Object bounds include instance matrices and the current skin pose. Recompute
+    // only when framing/preparing, never in the animation render loop.
+    let local: THREE.Box3 | null;
+    if (
+      object instanceof THREE.SkinnedMesh ||
+      object instanceof THREE.InstancedMesh
+    ) {
+      object.computeBoundingBox();
+      local = object.boundingBox;
+    } else {
+      if (!object.geometry.boundingBox) object.geometry.computeBoundingBox();
+      local = object.geometry.boundingBox;
+    }
+    if (local && !local.isEmpty())
+      visit(object, local.clone().applyMatrix4(object.matrixWorld));
+  });
+}
+
+export function getVisiblePreviewBounds(root: THREE.Object3D): THREE.Box3 {
+  const bounds = new THREE.Box3();
+  visitVisibleGeometry(root, (_object, box) => bounds.union(box));
+  return bounds;
+}
+
+/** Hide only a clearly disproportionate support, in the decoded preview copy. */
+function hideOversizedStudioFloor(
+  root: THREE.Object3D,
+  animations: THREE.AnimationClip[],
+) {
+  const entries: { object: PreviewGeometry; bounds: THREE.Box3 }[] = [];
+  visitVisibleGeometry(root, (object, bounds) =>
+    entries.push({ object, bounds }),
+  );
+  const animated = new Set<THREE.Object3D>();
+  for (const clip of animations)
+    for (const track of clip.tracks) {
+      try {
+        const { nodeName } = THREE.PropertyBinding.parseTrackName(track.name);
+        const node = THREE.PropertyBinding.findNode(root, nodeName);
+        if (!(node instanceof THREE.Object3D)) return; // Unresolved animation: preserve visibility.
+        animated.add(node);
+      } catch {
+        return;
+      }
+    }
+
+  let candidate: (typeof entries)[number] | undefined;
+  let largestArea = 0;
+  for (const entry of entries) {
+    const { object, bounds } = entry;
+    const size = bounds.getSize(new THREE.Vector3());
+    if (
+      ![...bounds.min.toArray(), ...bounds.max.toArray()].every(Number.isFinite)
+    )
+      return;
+    if (
+      !(object instanceof THREE.Mesh) ||
+      object instanceof THREE.SkinnedMesh ||
+      object instanceof THREE.InstancedMesh ||
+      Object.values(object.geometry.morphAttributes).some(
+        (attributes) => attributes.length,
+      ) ||
+      size.x <= 0 ||
+      size.z <= 0 ||
+      size.y > Math.min(size.x, size.z) * 0.01
+    )
+      continue;
+    let moving = false;
+    for (
+      let ancestor: THREE.Object3D | null = object;
+      ancestor;
+      ancestor = ancestor.parent
+    )
+      if (animated.has(ancestor)) moving = true;
+    if (!moving && size.x * size.z > largestArea) {
+      candidate = entry;
+      largestArea = size.x * size.z;
+    }
+  }
+  if (!candidate) return;
+  const floorObject = candidate.object;
+  let hasGeometryChild = false;
+  floorObject.traverse((object) => {
+    if (object !== floorObject && isPreviewGeometry(object))
+      hasGeometryChild = true;
+  });
+  if (hasGeometryChild) return;
+
+  const subject = new THREE.Box3();
+  let meshes = 0;
+  for (const entry of entries) {
+    if (entry === candidate) continue;
+    subject.union(entry.bounds);
+    if (entry.object instanceof THREE.Mesh) meshes++;
+  }
+  if (meshes < 2 || subject.isEmpty()) return;
+  const size = subject.getSize(new THREE.Vector3());
+  const floor = candidate.bounds;
+  const floorSize = floor.getSize(new THREE.Vector3());
+  if (
+    size.y >= Math.max(size.x, size.z) * 0.05 &&
+    floorSize.x >= size.x * 10 &&
+    floorSize.z >= size.z * 10 &&
+    floor.min.x <= subject.min.x &&
+    floor.max.x >= subject.max.x &&
+    floor.min.z <= subject.min.z &&
+    floor.max.z >= subject.max.z &&
+    Math.abs(floor.max.y - subject.min.y) <= size.length() * 0.02
+  )
+    floorObject.visible = false;
 }
 
 export function framePreviewModel(
   root: THREE.Object3D,
   camera: THREE.PerspectiveCamera,
 ) {
-  const box = new THREE.Box3().setFromObject(root);
+  const box = getVisiblePreviewBounds(root);
   if (box.isEmpty())
     throw new Error("Cette scène ne contient aucune géométrie visible.");
   const target = box.getCenter(new THREE.Vector3());
@@ -104,7 +246,7 @@ export function framePreviewModel(
     verticalFov,
     Math.atan(Math.tan(verticalFov) * camera.aspect),
   );
-  const distance = (radius / Math.sin(limitingFov)) * 1.2;
+  const distance = (radius / Math.sin(limitingFov)) * 1.1;
   camera.position
     .copy(target)
     .add(new THREE.Vector3(1, 0.7, 1.2).normalize().multiplyScalar(distance));
