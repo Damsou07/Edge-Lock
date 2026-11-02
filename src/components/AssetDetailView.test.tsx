@@ -118,6 +118,7 @@ beforeEach(() => {
   vi.mocked(api.onWorkspaceChanged).mockResolvedValue(() => {});
   vi.mocked(api.chooseExportPath).mockResolvedValue("C:\\Export\\drone.glb");
   vi.mocked(api.openBlender).mockResolvedValue(undefined);
+  vi.mocked(api.updateConfig).mockResolvedValue(undefined);
   vi.mocked(api.releasePreviewResources).mockResolvedValue(undefined);
   run.mockImplementation(async (request: JobRequest) =>
     request.kind === "changes" ? changes : generatedPreview,
@@ -216,6 +217,11 @@ describe("versions et travail en cours", () => {
   });
 
   it("préserve une configuration en cours de saisie lors du rafraîchissement des métriques", async () => {
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : { ...generatedPreview, sourceKind: "assetGlb" },
+    );
     const props = {
       id: "asset-1",
       taxonomy: { categories: [], games: [], tags: [] },
@@ -228,8 +234,8 @@ describe("versions et travail en cours", () => {
     const rendered = render(<AssetDetailView {...props} />);
     await screen.findByText("Modifications non versionnées");
     await screen.findByLabelText("Aperçu 3D interactif");
-    await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: "Scène" }),
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Scène" }),
       "Scene",
     );
     rendered.rerender(<AssetDetailView {...props} generation={1} />);
@@ -237,9 +243,8 @@ describe("versions et travail en cours", () => {
     expect(
       screen.getByRole("button", { name: "Exporter .glb" }),
     ).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Scène" })).toHaveValue(
-      "Scene",
-    );
+    expect(screen.getByRole("textbox", { name: "Scène" })).toHaveValue("Scene");
+    expect(api.updateConfig).not.toHaveBeenCalled();
     expect(
       run.mock.calls.filter(([request]) => request.kind === "preview"),
     ).toHaveLength(1);
@@ -407,7 +412,7 @@ describe("aperçu indépendant et dépendances", () => {
     ).toHaveLength(2);
   });
 
-  it("préserve les réglages saisis et recharge après leur enregistrement uniquement", async () => {
+  it("enregistre automatiquement les choix et recharge une seule fois sans bouton manuel", async () => {
     let savedConfig = variant.variant.config;
     vi.mocked(api.getVariant).mockImplementation(async () => ({
       ...variant,
@@ -421,20 +426,17 @@ describe("aperçu indépendant et dépendances", () => {
     );
     renderDetail();
     await screen.findByLabelText("Aperçu 3D interactif");
-    const save = screen.getByRole("button", {
-      name: "Enregistrer les réglages",
-    });
-    expect(save).toBeDisabled();
+    expect(
+      screen.queryByRole("button", { name: "Enregistrer les réglages" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Ces réglages définissent la source/),
+    ).not.toBeInTheDocument();
     await userEvent.click(
       screen.getByRole("checkbox", {
         name: "Appliquer les modificateurs à l’export",
       }),
     );
-    expect(save).toBeEnabled();
-    expect(
-      run.mock.calls.filter(([request]) => request.kind === "preview"),
-    ).toHaveLength(1);
-    await userEvent.click(save);
     await waitFor(() =>
       expect(
         run.mock.calls.filter(([request]) => request.kind === "preview"),
@@ -449,8 +451,398 @@ describe("aperçu indépendant et dépendances", () => {
         name: "Appliquer les modificateurs à l’export",
       }),
     ).toBeChecked();
-    expect(save).toBeDisabled();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+      "drone.blend",
+    );
+    expect(api.updateConfig).toHaveBeenCalledTimes(1);
   });
+
+  it("enregistre immédiatement la scène et la collection choisies", async () => {
+    let savedConfig = variant.variant.config;
+    vi.mocked(api.getVariant).mockImplementation(async () => ({
+      ...variant,
+      variant: { ...variant.variant, config: savedConfig },
+    }));
+    vi.mocked(api.updateConfig).mockImplementation(async (_, value) => {
+      savedConfig = value;
+    });
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Scène" }),
+      "Scene",
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenCalledWith("variant-1", {
+        ...variant.variant.config,
+        scene: "Scene",
+      }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Collection" }),
+      "Asset",
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenLastCalledWith("variant-1", {
+        ...variant.variant.config,
+        scene: "Scene",
+        collection: "Asset",
+      }),
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Scène" }),
+      "",
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenLastCalledWith(
+        "variant-1",
+        variant.variant.config,
+      ),
+    );
+    expect(api.updateConfig).toHaveBeenCalledTimes(3);
+  });
+
+  it("enregistre les champs texte au blur ou avec Entrée, sans écrire à chaque frappe", async () => {
+    let savedConfig = variant.variant.config;
+    vi.mocked(api.getVariant).mockImplementation(async () => ({
+      ...variant,
+      variant: { ...variant.variant, config: savedConfig },
+    }));
+    vi.mocked(api.updateConfig).mockImplementation(async (_, value) => {
+      savedConfig = value;
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : { ...generatedPreview, sourceKind: "assetGlb" },
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Scène" }),
+      "Scene",
+    );
+    expect(api.updateConfig).not.toHaveBeenCalled();
+    await userEvent.tab();
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenCalledWith("variant-1", {
+        ...variant.variant.config,
+        scene: "Scene",
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Collection" })).toBeEnabled(),
+    );
+    await userEvent.type(
+      screen.getByRole("textbox", { name: "Collection" }),
+      "Asset{Enter}",
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenLastCalledWith("variant-1", {
+        ...variant.variant.config,
+        scene: "Scene",
+        collection: "Asset",
+      }),
+    );
+    expect(api.updateConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("bloque les réglages et opérations pendant la sauvegarde et utilise la configuration canonique", async () => {
+    let finish: () => void = () => {};
+    vi.mocked(api.updateConfig).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+      "",
+    );
+    expect(api.updateConfig).toHaveBeenCalledWith("variant-1", {
+      ...variant.variant.config,
+      primaryFile: null,
+    });
+    for (const name of ["Fichier principal", "Scène", "Collection"])
+      expect(screen.getByLabelText(name)).toBeDisabled();
+    for (const name of [
+      "Exporter .glb",
+      "Ouvrir dans Blender",
+      "Créer une version",
+      "Analyser la source",
+    ])
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    ).toBeDisabled();
+    await act(async () => finish());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Fichier principal" }),
+      ).toHaveValue("drone.blend"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Exporter .glb" }),
+      ).toBeEnabled(),
+    );
+  });
+
+  it("conserve le brouillon après échec et permet de réessayer la sauvegarde", async () => {
+    let savedConfig = variant.variant.config;
+    vi.mocked(api.getVariant).mockImplementation(async () => ({
+      ...variant,
+      variant: { ...variant.variant, config: savedConfig },
+    }));
+    vi.mocked(api.updateConfig)
+      .mockRejectedValueOnce(new Error("Disque indisponible"))
+      .mockImplementation(async (_, value) => {
+        savedConfig = value;
+      });
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Disque indisponible",
+    );
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Exporter .glb" }),
+    ).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Réessayer" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Exporter .glb" }),
+      ).toBeEnabled(),
+    );
+    expect(api.updateConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("termine la sauvegarde capturée sans recharger l’ancienne variante après navigation", async () => {
+    const alternate = {
+      ...variant.variant,
+      id: "variant-2",
+      name: "Désert",
+      config: { ...variant.variant.config, primaryFile: "desert.blend" },
+    };
+    vi.mocked(api.getAsset).mockResolvedValue({
+      ...detail,
+      variants: [...detail.variants, alternate],
+    });
+    vi.mocked(api.getVariant).mockImplementation(async (id) =>
+      id === "variant-1" ? variant : { ...variant, variant: alternate },
+    );
+    let finish: () => void = () => {};
+    vi.mocked(api.updateConfig).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    );
+    expect(api.updateConfig).toHaveBeenCalledWith("variant-1", {
+      ...variant.variant.config,
+      applyModifiers: true,
+    });
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "Variante" }),
+      "variant-2",
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Fichier principal" }),
+      ).toHaveValue("desert.blend"),
+    );
+    const oldReads = vi
+      .mocked(api.getVariant)
+      .mock.calls.filter(([id]) => id === "variant-1").length;
+    await act(async () => finish());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Fichier principal" }),
+      ).toBeEnabled(),
+    );
+    expect(
+      vi.mocked(api.getVariant).mock.calls.filter(([id]) => id === "variant-1"),
+    ).toHaveLength(oldReads);
+    expect(
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+    ).toHaveValue("desert.blend");
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    ).not.toBeChecked();
+  });
+
+  it("n’installe aucun résultat ni watcher après la fermeture de la fiche pendant une sauvegarde", async () => {
+    let finish: () => void = () => {};
+    vi.mocked(api.updateConfig).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const rendered = renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    );
+    expect(api.updateConfig).toHaveBeenCalledTimes(1);
+    rendered.unmount();
+    const reads = vi.mocked(api.getVariant).mock.calls.length;
+    await act(async () => finish());
+    expect(api.getVariant).toHaveBeenCalledTimes(reads);
+  });
+
+  it("ignore un ancien aperçu terminé pendant la sauvegarde automatique", async () => {
+    let finishPreview: (value: PreviewResult) => void = () => {};
+    let finishSave: () => void = () => {};
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : new Promise((resolve) => {
+            finishPreview = resolve;
+          }),
+    );
+    vi.mocked(api.updateConfig).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    renderDetail();
+    await waitFor(() =>
+      expect(
+        run.mock.calls.filter(([request]) => request.kind === "preview"),
+      ).toHaveLength(1),
+    );
+    await userEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Appliquer les modificateurs à l’export",
+      }),
+    );
+    await act(async () => finishPreview(generatedPreview));
+    expect(
+      screen.queryByLabelText("Aperçu 3D interactif"),
+    ).not.toBeInTheDocument();
+    expect(api.releasePreviewResources).toHaveBeenCalledWith(["generated"]);
+    await act(async () => finishSave());
+  });
+
+  it.each(["choix GLB", "actualisation des fichiers"])(
+    "ignore une ancienne configuration chargée par %s après la sauvegarde automatique",
+    async (origin) => {
+      const stale = {
+        ...variant,
+        files: [
+          ...variant.files,
+          {
+            path: "alternate.glb",
+            kind: "file" as const,
+            hash: "glb",
+            size: 10,
+          },
+        ],
+      };
+      let savedConfig = variant.variant.config;
+      let delayNextRead = false;
+      let readWaiting = false;
+      let finishRead: (value: VariantDetail) => void = () => {};
+      vi.mocked(api.getVariant).mockImplementation(async () => {
+        if (delayNextRead) {
+          delayNextRead = false;
+          readWaiting = true;
+          return new Promise((resolve) => {
+            finishRead = resolve;
+          });
+        }
+        return { ...stale, variant: { ...stale.variant, config: savedConfig } };
+      });
+      vi.mocked(api.updateConfig).mockImplementation(async (_, value) => {
+        savedConfig = value;
+      });
+      let previewCalls = 0;
+      run.mockImplementation(async (request) => {
+        if (request.kind === "changes") return changes;
+        previewCalls += 1;
+        if (origin === "choix GLB" && previewCalls === 1)
+          throw {
+            code: "preview_ambiguous",
+            details: { candidates: ["alternate.glb"] },
+          };
+        return generatedPreview;
+      });
+      renderDetail();
+      if (origin === "choix GLB") {
+        await userEvent.selectOptions(
+          await screen.findByRole("combobox", {
+            name: "GLB de prévisualisation",
+          }),
+          "alternate.glb",
+        );
+        delayNextRead = true;
+        await userEvent.click(
+          screen.getByRole("button", { name: "Utiliser ce GLB" }),
+        );
+      } else {
+        await screen.findByLabelText("Aperçu 3D interactif");
+        delayNextRead = true;
+        await userEvent.click(
+          screen
+            .getAllByRole("button", { name: "Actualiser" })
+            .find((button) => button.classList.contains("refresh-files"))!,
+        );
+      }
+      await waitFor(() => expect(readWaiting).toBe(true));
+      await userEvent.click(
+        screen.getByRole("checkbox", {
+          name: "Appliquer les modificateurs à l’export",
+        }),
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Exporter .glb" }),
+        ).toBeEnabled(),
+      );
+      await act(async () => finishRead(stale));
+      expect(
+        screen.getByRole("button", { name: "Exporter .glb" }),
+      ).toBeEnabled();
+      expect(
+        screen.getByRole("checkbox", {
+          name: "Appliquer les modificateurs à l’export",
+        }),
+      ).toBeChecked();
+      expect(previewCalls).toBe(2);
+    },
+  );
 
   it("libère les ressources affichées et les réponses arrivées après fermeture", async () => {
     let finish: (value: PreviewResult) => void = () => {};

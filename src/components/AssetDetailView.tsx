@@ -35,6 +35,15 @@ import { Modal } from "./Modal";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
+function sameConfig(left: ExportConfig, right: ExportConfig) {
+  return (
+    left.primaryFile === right.primaryFile &&
+    left.scene === right.scene &&
+    left.collection === right.collection &&
+    left.applyModifiers === right.applyModifiers
+  );
+}
+
 function releasePreview(url: string) {
   const token = new URL(url).pathname.slice(1);
   void api.releasePreviewResources([token]).catch(() => {
@@ -172,6 +181,7 @@ export function AssetDetailView({
   const [externalChanged, setExternalChanged] = useState(false);
   const [config, setConfig] = useState<ExportConfig>(defaultExportConfig);
   const [configBusy, setConfigBusy] = useState(false);
+  const [configError, setConfigError] = useState("");
   const [localRefresh, setLocalRefresh] = useState(0);
   const [tab, setTab] = useState<"files" | "history" | "changes">("files");
   const [fileLimit, setFileLimit] = useState(100);
@@ -189,9 +199,19 @@ export function AssetDetailView({
   const alive = useRef(true);
   const previewRequest = useRef(0);
   const autoPreviewAttempt = useRef("");
-  const editConfig = (update: (previous: ExportConfig) => ExportConfig) => {
-    configEdited.current = true;
-    setConfig(update);
+  const configSaving = useRef(false);
+  const configRevision = useRef(0);
+  const editConfig = (
+    update: (previous: ExportConfig) => ExportConfig,
+    persist = false,
+  ) => {
+    if (configSaving.current) return;
+    const next = update(config);
+    configEdited.current =
+      !variantDetail || !sameConfig(next, variantDetail.variant.config);
+    setConfig(next);
+    setConfigError("");
+    if (persist) void saveConfig(next);
   };
 
   useEffect(() => {
@@ -232,10 +252,12 @@ export function AssetDetailView({
   useEffect(() => {
     if (!variantId) return;
     let active = true;
+    const revision = configRevision.current;
+    const isCurrent = () => active && configRevision.current === revision;
     void api
       .getVariant(variantId)
       .then((value) => {
-        if (active) {
+        if (isCurrent()) {
           setVariantDetail(value);
           if (
             !configEdited.current ||
@@ -248,7 +270,7 @@ export function AssetDetailView({
         }
       })
       .catch((reason) => {
-        if (active) onError(errorMessage(reason));
+        if (isCurrent()) onError(errorMessage(reason));
       });
     return () => {
       active = false;
@@ -302,23 +324,26 @@ export function AssetDetailView({
     setPreviewCandidates([]);
     setPreviewFile("");
     setInspectionBusy(false);
+    setConfigError("");
     setFileLimit(100);
   }, [selection]);
   useEffect(() => {
     if (!variantId) return;
     let active = true;
+    const revision = configRevision.current;
+    const isCurrent = () => active && configRevision.current === revision;
     setChangesBusy(true);
     setChanges(null);
     setExternalChanged(false);
     void runJob<ChangeSet>({ kind: "changes", variantId })
       .then((value) => {
-        if (active) setChanges(value);
+        if (isCurrent()) setChanges(value);
       })
       .catch((reason) => {
-        if (active) onError(errorMessage(reason));
+        if (isCurrent()) onError(errorMessage(reason));
       })
       .finally(() => {
-        if (active) setChangesBusy(false);
+        if (isCurrent()) setChangesBusy(false);
       });
     return () => {
       active = false;
@@ -359,10 +384,8 @@ export function AssetDetailView({
   const configurationDirty =
     !snapshotId &&
     !!variantDetail &&
-    (config.primaryFile !== variantDetail.variant.config.primaryFile ||
-      config.scene !== variantDetail.variant.config.scene ||
-      config.collection !== variantDetail.variant.config.collection ||
-      config.applyModifiers !== variantDetail.variant.config.applyModifiers);
+    !sameConfig(config, variantDetail.variant.config);
+  const configurationPending = configurationDirty || configBusy;
   const pendingCount = changes
     ? changes.added.length +
       changes.modified.length +
@@ -408,6 +431,11 @@ export function AssetDetailView({
 
   const inspect = async () => {
     const target = selection;
+    const revision = configRevision.current;
+    const isCurrent = () =>
+      alive.current &&
+      currentSelection.current === target &&
+      configRevision.current === revision;
     setInspectionBusy(true);
     try {
       const result = await runJob<Inspection>({
@@ -415,18 +443,24 @@ export function AssetDetailView({
         variantId,
         snapshotId,
       });
-      if (currentSelection.current === target) setInspection(result);
+      if (isCurrent()) setInspection(result);
     } catch (reason) {
-      showFailure(reason);
+      if (isCurrent()) showFailure(reason);
     } finally {
-      if (currentSelection.current === target) setInspectionBusy(false);
+      if (isCurrent()) setInspectionBusy(false);
     }
   };
   const loadPreviewFiles = useCallback(
     async (target: string) => {
       if (snapshotId) return files;
+      const revision = configRevision.current;
       const updated = await api.getVariant(variantId);
-      if (!alive.current || currentSelection.current !== target) return null;
+      if (
+        !alive.current ||
+        currentSelection.current !== target ||
+        configRevision.current !== revision
+      )
+        return null;
       setVariantDetail(updated);
       return updated.files;
     },
@@ -515,6 +549,11 @@ export function AssetDetailView({
   }, [autoPreviewKey, configurationDirty, configBusy, generatePreview]);
   const changePreviewFile = async () => {
     const target = selection;
+    const revision = configRevision.current;
+    const isCurrent = () =>
+      alive.current &&
+      currentSelection.current === target &&
+      configRevision.current === revision;
     setPreviewBusy(true);
     setPreviewError("");
     try {
@@ -527,49 +566,79 @@ export function AssetDetailView({
       setPreviewCandidates(candidates);
       if (candidates.length === 0) await generatePreview("");
     } catch (reason) {
-      if (currentSelection.current === target)
-        setPreviewError(errorMessage(reason));
+      if (isCurrent()) setPreviewError(errorMessage(reason));
     } finally {
-      if (currentSelection.current === target) setPreviewBusy(false);
+      if (isCurrent()) setPreviewBusy(false);
     }
   };
   const refreshChanges = async () => {
     const targetId = variantId;
+    const revision = configRevision.current;
+    const isCurrent = () =>
+      alive.current &&
+      currentSelection.current.startsWith(`${id}:${targetId}:`) &&
+      configRevision.current === revision;
     setChangesBusy(true);
     try {
       const result = await runJob<ChangeSet>({ kind: "changes", variantId });
-      if (!currentSelection.current.startsWith(`${id}:${targetId}:`)) return;
+      if (!isCurrent()) return;
       const updated = await api.getVariant(targetId);
-      if (currentSelection.current.startsWith(`${id}:${targetId}:`)) {
+      if (isCurrent()) {
         setChanges(result);
         setVariantDetail(updated);
         setExternalChanged(false);
       }
     } catch (reason) {
-      showFailure(reason);
+      if (isCurrent()) showFailure(reason);
     } finally {
-      setChangesBusy(false);
+      if (isCurrent()) setChangesBusy(false);
     }
   };
-  const saveConfig = async (event: FormEvent) => {
-    event.preventDefault();
+  const saveConfig = async (next: ExportConfig = config) => {
+    if (
+      snapshotId ||
+      configSaving.current ||
+      variantDetail?.variant.id !== variantId ||
+      variantDetail.variant.assetId !== id ||
+      sameConfig(next, variantDetail.variant.config)
+    )
+      return;
     const target = selection;
+    const targetVariant = variantId;
+    const isCurrent = () =>
+      alive.current && currentSelection.current === target;
+    configSaving.current = true;
+    configRevision.current += 1;
+    previewRequest.current += 1;
     setConfigBusy(true);
+    setConfigError("");
+    setPreview(null);
+    setPreviewBusy(false);
+    setInspection(null);
+    setInspectionBusy(false);
+    setChangesBusy(false);
+    setPreviewError("");
+    setPreviewCandidates([]);
+    setPreviewFile("");
     try {
-      await api.updateConfig(variantId, config);
-      if (!alive.current || currentSelection.current !== target) return;
+      await api.updateConfig(targetVariant, next);
+      if (!isCurrent()) return;
+      const updated = await api.getVariant(targetVariant);
+      if (!isCurrent()) return;
+      configRevision.current += 1;
       configEdited.current = false;
-      previewRequest.current += 1;
-      setPreview(null);
-      setInspection(null);
-      setPreviewError("");
-      setPreviewCandidates([]);
-      setPreviewFile("");
+      configVariant.current = targetVariant;
+      setConfig(updated.variant.config);
+      setVariantDetail(updated);
+      autoPreviewAttempt.current = "";
       setLocalRefresh((value) => value + 1);
+      onChanged();
     } catch (reason) {
-      showFailure(reason);
+      if (isCurrent()) setConfigError(errorMessage(reason));
+      else onError(errorMessage(reason));
     } finally {
-      setConfigBusy(false);
+      configSaving.current = false;
+      if (alive.current) setConfigBusy(false);
     }
   };
   const exportTo = async (destination: string, overwrite: boolean) => {
@@ -690,7 +759,7 @@ export function AssetDetailView({
           </button>
           <button
             className="button primary"
-            disabled={!variant || exportBusy || configurationDirty}
+            disabled={!variant || exportBusy || configurationPending}
             onClick={() => void exportGlb()}
           >
             <Icon
@@ -796,7 +865,7 @@ export function AssetDetailView({
                   disabled={
                     !variant ||
                     previewBusy ||
-                    configurationDirty ||
+                    configurationPending ||
                     previewCandidates.length > 0
                   }
                   onClick={() => void generatePreview()}
@@ -824,7 +893,7 @@ export function AssetDetailView({
                 {preview.sourceKind === "assetGlb" && (
                   <button
                     className="text-button"
-                    disabled={previewBusy || configurationDirty}
+                    disabled={previewBusy || configurationPending}
                     onClick={() => void changePreviewFile()}
                   >
                     Changer le GLB
@@ -832,7 +901,7 @@ export function AssetDetailView({
                 )}
                 <button
                   className="text-button"
-                  disabled={previewBusy || configurationDirty}
+                  disabled={previewBusy || configurationPending}
                   onClick={() => void generatePreview()}
                 >
                   <Icon
@@ -870,7 +939,7 @@ export function AssetDetailView({
               </label>
               <button
                 className="button secondary small-button"
-                disabled={!previewFile || previewBusy || configurationDirty}
+                disabled={!previewFile || previewBusy || configurationPending}
               >
                 Utiliser ce GLB
               </button>
@@ -1004,7 +1073,7 @@ export function AssetDetailView({
             </button>
             <button
               className="button blender-button"
-              disabled={!variant || !!snapshotId || configurationDirty}
+              disabled={!variant || !!snapshotId || configurationPending}
               title={
                 snapshotId
                   ? "Créez une variante pour ouvrir cette version dans Blender."
@@ -1019,7 +1088,10 @@ export function AssetDetailView({
           <div className="panel-divider" />
           <form
             className="config-form"
-            onSubmit={(event) => void saveConfig(event)}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveConfig();
+            }}
           >
             <div className="panel-heading">
               <h3>Source de l’asset</h3>
@@ -1031,14 +1103,17 @@ export function AssetDetailView({
               Fichier principal
               <select
                 value={activeConfig.primaryFile ?? ""}
-                disabled={!!snapshotId}
+                disabled={!!snapshotId || configBusy || !variant}
                 onChange={(event) =>
-                  editConfig((previous) => ({
-                    ...previous,
-                    primaryFile: event.target.value || null,
-                    scene: null,
-                    collection: null,
-                  }))
+                  editConfig(
+                    (previous) => ({
+                      ...previous,
+                      primaryFile: event.target.value || null,
+                      scene: null,
+                      collection: null,
+                    }),
+                    true,
+                  )
                 }
               >
                 <option value="">Détection automatique</option>
@@ -1062,14 +1137,17 @@ export function AssetDetailView({
                 Scène
                 {sourceInspection ? (
                   <select
-                    disabled={!!snapshotId}
+                    disabled={!!snapshotId || configBusy || !variant}
                     value={activeConfig.scene ?? ""}
                     onChange={(event) =>
-                      editConfig((previous) => ({
-                        ...previous,
-                        scene: event.target.value || null,
-                        collection: null,
-                      }))
+                      editConfig(
+                        (previous) => ({
+                          ...previous,
+                          scene: event.target.value || null,
+                          collection: null,
+                        }),
+                        true,
+                      )
                     }
                   >
                     <option value="">Scène active</option>
@@ -1081,7 +1159,7 @@ export function AssetDetailView({
                   </select>
                 ) : (
                   <input
-                    disabled={!!snapshotId}
+                    disabled={!!snapshotId || configBusy || !variant}
                     value={activeConfig.scene ?? ""}
                     placeholder="Scène active"
                     onChange={(event) =>
@@ -1090,6 +1168,13 @@ export function AssetDetailView({
                         scene: event.target.value || null,
                       }))
                     }
+                    onBlur={() => void saveConfig()}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        event.currentTarget.blur();
+                      }
+                    }}
                   />
                 )}
               </label>
@@ -1097,13 +1182,16 @@ export function AssetDetailView({
                 Collection
                 {sourceInspection ? (
                   <select
-                    disabled={!!snapshotId}
+                    disabled={!!snapshotId || configBusy || !variant}
                     value={activeConfig.collection ?? ""}
                     onChange={(event) =>
-                      editConfig((previous) => ({
-                        ...previous,
-                        collection: event.target.value || null,
-                      }))
+                      editConfig(
+                        (previous) => ({
+                          ...previous,
+                          collection: event.target.value || null,
+                        }),
+                        true,
+                      )
                     }
                   >
                     <option value="">Scène entière</option>
@@ -1115,7 +1203,7 @@ export function AssetDetailView({
                   </select>
                 ) : (
                   <input
-                    disabled={!!snapshotId}
+                    disabled={!!snapshotId || configBusy || !variant}
                     value={activeConfig.collection ?? ""}
                     placeholder="Scène entière"
                     onChange={(event) =>
@@ -1124,20 +1212,30 @@ export function AssetDetailView({
                         collection: event.target.value || null,
                       }))
                     }
+                    onBlur={() => void saveConfig()}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        event.currentTarget.blur();
+                      }
+                    }}
                   />
                 )}
               </label>
             </div>
             <label className="checkbox-label">
               <input
-                disabled={!!snapshotId}
+                disabled={!!snapshotId || configBusy || !variant}
                 type="checkbox"
                 checked={activeConfig.applyModifiers}
                 onChange={(event) =>
-                  editConfig((previous) => ({
-                    ...previous,
-                    applyModifiers: event.target.checked,
-                  }))
+                  editConfig(
+                    (previous) => ({
+                      ...previous,
+                      applyModifiers: event.target.checked,
+                    }),
+                    true,
+                  )
                 }
               />
               Appliquer les modificateurs à l’export
@@ -1146,7 +1244,7 @@ export function AssetDetailView({
               <button
                 type="button"
                 className="text-button"
-                disabled={!variant || inspectionBusy || configurationDirty}
+                disabled={!variant || inspectionBusy || configurationPending}
                 onClick={() => void inspect()}
                 title="Actualiser la géométrie, les scènes, les collections et les dépendances de la source enregistrée."
               >
@@ -1157,25 +1255,23 @@ export function AssetDetailView({
                 />
                 {inspectionBusy ? "Analyse…" : "Analyser la source"}
               </button>
-              <button
-                className="button secondary small-button"
-                disabled={
-                  !variant || !!snapshotId || configBusy || !configurationDirty
-                }
-              >
-                {configBusy ? "Enregistrement…" : "Enregistrer les réglages"}
-              </button>
             </div>
-            <p className="field-help">
-              Ces réglages définissent la source de l’aperçu et de l’export.
-              Enregistrez vos fichiers dans Blender, puis créez une version pour
-              conserver votre travail.
-            </p>
-            {configurationDirty && (
-              <p className="field-help">
-                Enregistrez la source pour l’utiliser dans Blender, les versions
-                et les exports.
+            {configBusy && (
+              <p className="field-help" role="status">
+                Enregistrement…
               </p>
+            )}
+            {configError && (
+              <div className="inline-error" role="alert">
+                <p>{configError}</p>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => void saveConfig()}
+                >
+                  Réessayer
+                </button>
+              </div>
             )}
           </form>
           <div className="panel-divider" />
@@ -1188,7 +1284,7 @@ export function AssetDetailView({
           </div>
           <button
             className="button primary full-width"
-            disabled={!variant || !!snapshotId || configurationDirty}
+            disabled={!variant || !!snapshotId || configurationPending}
             onClick={() => setModal("snapshot")}
           >
             <Icon name="save" />

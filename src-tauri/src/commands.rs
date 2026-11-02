@@ -60,6 +60,8 @@ pub async fn open_library(path: String, state: State<'_, ManagedState>) -> AppRe
     let state = state.0.clone();
     blocking(move || {
         let _gate = lock(&state.operation_gate)?;
+        let _lifecycle = lock(&state.lifecycle_gate)?;
+        state.ensure_running()?;
         if state.busy()? {
             return Err(AppError::new(
                 "busy",
@@ -222,12 +224,29 @@ pub async fn update_config(
     state: State<'_, ManagedState>,
 ) -> AppResult<()> {
     let state = state.0.clone();
+    let pending = state.register_config_write()?;
     let library = state.library()?;
     blocking(move || {
-        let _gate = lock(&state.operation_gate)?;
-        Ok(library.update_config(&variant_id, config)?)
+        let _pending = pending;
+        persist_config(&state, &library, &variant_id, config)
     })
     .await
+}
+
+fn persist_config(
+    state: &AppState,
+    library: &Arc<Library>,
+    variant_id: &str,
+    config: ExportConfig,
+) -> AppResult<()> {
+    let _gate = lock(&state.operation_gate)?;
+    if !Arc::ptr_eq(library, &state.library()?) {
+        return Err(AppError::new(
+            "library_changed",
+            "La bibliothèque a changé. Relancez cette opération.",
+        ));
+    }
+    Ok(library.update_config(variant_id, config)?)
 }
 
 #[tauri::command]
@@ -457,4 +476,76 @@ pub async fn invalidate_thumbnail(
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edge_lock_core::OperationContext;
+
+    #[test]
+    fn a_submitted_config_write_finishes_after_close_is_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("main.blend"), b"source").unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let asset = library
+            .import_folder(
+                &source,
+                "Drone",
+                ExportConfig::default(),
+                &OperationContext::default(),
+            )
+            .unwrap();
+        let variant = &asset.variants[0];
+        let state = Arc::new(crate::state::test_state(library.clone()));
+        let gate = lock(&state.operation_gate).unwrap();
+        let pending = state.register_config_write().unwrap();
+        let config = ExportConfig {
+            apply_modifiers: true,
+            ..variant.config.clone()
+        };
+        let write_state = state.clone();
+        let write_library = library.clone();
+        let variant_id = variant.id.clone();
+        let submitted_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let _pending = pending;
+            persist_config(&write_state, &write_library, &variant_id, submitted_config)
+        });
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Wait
+        ));
+        assert!(
+            !library
+                .get_variant(&variant.id)
+                .unwrap()
+                .variant
+                .config
+                .apply_modifiers
+        );
+        drop(gate);
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            library.get_variant(&variant.id).unwrap().variant.config,
+            config
+        );
+        assert_eq!(std::fs::read(source.join("main.blend")).unwrap(), b"source");
+        assert!(!state.busy().unwrap());
+    }
+
+    #[test]
+    fn a_config_write_refuses_a_library_that_changed_while_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::open(root.path().join("previous")).unwrap());
+        let current = Arc::new(Library::open(root.path().join("current")).unwrap());
+        let state = Arc::new(crate::state::test_state(library.clone()));
+        let _pending = state.register_config_write().unwrap();
+        *lock(&state.library).unwrap() = Some(current);
+        let error =
+            persist_config(&state, &library, "unused", ExportConfig::default()).unwrap_err();
+        assert_eq!(error.code, "library_changed");
+    }
 }

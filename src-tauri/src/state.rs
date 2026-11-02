@@ -4,7 +4,10 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,8 +85,26 @@ pub struct AppState {
     pub previews: Mutex<PreviewResources>,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub watcher_generation: std::sync::atomic::AtomicU64,
+    // Synchronizes close and library changes with admission of new work.
+    pub lifecycle_gate: Mutex<()>,
+    pub pending_config_writes: AtomicUsize,
     pub closing: AtomicBool,
 }
+
+pub enum CloseDecision {
+    Ready,
+    Wait,
+    Waiting,
+}
+
+pub struct PendingConfigWrite(Arc<AppState>);
+
+impl Drop for PendingConfigWrite {
+    fn drop(&mut self) {
+        self.0.pending_config_writes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 pub struct ManagedState(pub Arc<AppState>);
 impl AppState {
@@ -93,9 +114,39 @@ impl AppState {
             .ok_or_else(|| AppError::new("no_library", "Ouvrez une bibliothèque."))
     }
     pub fn busy(&self) -> AppResult<bool> {
-        Ok(lock(&self.jobs)?
-            .values()
-            .any(|entry| matches!(entry.job.status.as_str(), "queued" | "running")))
+        Ok(self.pending_config_writes.load(Ordering::SeqCst) > 0
+            || lock(&self.jobs)?
+                .values()
+                .any(|entry| matches!(entry.job.status.as_str(), "queued" | "running")))
+    }
+
+    pub fn register_config_write(self: &Arc<Self>) -> AppResult<PendingConfigWrite> {
+        let _lifecycle = lock(&self.lifecycle_gate)?;
+        self.ensure_running()?;
+        self.pending_config_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(PendingConfigWrite(self.clone()))
+    }
+
+    pub fn ensure_running(&self) -> AppResult<()> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(AppError::new(
+                "closing",
+                "Edge Lock termine les tâches avant de se fermer.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn request_close(&self) -> AppResult<CloseDecision> {
+        let _lifecycle = lock(&self.lifecycle_gate)?;
+        let already_closing = self.closing.swap(true, Ordering::SeqCst);
+        if !self.busy()? {
+            Ok(CloseDecision::Ready)
+        } else if already_closing {
+            Ok(CloseDecision::Waiting)
+        } else {
+            Ok(CloseDecision::Wait)
+        }
     }
 }
 
@@ -111,6 +162,53 @@ pub fn test_state(library: Arc<Library>) -> AppState {
         previews: Mutex::new(PreviewResources::default()),
         watcher: Mutex::new(None),
         watcher_generation: std::sync::atomic::AtomicU64::new(0),
+        lifecycle_gate: Mutex::new(()),
+        pending_config_writes: AtomicUsize::new(0),
         closing: AtomicBool::new(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submitted_config_writes_keep_close_waiting_until_the_guard_is_released() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_state(Arc::new(Library::open(root.path()).unwrap())));
+        let pending = state.register_config_write().unwrap();
+        assert!(state.busy().unwrap());
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Wait
+        ));
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Waiting
+        ));
+        assert!(matches!(state.register_config_write(), Err(error) if error.code == "closing"));
+        drop(pending);
+        assert!(!state.busy().unwrap());
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Ready
+        ));
+    }
+
+    #[test]
+    fn a_failed_operation_releases_its_pending_write_and_idle_close_rejects_new_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(test_state(Arc::new(Library::open(root.path()).unwrap())));
+        let result: AppResult<()> = (|| {
+            let _pending = state.register_config_write()?;
+            Err(AppError::new("test", "Échec injecté"))
+        })();
+        assert!(result.is_err());
+        assert!(!state.busy().unwrap());
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Ready
+        ));
+        assert!(matches!(state.register_config_write(), Err(error) if error.code == "closing"));
     }
 }

@@ -29,7 +29,9 @@ Le rendu conserve les textures, UV, transparences et matériaux pris en charge p
 
 Le choix explicite d’un GLB d’aperçu du travail courant est mémorisé dans le cache pour la fiche et sa vignette, sans modifier le fichier principal ni les versions. Un changement de configuration ou la disparition du GLB invalide ce choix. Les aperçus historiques restent indépendants.
 
-L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. **Analyser la source** actualise explicitement la géométrie, les scènes, les collections et les dépendances de la source enregistrée. **Enregistrer les réglages** conserve le fichier principal, la scène, la collection et les options d’export ; ce bouton ne sauvegarde pas le fichier Blender et ne crée aucune version.
+L’analyse affiche objets maillés, sommets, arêtes, faces et triangles. Les arêtes Blender correspondent aux maillages évalués ; celles d’un GLB correspondent à sa topologie exportée, généralement triangulée. Un compte trop coûteux reste indisponible (« — arêtes ») sans empêcher l’aperçu. Une analyse Blender existante conserve la priorité sur les statistiques d’un GLB voisin ; leur origine est indiquée. **Analyser la source** actualise explicitement la géométrie, les scènes, les collections et les dépendances de la source enregistrée.
+
+Les réglages de source et d’export sont enregistrés automatiquement : immédiatement pour les listes et cases, à la sortie du champ ou avec Entrée pour les champs texte Scène et Collection. Les actions qui utilisent la source attendent la sauvegarde ; une erreur conserve la saisie et propose **Réessayer**. La sauvegarde des réglages ne sauvegarde pas le fichier Blender et ne crée aucune version. Les anciennes versions restent en lecture seule.
 
 Pour un `.blend`, choisir le fichier principal, éventuellement une scène et une collection racine. Les sous-collections sont incluses. L’application des modificateurs à l’export est désactivée par défaut pour préserver les shape keys et animations compatibles avec glTF. Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
 
@@ -51,6 +53,10 @@ Le fichier GLB final est écrit hors de la bibliothèque, avec confirmation avan
 - Aucune suppression définitive ni récupération automatique d’espace historique. L’historique local ne remplace pas une sauvegarde sur un autre support.
 
 Voir [le format de stockage et la sauvegarde](docs/storage.md), [l’architecture](docs/architecture.md) et [les validations réellement exécutées](docs/validation.md).
+
+## Identité visuelle
+
+L’interface utilise des surfaces bleu ardoise, des boutons bleu ciel avec reflets et des indicateurs actifs roses. Le logo source `Edge-Lock-Icon.png` fournit le logo de navigation et les icônes Windows ; `npm run icons` régénère les ressources avant une reconstruction Tauri. La police Space Grotesk est embarquée localement, sous licence SIL Open Font License fournie dans `public/fonts/` ; aucun service de polices distant n’est sollicité. Les chemins et extraits de code conservent une police monospace.
 
 ## Développement
 

@@ -4,7 +4,7 @@ mod preview_resources;
 mod settings;
 mod state;
 
-use state::{AppState, ManagedState};
+use state::{AppState, CloseDecision, ManagedState};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -59,6 +59,8 @@ pub fn run() {
                 previews: Mutex::new(preview_resources::PreviewResources::default()),
                 watcher: Mutex::new(None),
                 watcher_generation: std::sync::atomic::AtomicU64::new(0),
+                lifecycle_gate: Mutex::new(()),
+                pending_config_writes: std::sync::atomic::AtomicUsize::new(0),
                 closing: std::sync::atomic::AtomicBool::new(false),
             })));
             Ok(())
@@ -66,10 +68,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<ManagedState>().0.clone();
-                if state.busy().unwrap_or(false) {
-                    api.prevent_close();
-                    use std::sync::atomic::Ordering;
-                    if !state.closing.swap(true, Ordering::SeqCst) {
+                match state.request_close() {
+                    Ok(CloseDecision::Ready) => {}
+                    Ok(CloseDecision::Waiting) | Err(_) => api.prevent_close(),
+                    Ok(CloseDecision::Wait) => {
+                        api.prevent_close();
+                        use std::sync::atomic::Ordering;
                         if let Ok(jobs) = state.jobs.lock() {
                             for entry in jobs.values() {
                                 entry.cancelled.store(true, Ordering::Relaxed);
@@ -77,9 +81,9 @@ pub fn run() {
                         }
                         let window = window.clone();
                         std::thread::spawn(move || {
-                            // Let workers terminate Blender and finish any atomic publication
-                            // before the application process exits.
-                            while state.busy().unwrap_or(false) {
+                            // Finish submitted configuration writes and let workers terminate
+                            // Blender and atomic publications before the process exits.
+                            while state.busy().unwrap_or(true) {
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                             let _ = window.close();

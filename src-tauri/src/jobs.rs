@@ -78,16 +78,12 @@ impl JobRequest {
 }
 
 pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppResult<String> {
-    if state.closing.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(AppError::new(
-            "closing",
-            "Edge Lock termine les tâches avant de se fermer.",
-        ));
-    }
-    let library = state.library()?;
     let id = uuid::Uuid::new_v4().to_string();
     let cancelled = Arc::new(AtomicBool::new(false));
-    {
+    let library = {
+        let _lifecycle = lock(&state.lifecycle_gate)?;
+        state.ensure_running()?;
+        let library = state.library()?;
         let mut jobs = lock(&state.jobs)?;
         if jobs
             .values()
@@ -116,7 +112,8 @@ pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppRe
                 },
             },
         );
-    }
+        library
+    };
     let job_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let progress_state = state.clone();

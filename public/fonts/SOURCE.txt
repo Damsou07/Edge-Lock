@@ -1,0 +1,10 @@
+Space Grotesk variable font, by Florian Karsten.
+
+Upstream: https://github.com/floriankarsten/space-grotesk
+Revision: 03507d024a01282884232081fc6011c09ff4e849
+Original path: fonts/woff2/SpaceGrotesk[wght].woff2
+Downloaded without modification; renamed to space-grotesk-variable.woff2.
+Weight range: 300-700. Contains the full upstream Latin character coverage.
+
+Licence: SIL Open Font License 1.1, reproduced in OFL-Space-Grotesk.txt.
+The font is served locally. The application makes no request to a font CDN.

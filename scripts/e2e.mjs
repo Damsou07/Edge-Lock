@@ -194,6 +194,283 @@ async function screenshot(name) {
   return base64;
 }
 
+async function clickSelector(selector) {
+  const element = await request("POST", `/session/${session}/element`, {
+    using: "css selector",
+    value: selector,
+  });
+  await request(
+    "POST",
+    `/session/${session}/element/${element["element-6066-11e4-a52e-4f735466cecf"]}/click`,
+    {},
+  );
+}
+
+let viewportEmulated = false;
+async function viewport(width, height) {
+  if (viewportEmulated) {
+    await request("POST", `/session/${session}/ms/cdp/execute`, {
+      cmd: "Emulation.clearDeviceMetricsOverride",
+      params: {},
+    });
+    viewportEmulated = false;
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const size = await script(
+      "return {width: innerWidth, height: innerHeight};",
+    );
+    if (size.width === width && size.height === height) return;
+    const rect = await request("GET", `/session/${session}/window/rect`);
+    await request("POST", `/session/${session}/window/rect`, {
+      width: rect.width + width - size.width,
+      height: rect.height + height - size.height,
+    });
+  }
+  // Windows rounds the minimum native window width at fractional DPI. Keep
+  // the CSS test viewport exact without changing production window limits.
+  await request("POST", `/session/${session}/ms/cdp/execute`, {
+    cmd: "Emulation.setDeviceMetricsOverride",
+    params: { width, height, deviceScaleFactor: 0, mobile: false },
+  });
+  viewportEmulated = true;
+  assert.deepEqual(
+    await script("return {width: innerWidth, height: innerHeight};"),
+    { width, height },
+  );
+}
+
+async function assertTheme() {
+  await until(() =>
+    script(`return Array.from(document.fonts).some(font =>
+    font.family.includes('Space Grotesk') && font.status === 'loaded');`),
+  );
+  const theme = await script(`
+    const logo = document.querySelector('.brand img');
+    const brandText = document.querySelector('.brand > div');
+    const sidebar = document.querySelector('.sidebar').getBoundingClientRect();
+    const dot = document.querySelector('.live-dot');
+    const main = document.querySelector('.main-area');
+    return {
+      viewport: {width: innerWidth, height: innerHeight},
+      font: getComputedStyle(document.body).fontFamily,
+      background: getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
+      logo: { loaded: logo.complete && logo.naturalWidth > 0, width: logo.getBoundingClientRect().width },
+      brandFits: brandText.getBoundingClientRect().right <= sidebar.right,
+      dot: dot ? getComputedStyle(dot).backgroundColor : null,
+      overflow: document.documentElement.scrollWidth > innerWidth || main.scrollWidth > main.clientWidth,
+    };
+  `);
+  assert.match(theme.font, /Space Grotesk/);
+  assert.equal(theme.background, "#172a3e");
+  assert.equal(theme.logo.loaded, true);
+  assert.equal(
+    theme.logo.width,
+    theme.viewport.width <= 860 ? 46 : theme.viewport.width <= 1080 ? 50 : 56,
+  );
+  assert.equal(
+    theme.brandFits,
+    true,
+    "The enlarged logo and wordmark must fit the sidebar.",
+  );
+  assert.equal(theme.dot, "rgb(238, 38, 143)");
+  assert.equal(
+    theme.overflow,
+    false,
+    "The document and main area must not overflow horizontally.",
+  );
+  return theme;
+}
+
+async function assertBlueButton(selector, capture) {
+  await script(
+    "document.querySelector(arguments[0]).scrollIntoView({block: 'center'});",
+    [selector],
+  );
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "pointer",
+        id: "theme",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: 2, y: 2 },
+        ],
+      },
+    ],
+  });
+  const read = () =>
+    script(
+      `
+    const el = document.querySelector(arguments[0]), s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return { gradient: s.backgroundImage, color: s.color, width: r.width, height: r.height,
+      x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2),
+      disabled: el.disabled, outline: s.outlineStyle };
+  `,
+      [selector],
+    );
+  const idle = await read();
+  assert.match(idle.gradient, /linear-gradient/);
+  assert.equal(idle.disabled, false);
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "pointer",
+        id: "theme",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          {
+            type: "pointerMove",
+            duration: 0,
+            origin: "viewport",
+            x: idle.x,
+            y: idle.y,
+          },
+        ],
+      },
+    ],
+  });
+  // Sample during and after the transition: the gradient must never disappear.
+  for (let index = 0; index < 4; index++) {
+    const hovered = await read();
+    assert.equal(hovered.gradient, idle.gradient);
+    assert.equal(hovered.color, idle.color);
+    assert.equal(hovered.width, idle.width);
+    assert.equal(hovered.height, idle.height);
+  }
+  await screenshot(capture);
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "pointer",
+        id: "theme",
+        parameters: { pointerType: "mouse" },
+        actions: [{ type: "pointerDown", button: 0 }],
+      },
+    ],
+  });
+  const active = await read();
+  assert.equal(active.gradient, idle.gradient);
+  assert.equal(active.width, idle.width);
+  assert.equal(active.height, idle.height);
+  await screenshot(capture.replace("hover", "active"));
+  // Release outside the button so the style check never launches an export or Blender.
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "pointer",
+        id: "theme",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: 2, y: 2 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ],
+  });
+  await script("document.querySelector(arguments[0]).focus();", [selector]);
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "key",
+        id: "theme-keyboard",
+        actions: [
+          { type: "keyDown", value: "\uE012" },
+          { type: "keyUp", value: "\uE012" },
+        ],
+      },
+    ],
+  });
+  assert.notEqual((await read()).outline, "none");
+  return idle;
+}
+
+async function testVisualRefreshAndAutosave(variantId) {
+  report.visualRefresh = {};
+  for (const [width, height] of [
+    [1440, 940],
+    [1024, 700],
+  ]) {
+    await viewport(width, height);
+    report.visualRefresh[width] = await assertTheme();
+    await screenshot(`ui-${width}-detail.png`);
+    await clickText("Fichiers");
+    await script(
+      "document.querySelector('.asset-bottom-panel').scrollIntoView({block:'end'});",
+    );
+    await screenshot(`ui-${width}-table.png`);
+    await clickText("Organiser");
+    await screenshot(`ui-${width}-modal.png`);
+    assert.equal(
+      await script(
+        "const r=document.querySelector('dialog[open]').getBoundingClientRect(); return r.left>=0 && r.right<=innerWidth;",
+      ),
+      true,
+    );
+    await clickSelector('dialog[open] [aria-label="Fermer"]');
+    await clickText("Retour à la bibliothèque");
+    await waitForThumbnail("Éclaireur");
+    await assertTheme();
+    await screenshot(`ui-${width}-grid.png`);
+    await clickSelector('[aria-label="Vue liste"]');
+    await screenshot(`ui-${width}-list.png`);
+    await assertTheme();
+    await clickSelector('[aria-label="Vue grille"]');
+    await clickText("Éclaireur");
+    await waitForModel("model.glb");
+  }
+  await viewport(1440, 940);
+  const primary = await assertBlueButton(
+    ".detail-heading .button.primary",
+    "ui-primary-hover.png",
+  );
+  const blender = await assertBlueButton(
+    ".blender-button",
+    "ui-blender-hover.png",
+  );
+  assert.equal(blender.gradient, primary.gradient);
+  assert.equal(blender.color, primary.color);
+  assert.equal(
+    await script(`return document.body.innerText.includes('Enregistrer les réglages') ||
+    document.body.innerText.includes('Ces réglages définissent la source');`),
+    false,
+  );
+  await clickSelector('.config-form input[type="checkbox"]');
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: variantId })).variant.config
+        .applyModifiers,
+  );
+  await until(() =>
+    script(
+      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
+    ),
+  );
+  await clickText("Retour à la bibliothèque");
+  await clickText("Éclaireur");
+  await until(() =>
+    script(
+      'return document.querySelector(".config-form input[type=checkbox]")?.checked;',
+    ),
+  );
+  await waitForModel("model.glb");
+  // Restore the fixture before the existing version/configuration scenarios.
+  await clickSelector('.config-form input[type="checkbox"]');
+  await until(
+    async () =>
+      !(await invoke("get_variant", { id: variantId })).variant.config
+        .applyModifiers,
+  );
+  await until(() =>
+    script(
+      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
+    ),
+  );
+  await waitForModel("model.glb");
+  report.checks.push(
+    "Thème bleu glass à 1440/1024 px : police locale, logo agrandi, points roses, grille/liste/tableau/modales et survol bleu sans flash ni déplacement ; sauvegarde automatique persistée après réouverture",
+  );
+}
+
 async function assertTexturePixels(selector, name) {
   const base64 = await screenshot(name);
   const result = await request("POST", `/session/${session}/execute/async`, {
@@ -914,6 +1191,8 @@ try {
   await until(() =>
     script('return document.body.innerText.includes("Choisir un dossier");'),
   );
+  await viewport(1440, 940);
+  await assertTheme();
   await screenshot("01-onboarding.png");
   const opened = await invoke("open_library", { path: library });
   assert.equal(opened.assetCount, 0);
@@ -1012,6 +1291,7 @@ try {
     ".viewer-canvas",
     "03-viewer.png",
   );
+  await testVisualRefreshAndAutosave(main.id);
   report.checks.push(
     "Texture PNG rouge et verte réellement visible dans la vignette statique et dans l’aperçu automatique, contrôlée par pixels des captures WebDriver",
   );
@@ -1268,6 +1548,24 @@ try {
       "Blender réel via Tauri : détection principale, collection12 triangles, aperçu/export, source inchangée et création native de projet",
     );
   }
+  if (await script('return !!document.querySelector(".workspace-panel");'))
+    await clickText("Retour à la bibliothèque");
+  await waitForThumbnail("Éclaireur");
+  await clickText("Éclaireur");
+  await waitForModel("model.glb");
+  await clickSelector('.config-form input[type="checkbox"]');
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: main.id })).variant.config
+        .applyModifiers,
+  );
+  await until(() =>
+    script(
+      'return !document.querySelector(".config-form input[type=checkbox]").disabled;',
+    ),
+  );
+  await clickText("Retour à la bibliothèque");
+  await waitForThumbnail("Éclaireur");
   const thumbnailCacheBeforeRestart = (
     await fileManifest(join(library, "cache", "thumbnails"))
   ).filter((entry) => entry.kind === "file" && entry.path.endsWith(".png"));
@@ -1277,6 +1575,11 @@ try {
   await newSession();
   const saved = await invoke("get_asset", { id: imported.asset.id });
   assert.equal(saved.variants.length, 2);
+  assert.equal(
+    saved.variants.find((variant) => variant.id === main.id).config
+      .applyModifiers,
+    true,
+  );
   assert.deepEqual(saved.asset.tags, ["prototype", "robot"]);
   const history = await invoke("list_snapshots", {
     variantId: main.id,
@@ -1332,8 +1635,23 @@ try {
     script('return document.body.innerText.includes("Textures et rapport");'),
   );
   await screenshot("04-history.png");
+  await clickText("Consulter");
+  await until(() =>
+    script('return !!document.querySelector(".history-banner");'),
+  );
+  assert.equal(
+    await script('return document.querySelector(".blender-button").disabled;'),
+    true,
+  );
+  assert.equal(
+    await script(
+      'return Array.from(document.querySelectorAll(".config-form input,.config-form select")).every(el=>el.disabled);',
+    ),
+    true,
+  );
+  await screenshot("ui-history-readonly.png");
   report.checks.push(
-    "Redémarrage : vignette texturée persistante réutilisée sans réécriture, classement, variantes et historique conservés",
+    "Redémarrage : réglage sauvegardé automatiquement conservé, vignette texturée persistante réutilisée sans réécriture, classement, variantes et historique conservés",
   );
   report.status = "passed";
   console.log(JSON.stringify(report, null, 2));

@@ -1,8 +1,46 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le bilan du 2 novembre 2026 concerne les aperçus automatiques texturés et les vignettes. Le bilan du 1er novembre est conservé plus bas comme historique ; ses mesures, binaires et hashes ne décrivent pas la nouvelle livraison.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne la refonte visuelle et la sauvegarde automatique des réglages. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas la nouvelle livraison.
 
-## Actualisation — 2 novembre 2026
+## Refonte visuelle et sauvegarde automatique — 2 novembre 2026
+
+### TDD et contrôles automatisés
+
+- **79 tests frontend passent dans huit fichiers**, dont 32 pour la fiche d’asset. Cinq échecs ont été observés avant l’implémentation de la sauvegarde automatique, puis deux nouvelles régressions ont reproduit des réponses `getVariant` périmées avant leur correction. Les cas couvrent sauvegarde immédiate des choix, blur/Entrée, absence d’écriture inutile, configuration canonique, erreur/réessai, navigation, historique et invalidation des résultats obsolètes.
+- **60 tests Rust ordinaires passent**, dont quatre nouveaux tests de cycle de vie : fermeture attendant une écriture soumise, refus de nouvelles écritures pendant fermeture, libération de la garde après erreur et contrôle de la bibliothèque cible.
+- **12 intégrations Blender 5.1.1 passent** avec `--ignored` : huit scénarios du worker et quatre du cache. Les **deux tests Node** des fixtures de texture passent également.
+- ESLint, TypeScript, Prettier, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all --check` et le build frontend passent. Les builds Tauri debug et release finaux et l’empaquetage NSIS passent.
+
+Pour les tests Rust locaux dans cet environnement restreint, `TEMP` et `TMP` ont été dirigés vers `.test-data/native-tests` : le dossier temporaire système refusait les écritures des tests de persistance. Les avertissements de cache incrémental Rust indiquent une copie à la place des liens physiques ; ils n’ont pas empêché les vérifications.
+
+### Interface et parcours desktop réels
+
+Le rapport final `.test-data/desktop-Vz0XNV/report.json` porte **`status: passed` pour douze parcours**, avec bibliothèque, réglages et profil WebView2 jetables. Il a été produit après reconstruction du binaire avec la correction finale des réponses obsolètes.
+
+- Captures examinées en **1440 × 940** et **1024 × 700 pixels CSS** : grille, liste, fiche, tableau et modale. Aucun débordement horizontal ; logo et nom tiennent dans la barre latérale. Windows arrondissant la largeur native minimale à 125 % de DPI, le test utilise au besoin l’émulation de viewport du pilote pour obtenir exactement 1024 pixels CSS, sans modifier les contraintes de la fenêtre de production.
+- Space Grotesk est effectivement chargée depuis la ressource locale ; le logo mesure respectivement 56 et 50 pixels. Les points actifs sont roses. Les captures de survol et de clic montrent les mêmes dimensions et le même gradient ; le focus clavier reste visible. Le bouton Blender partage le style bleu des boutons primaires.
+- Le bouton de sauvegarde manuelle et son paragraphe ont disparu. Une modification par la case de réglage est persistée, conservée après réouverture puis après redémarrage. Les contrôles des versions historiques et le bouton Blender y restent désactivés.
+- Import, versions, variantes, export protégé, textures PNG en buffer et data URI, commandes de la visionneuse et opérations Blender réelles passent. Les fichiers sources des fixtures restent intacts.
+- Dix allers-retours conservent au maximum un contexte WebGL dans la fiche et zéro dans la galerie ; aucune URL blob ne subsiste après retour. Les images persistantes sont réutilisées après redémarrage sans réécriture.
+
+Sur le dernier passage synthétique, l’ouverture de fiche à chaud prend une médiane de **951 ms**, le retour galerie **701 ms**, et les vignettes en cache de la page de 36 cartes apparaissent en **529 ms**. Douze cartes sont visibles à cette taille de fenêtre. La préparation froide varie entre **9,6 s et 21,9 s** sur les deux passages de validation ; ces observations ne constituent ni une garantie de débit ni une comparaison contrôlée avec les anciens bilans. Aucun benchmark de modèle réel lourd n’a été ajouté.
+
+### Ressources et compatibilité
+
+`npm run icons` a régénéré les ressources Windows depuis `Edge-Lock-Icon.png`. L’icône 32 × 32 extraite du binaire debug final est identique pixel par pixel au PNG généré ; le PNG public est identique au logo source. La police WOFF2 officielle de 49 256 octets est livrée avec licence et provenance dans `public/fonts/`. Aucun changement de schéma ou de signature IPC n’a été nécessaire.
+
+Les artefacts release reconstruits ont été inspectés : nom de produit **Edge Lock**, versions fichier et produit **0.1.0**, application PE x64 (`0x8664`) et bootstrap NSIS PE x86 (`0x014C`) embarquant l’application x64. L’icône extraite du binaire release est également identique pixel par pixel au PNG généré. Le téléchargement NSIS initialement refusé par l’environnement restreint a réussi après autorisation réseau ; l’empaquetage final est terminé.
+
+| Artefact | Taille en octets | SHA-256 |
+| --- | --- | --- |
+| `target/automatic-preview/release/edge-lock.exe` | 16 603 648 | `3D0A013F5F2504E39C0EFFAAF009BCD64A2D0E917DC9355532BD21E2B587336A` |
+| `target/automatic-preview/release/bundle/nsis/Edge Lock_0.1.0_x64-setup.exe` | 6 345 374 | `2BDE848C96699243B946DF6828288F1FFA7A34488151020496DAD2BCC4798F00` |
+
+Le rapport local d’inspection est `.test-data/visual-refresh-release-verification.json`.
+
+L’installation et la mise à niveau en VM jetable ou Windows Sandbox ne sont pas exécutées sur ce poste. Aucun installateur n’est lancé sur l’installation personnelle.
+
+## Bilan précédent : aperçus et vignettes — 2 novembre 2026
 
 ### Vérifications exécutées
 
