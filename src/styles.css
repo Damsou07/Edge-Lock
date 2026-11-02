@@ -103,11 +103,42 @@ textarea::placeholder {
   color: var(--subtle);
 }
 input[type="checkbox"] {
+  appearance: none;
   width: 15px;
   height: 15px;
   margin: 0;
-  accent-color: var(--accent);
+  padding: 0;
+  border: 1.5px solid #fb5bae;
+  border-radius: 3px;
+  background: var(--input);
+  cursor: pointer;
   flex-shrink: 0;
+}
+input[type="checkbox"]:checked {
+  background-color: #c31470;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m3 8 3.2 3.2L13 4.5' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: #ffb4dc;
+  box-shadow: 0 0 0 2px #ee268f33;
+}
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+@media (forced-colors: active) {
+  input[type="checkbox"] {
+    appearance: auto;
+    border: revert;
+    background: revert;
+  }
+  input[type="checkbox"]:checked {
+    background: revert;
+  }
 }
 input[type="range"] {
   padding: 0;
@@ -161,20 +192,20 @@ code {
 }
 .brand {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
-  padding: 0 7px 26px;
+  padding: 0 3px 26px;
 }
 .brand img {
-  height: 56px;
-  width: 56px;
+  height: 64px;
+  width: 64px;
   flex-shrink: 0;
   border-radius: 14px;
   object-fit: contain;
-  border: 1px solid #75d8ff80;
+  border: 1px solid #a2e7ffc0;
   box-shadow:
-    0 0 16px #35b9f226,
-    0 5px 20px #ee268f15;
+    0 0 18px #35b9f24d,
+    0 5px 20px #ee268f26;
 }
 .brand > div {
   min-width: 0;
@@ -301,7 +332,7 @@ code {
   padding: 2px 6px;
   background: #38506a;
   border-radius: 4px;
-  color: #b8dbff;
+  color: var(--pink-text);
 }
 .nav-section-heading {
   display: flex;
@@ -413,7 +444,7 @@ code {
 }
 .eyebrow {
   display: block;
-  color: var(--blue);
+  color: var(--pink-text);
   font-size: 9px;
   font-weight: 650;
   letter-spacing: 1.8px;
@@ -430,7 +461,7 @@ code {
 }
 .heading-count {
   background: var(--glass-raised);
-  color: var(--muted);
+  color: var(--pink-text);
   border: 1px solid var(--border-soft);
   border-radius: 6px;
   padding: 2px 7px;
@@ -2171,8 +2202,8 @@ legend {
     gap: 8px;
   }
   .brand img {
-    width: 50px;
-    height: 50px;
+    width: 54px;
+    height: 54px;
     border-radius: 12px;
   }
   .brand strong {
@@ -2267,8 +2298,8 @@ legend {
     width: 190px;
   }
   .brand img {
-    width: 46px;
-    height: 46px;
+    width: 49px;
+    height: 49px;
   }
   .brand strong {
     font-size: 13px;

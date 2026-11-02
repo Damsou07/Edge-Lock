@@ -66,7 +66,7 @@ Voir [le format de stockage et la sauvegarde](docs/storage.md), [l’architectur
 
 ## Identité visuelle
 
-L’interface utilise des surfaces bleu ardoise, des boutons bleu ciel avec reflets et des indicateurs actifs roses. Le logo source `Edge-Lock-Icon.png` fournit le logo de navigation et les icônes Windows ; `npm run icons` régénère les ressources avant une reconstruction Tauri. La police Space Grotesk est embarquée localement, sous licence SIL Open Font License fournie dans `public/fonts/` ; aucun service de polices distant n’est sollicité. Les chemins et extraits de code conservent une police monospace.
+L’interface utilise des surfaces bleu ardoise, des boutons bleu ciel avec reflets et des accents roses sur les indicateurs, les cases à cocher et certains libellés. Le logo de navigation est adapté à la largeur de la barre latérale et l’icône de manette identifie les projets de jeu. Le logo source `Edge-Lock-Icon.png` fournit le logo de navigation et les icônes Windows ; `npm run icons` régénère les ressources avant une reconstruction Tauri. La police Space Grotesk est embarquée localement, sous licence SIL Open Font License fournie dans `public/fonts/` ; aucun service de polices distant n’est sollicité. Les chemins et extraits de code conservent une police monospace.
 
 ## Développement
 

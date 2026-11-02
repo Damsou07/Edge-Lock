@@ -1,6 +1,13 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne le cadrage des aperçus 3D de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette correction.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne les ajustements visuels de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette correction.
+
+## Ajustements visuels — 0.2.0 — 2 novembre 2026
+
+- Les 102 tests frontend passent, dont deux nouveaux scénarios de sélection des projets et d’archivage au clavier et par leurs libellés. Le lint, la vérification Prettier et le build frontend réussissent avec Node 26.13.0.
+- Le build Tauri debug et le parcours WebView2 sur bibliothèque et réglages jetables réussissent (`.test-data/desktop-ue3Dl6/report.json`). Le benchmark de galerie à 50 imports a été explicitement ignoré ; aucune fixture personnelle n’a été utilisée.
+- Les captures de la galerie, de la fiche et de la modale ont été examinées à 1440, 1024 et 860 pixels de largeur : logo et texte sans débordement, manette visible et cases cochée et décochée distinctes. La largeur de 860 pixels est émulée, car la fenêtre native impose un minimum de 1024 pixels.
+- La navigation au clavier et le changement des cases sont couverts par les tests frontend. Le mode couleurs forcées et l’état désactivé n’ont pas fait l’objet d’une inspection visuelle dédiée.
 
 ## Cadrage des aperçus 3D — 0.2.0 — 2 novembre 2026
 

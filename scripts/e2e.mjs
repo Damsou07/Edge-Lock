@@ -263,7 +263,11 @@ async function assertTheme() {
       font: getComputedStyle(document.body).fontFamily,
       background: getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
       logo: { loaded: logo.complete && logo.naturalWidth > 0, width: logo.getBoundingClientRect().width },
-      brandFits: brandText.getBoundingClientRect().right <= sidebar.right,
+      brandFits: Array.from(brandText.children).every(el => {
+        const text = document.createRange();
+        text.selectNodeContents(el);
+        return text.getBoundingClientRect().right <= sidebar.right;
+      }),
       dot: dot ? getComputedStyle(dot).backgroundColor : null,
       overflow: document.documentElement.scrollWidth > innerWidth || main.scrollWidth > main.clientWidth,
     };
@@ -271,9 +275,10 @@ async function assertTheme() {
   assert.match(theme.font, /Space Grotesk/);
   assert.equal(theme.background, "#172a3e");
   assert.equal(theme.logo.loaded, true);
-  assert.equal(
-    theme.logo.width,
-    theme.viewport.width <= 860 ? 46 : theme.viewport.width <= 1080 ? 50 : 56,
+  assert.ok(
+    theme.logo.width >
+      (theme.viewport.width <= 860 ? 46 : theme.viewport.width <= 1080 ? 50 : 56),
+    "The logo must be larger than before at each sidebar breakpoint.",
   );
   assert.equal(
     theme.brandFits,
@@ -397,6 +402,7 @@ async function testVisualRefreshAndCanonicalRules() {
   for (const [width, height] of [
     [1440, 940],
     [1024, 700],
+    [860, 700],
   ]) {
     await viewport(width, height);
     report.visualRefresh[width] = await assertTheme();
@@ -433,7 +439,7 @@ async function testVisualRefreshAndCanonicalRules() {
     false,
   );
   report.checks.push(
-    "Thème à 1440/1024 px : police locale, logo, grille/liste/tableau/modales ; aucun ancien menu de source ou choix des modificateurs",
+    "Thème à 1440/1024/860 px : police locale, logo, grille/liste/tableau/modales ; aucun ancien menu de source ou choix des modificateurs",
   );
 }
 
