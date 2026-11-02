@@ -6,6 +6,14 @@ Edge Lock est une application desktop Windows pour centraliser des dossiers d’
 
 L’installateur **0.2.0 x64** est produit dans `target/release/bundle/nsis/Edge Lock_0.2.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque reste séparée de l’application. WebView2 est requis. Blender est nécessaire pour importer, créer et synchroniser les projets ; un aperçu déjà synchronisé peut être relu sans lancer Blender.
 
+Pour générer un nouvel installateur à partir des fichiers locaux actuels, y compris les modifications non commitées, exécuter depuis PowerShell à la racine du projet :
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1
+```
+
+Le script nécessite les prérequis de développement ci-dessous et les dépendances installées par `npm ci`. Il reconstruit l’application et l’installateur NSIS x64, vérifie leur version et affiche le chemin absolu de l’installateur ainsi que son SHA-256. Il utilise `CARGO_TARGET_DIR` si cette variable est définie. La génération ne lance pas l’installation : ouvrir l’installateur produit pour installer ou mettre à jour Edge Lock.
+
 Les contrôles réellement exécutés et leurs limites sont détaillés dans [le bilan de validation](docs/validation.md). L’installation sur le poste personnel ne fait pas partie de ces contrôles.
 
 ## Utilisation

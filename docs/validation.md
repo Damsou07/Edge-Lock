@@ -1,6 +1,12 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne les ajustements visuels de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette correction.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne le script de génération d’installateur de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette génération.
+
+## Génération de l’installateur — 0.2.0 — 2 novembre 2026
+
+Le script `scripts/build-installer.ps1` a construit l’interface, l’exécutable release et l’installateur NSIS x64. L’exécutable et l’installateur indiquent tous deux Edge Lock 0.2.0. L’installateur produit pèse 6 406 082 octets et son SHA-256 est `D411DBE7FB4091B6EEE085BF3C5E1196EA8B1405543BD8DA89E9538D788B995E`. Sa construction a nécessité l’accès aux outils NSIS hors du bac à sable réseau.
+
+La syntaxe PowerShell et le message d’échec en l’absence des dépendances npm ont été vérifiés. Une première tentative a échoué lors de l’accès réseau à NSIS et le script a bien signalé l’échec ; la relance a réussi. L’installation et la mise à niveau dans une VM ou Windows Sandbox n’ont pas été exécutées pour cette génération.
 
 ## Ajustements visuels — 0.2.0 — 2 novembre 2026
 
