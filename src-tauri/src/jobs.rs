@@ -24,13 +24,14 @@ use tauri::{AppHandle, Emitter};
     rename_all_fields = "camelCase"
 )]
 pub enum JobRequest {
+    StorageDiagnostic,
     StoragePlan {
-        variant_id: String,
+        variant_id: Option<String>,
         action: StorageAction,
         snapshot_id: Option<String>,
     },
     StorageApply {
-        variant_id: String,
+        variant_id: Option<String>,
         action: StorageAction,
         snapshot_id: Option<String>,
         plan_token: String,
@@ -81,6 +82,7 @@ pub enum JobRequest {
 impl JobRequest {
     fn kind(&self) -> &str {
         match self {
+            Self::StorageDiagnostic => "storageDiagnostic",
             Self::StoragePlan { .. } => "storagePlan",
             Self::StorageApply { .. } => "storageApply",
             Self::Restore { .. } => "restore",
@@ -218,6 +220,27 @@ fn update_job(app: &AppHandle, state: &AppState, id: &str, update: impl FnOnce(&
     }
 }
 
+fn validate_storage_target(
+    action: StorageAction,
+    variant_id: Option<&str>,
+    snapshot_id: Option<&str>,
+) -> AppResult<()> {
+    if matches!(action, StorageAction::Recompress | StorageAction::Purge) {
+        if snapshot_id.is_some() {
+            return Err(AppError::new(
+                "invalid",
+                "Une action globale ne cible pas une version.",
+            ));
+        }
+    } else if variant_id.is_none() {
+        return Err(AppError::new(
+            "invalid",
+            "Une variante est requise pour cette action historique.",
+        ));
+    }
+    Ok(())
+}
+
 fn runner(state: &AppState) -> AppResult<BlenderRunner> {
     let path = lock(&state.settings)?
         .blender_path
@@ -260,28 +283,49 @@ fn run(
     ctx: &OperationContext,
 ) -> AppResult<Value> {
     match request {
+        JobRequest::StorageDiagnostic => {
+            Ok(serde_json::to_value(library.storage_diagnostic(ctx)?)?)
+        }
         JobRequest::StoragePlan {
             variant_id,
             action,
             snapshot_id,
-        } => Ok(serde_json::to_value(library.preview_storage_action(
-            variant_id,
-            *action,
-            snapshot_id.as_deref(),
-            ctx,
-        )?)?),
+        } => {
+            validate_storage_target(*action, variant_id.as_deref(), snapshot_id.as_deref())?;
+            Ok(serde_json::to_value(
+                if let Some(variant_id) = variant_id {
+                    library.preview_storage_action(
+                        variant_id,
+                        *action,
+                        snapshot_id.as_deref(),
+                        ctx,
+                    )?
+                } else {
+                    library.preview_library_storage_action(*action, ctx)?
+                },
+            )?)
+        }
         JobRequest::StorageApply {
             variant_id,
             action,
             snapshot_id,
             plan_token,
-        } => Ok(serde_json::to_value(library.apply_storage_action(
-            variant_id,
-            *action,
-            snapshot_id.as_deref(),
-            plan_token,
-            ctx,
-        )?)?),
+        } => {
+            validate_storage_target(*action, variant_id.as_deref(), snapshot_id.as_deref())?;
+            Ok(serde_json::to_value(
+                if let Some(variant_id) = variant_id {
+                    library.apply_storage_action(
+                        variant_id,
+                        *action,
+                        snapshot_id.as_deref(),
+                        plan_token,
+                        ctx,
+                    )?
+                } else {
+                    library.apply_library_storage_action(*action, plan_token, ctx)?
+                },
+            )?)
+        }
         JobRequest::Restore {
             variant_id,
             expected_head,
@@ -834,6 +878,45 @@ mod tests {
         let thumbnail: JobRequest =
             serde_json::from_value(json!({"kind":"thumbnail","assetId":"asset"})).unwrap();
         assert!(matches!(thumbnail, JobRequest::Thumbnail {asset_id} if asset_id == "asset"));
+    }
+
+    #[test]
+    fn storage_jobs_work_without_variants_and_reject_local_actions_without_a_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::open(temp.path().join("library")).unwrap());
+        let state = crate::state::test_state(library.clone());
+        let ctx = OperationContext::default();
+        let diagnostic: JobRequest =
+            serde_json::from_value(json!({"kind":"storageDiagnostic"})).unwrap();
+        let report = run(&state, &library, &diagnostic, &ctx).unwrap();
+        assert_eq!(report["complete"], true);
+        for action in ["recompress", "purge"] {
+            let request: JobRequest =
+                serde_json::from_value(json!({"kind":"storagePlan","action":action})).unwrap();
+            let report = run(&state, &library, &request, &ctx).unwrap();
+            let apply: JobRequest = serde_json::from_value(
+                json!({"kind":"storageApply","action":action,"planToken":report["planToken"]}),
+            )
+            .unwrap();
+            assert_eq!(
+                run(&state, &library, &apply, &ctx).unwrap()["releasedBytes"],
+                0
+            );
+            let legacy: JobRequest = serde_json::from_value(
+                json!({"kind":"storagePlan","variantId":"old-client","action":action}),
+            )
+            .unwrap();
+            assert_eq!(
+                run(&state, &library, &legacy, &ctx).unwrap()["planToken"],
+                report["planToken"]
+            );
+        }
+        for action in ["compact", "releaseBackup", "deleteVersion"] {
+            let request: JobRequest =
+                serde_json::from_value(json!({"kind":"storagePlan","action":action})).unwrap();
+            assert!(run(&state, &library, &request, &ctx).is_err());
+        }
+        assert!(validate_storage_target(StorageAction::Purge, None, Some("snapshot")).is_err());
     }
 
     #[test]

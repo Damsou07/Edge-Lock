@@ -1073,21 +1073,9 @@ export function AssetDetailView({
             <div className="history-storage-actions">
               <button
                 className="button secondary small-button"
-                onClick={() => setStorageAction({ action: "recompress" })}
-              >
-                Compresser avec Zstd
-              </button>
-              <button
-                className="button secondary small-button"
                 onClick={() => setStorageAction({ action: "compact" })}
               >
                 Alléger l’ancien historique
-              </button>
-              <button
-                className="button secondary small-button"
-                onClick={() => setStorageAction({ action: "purge" })}
-              >
-                Libérer les objets inutilisés
               </button>
               {variant?.backupSnapshotId && (
                 <>

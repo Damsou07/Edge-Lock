@@ -17,6 +17,31 @@ const report: StorageReport = {
 };
 
 describe("gestion du stockage historique", () => {
+  it("analyse la purge globale sans sélectionner une variante", async () => {
+    const job = vi.fn().mockResolvedValue({ ...report, versions: [] });
+    render(
+      <HistoryStorageModal
+        action="purge"
+        runJob={job as RunJob}
+        onSaved={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByText("Espace récupérable : 400 o");
+    expect(
+      screen.getByText("Portée : toute la bibliothèque"),
+    ).toBeInTheDocument();
+    expect(job).toHaveBeenCalledWith(
+      {
+        kind: "storagePlan",
+        variantId: undefined,
+        action: "purge",
+        snapshotId: undefined,
+      },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(screen.getByText(/Objets de la bibliothèque/)).toBeInTheDocument();
+  });
   it("analyse puis attend une confirmation explicite avant de supprimer des sources", async () => {
     const job = vi
       .fn()

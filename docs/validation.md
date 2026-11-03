@@ -1,6 +1,22 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 3 novembre 2026 concerne le stockage Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les bilans du 3 novembre 2026 concernent le diagnostic global du stockage, Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+
+## Diagnostic global et menu d’optimisation — 3 novembre 2026
+
+La page **Optimisation du stockage** regroupe l’inventaire manuel en lecture seule et les deux actions de portée bibliothèque, compression Zstd et purge des objets connus sans référence. Les actions locales restent dans la fiche d’asset. Le diagnostic parcourt les métadonnées et les références, sans vérifier les contenus ni élargir la purge aux orphelins signalés. Aucune migration et aucun nettoyage du workspace ne sont ajoutés.
+
+**94 tests Rust ordinaires passent**, dont 23 de l’adaptateur Tauri, 12 de l’historique et 5 du diagnostic. Les six tests dédiés au diagnostic passent également avec le test opt-in de jonction Windows réellement exécuté hors sandbox. Ils couvrent les références partagées, brut/Zstd simultanés, candidats encore référencés, orphelins hors candidats, objets absents, fichiers inconnus, journaux, catégories additives, exemples plafonnés, annulation et disparition de dossier donnant un rapport partiel. Les fichiers de test restent sous `.test-data/storage-menu-temp`.
+
+Le contrôle de non-écriture compare les contenus persistants par hash, les tailles et dates de modification ainsi que le contenu SQL logique avant/après. Le contenu de `library.sqlite3-shm` est exclu de cette comparaison : les lectures SQLite WAL peuvent modifier ses read-marks volatils, sans modifier les données du catalogue. Les fichiers verrouillés par Windows sont contrôlés par métadonnées lorsqu’une lecture brute est interdite. Le diagnostic n’effectue aucune écriture applicative, aucun hachage ou décompression des contenus, aucune migration ni récupération.
+
+**115 tests frontend passent dans 14 fichiers**. Les nouveaux scénarios vérifient le lancement manuel, la navigation sans bibliothèque, les rapports partiels, la purge bloquée, l’annulation, les réponses tardives, le changement de bibliothèque, la confirmation sans variante et le rapport à actualiser après optimisation. Le typage TypeScript, ESLint, Clippy du workspace et de toutes ses cibles avec `-D warnings`, le format Rust et le contrôle du diff passent. Prettier passe sur les fichiers frontend concernés hors `App.test.tsx`, dont les écarts antérieurs ne sont pas reformattés dans cette évolution.
+
+Le build Tauri debug sans bundle réussit. Le parcours Windows `.test-data/desktop-WtRKBi/report.json` est **`passed` avec 15 groupes de contrôles**. Sur bibliothèque vide avant tout import, il vérifie navigation, lancement manuel, diagnostic IPC sans variante, catégories additives et comparaison des fichiers gérés hors catalogue SQLite et verrou Windows. Les commandes de compression et purge fonctionnent sans variante. Le parcours historique vérifie le déplacement des boutons, le diagnostic après les opérations locales, la portée affichée dans les confirmations globales et le statut à actualiser après optimisation. Le benchmark de galerie de 50 imports est explicitement omis ; les dix allers-retours et le rendu 3D restent vérifiés. Bibliothèque, réglages et profil WebView sont jetables ; aucune bibliothèque personnelle n’est utilisée.
+
+Les captures `storage-empty-diagnostic.png`, `storage-library-diagnostic.png`, `storage-compression-plan.png`, `storage-diagnostic-stale.png` et `storage-purge-plan.png` ont été examinées : menu lisible sur deux lignes, commandes accessibles, séparation des volumes et confirmation de portée globale. L’exécution du pilote localhost et du test de jonction demande l’accès local hors sandbox. Les tests Blender opt-in complets, le benchmark de stockage et l’installation en VM n’ont pas été réexécutés pour cette évolution ; les résultats de la section suivante restent ceux du chantier précédent.
+
+Le binaire final `target/storage-plan/debug/edge-lock.exe` indique les versions fichier et produit **0.2.0**, mesure **24 854 528 octets** et a pour SHA-256 `26DC885FFA141D97C3888AFD963D1E19E6B9DC1D8934A383E6DB3E97AC8C1530`. Aucun installateur n’est produit pour ce contrôle.
 
 ## Zstd, historique et restauration — 3 novembre 2026
 

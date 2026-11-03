@@ -173,15 +173,16 @@ export interface WorkspaceStatus {
   error: AppError | null;
 }
 export type JobRequest =
+  | { kind: "storageDiagnostic" }
   | {
       kind: "storagePlan";
-      variantId: string;
+      variantId?: string;
       action: StorageAction;
       snapshotId?: string;
     }
   | {
       kind: "storageApply";
-      variantId: string;
+      variantId?: string;
       action: StorageAction;
       snapshotId?: string;
       planToken: string;
@@ -232,5 +233,28 @@ export interface StorageReport {
   reclaimableBytes: number;
   releasedBytes: number;
   versions: { id: string; message: string }[];
+  warnings: string[];
+}
+
+export interface StorageMeasure {
+  fileCount: number;
+  bytes: number;
+}
+export interface StorageDiagnostic {
+  startedAt: string;
+  completedAt: string;
+  complete: boolean;
+  total: StorageMeasure;
+  categories: (StorageMeasure & { key: string; label: string })[];
+  details: {
+    key: string;
+    label: string;
+    count: number;
+    bytes: number;
+    examples: { path: string; size: number }[];
+  }[];
+  logicalObjectBytes: number;
+  purgeAvailable: boolean;
+  purgeBlockedReason: string | null;
   warnings: string[];
 }

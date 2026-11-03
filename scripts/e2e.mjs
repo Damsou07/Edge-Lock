@@ -1061,12 +1061,13 @@ async function fileHash(path) {
   return hash.digest("hex");
 }
 
-async function fileManifest(directory) {
+async function fileManifest(directory, exclude = () => false) {
   const entries = [];
   const visit = async (current, prefix = "") => {
     for (const entry of await readdir(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       const name = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (exclude(name)) continue;
       const before = await lstat(path);
       assert.ok(!before.isSymbolicLink(), `Fixture contains a link: ${name}`);
       if (before.isDirectory()) {
@@ -1186,6 +1187,69 @@ async function testKitsune() {
   }
 }
 
+async function testEmptyLibraryStorage() {
+  const stableManifest = async () =>
+    fileManifest(
+      library,
+      (name) => name === "library.lock" || name.startsWith("library.sqlite3"),
+    );
+  const before = await stableManifest();
+  await clickText("Optimisation du stockage");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('h1')].some(h=>h.textContent==='Optimisation du stockage');",
+    ),
+  );
+  await clickText("Lancer le diagnostic");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('button')].some(b=>b.textContent.includes('Actualiser le diagnostic')&&!b.disabled);",
+    ),
+  );
+  const diagnostic = await job({ kind: "storageDiagnostic" });
+  assert.equal(diagnostic.complete, true);
+  assert.equal(diagnostic.purgeAvailable, true);
+  for (const key of ["objects", "workspaces", "staging", "backups"]) {
+    assert.equal(
+      diagnostic.categories.find((item) => item.key === key).bytes,
+      0,
+    );
+  }
+  assert.equal(
+    diagnostic.categories.reduce((total, item) => total + item.bytes, 0),
+    diagnostic.total.bytes,
+  );
+  assert.equal(
+    diagnostic.categories.reduce((total, item) => total + item.fileCount, 0),
+    diagnostic.total.fileCount,
+  );
+  assert.deepEqual(
+    await stableManifest(),
+    before,
+    "The empty-library diagnostic must not create or change managed storage files outside the locked catalog",
+  );
+  await screenshot("storage-empty-diagnostic.png");
+  for (const action of ["recompress", "purge"]) {
+    const plan = await job({ kind: "storagePlan", action });
+    assert.equal(plan.reclaimableBytes, 0);
+    const result = await job({
+      kind: "storageApply",
+      action,
+      planToken: plan.planToken,
+    });
+    assert.equal(result.releasedBytes, 0);
+  }
+  await clickText("Tous les assets");
+  await until(() =>
+    script(
+      "return document.body.innerText.includes('Importer mon premier asset');",
+    ),
+  );
+  report.checks.push(
+    "Stockage global sur bibliothèque vide : diagnostic manuel, inventaire additif, fichiers gérés inchangés hors SQLite auxiliaire, compression et purge sans variante",
+  );
+}
+
 async function testHistoryStorage() {
   const asset = await job({
     kind: "import",
@@ -1233,6 +1297,13 @@ async function testHistoryStorage() {
   await clickText("Historique");
   await until(() =>
     script("return document.body.innerText.includes('Consultation seule');"),
+  );
+  assert.equal(
+    await script(
+      "return [...document.querySelectorAll('.history-storage-actions button')].some(b=>/Compresser avec Zstd|Libérer les objets inutilisés/.test(b.textContent));",
+    ),
+    false,
+    "Library-wide actions must no longer appear in an asset's history",
   );
   await script(
     "document.querySelector('.history-storage-actions').scrollIntoView({block:'center'});",
@@ -1332,15 +1403,29 @@ async function testHistoryStorage() {
     (await invoke("get_snapshot", { id: first })).storage.kind,
     "deleted",
   );
-  await script("location.reload();");
-  await waitForThumbnail("Historique Zstd");
-  await clickText("Historique Zstd");
-  await waitForModel("model.glb");
-  await clickText("Historique");
+  await clickText("Optimisation du stockage");
+  await clickText("Lancer le diagnostic");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('button')].some(b=>b.textContent.includes('Actualiser le diagnostic')&&!b.disabled);",
+    ),
+  );
+  const diagnostic = await job({ kind: "storageDiagnostic" });
+  assert.ok(diagnostic.total.bytes > 0);
+  assert.ok(diagnostic.logicalObjectBytes > 0);
+  assert.ok(
+    diagnostic.categories.find((item) => item.key === "objects").bytes > 0,
+  );
+  await screenshot("storage-library-diagnostic.png");
   await clickText("Compresser avec Zstd");
   await until(() =>
     script(
       "return document.querySelector('dialog[open]')?.textContent.includes('Espace récupérable');",
+    ),
+  );
+  assert.ok(
+    await script(
+      "return document.querySelector('dialog[open]').textContent.includes('Portée : toute la bibliothèque');",
     ),
   );
   await screenshot("storage-compression-plan.png");
@@ -1352,12 +1437,37 @@ async function testHistoryStorage() {
   );
   await screenshot("storage-compression-result.png");
   await clickSelector('dialog[open] [aria-label="Fermer"]');
+  await until(() =>
+    script(
+      "return document.body.innerText.includes('Stockage modifié : actualisez le diagnostic pour obtenir les nouveaux volumes.');",
+    ),
+  );
+  await screenshot("storage-diagnostic-stale.png");
+  await clickText("Libérer les objets inutilisés");
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Espace récupérable');",
+    ),
+  );
+  assert.ok(
+    await script(
+      "return document.querySelector('dialog[open]').textContent.includes('Portée : toute la bibliothèque');",
+    ),
+  );
+  await screenshot("storage-purge-plan.png");
+  await clickSelector("dialog[open] .button.primary");
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Opération terminée');",
+    ),
+  );
+  await clickSelector('dialog[open] [aria-label="Fermer"]');
   assert.equal(
     (await invoke("get_snapshot", { id: second.id })).storage.kind,
     "preview",
   );
   report.checks.push(
-    "Historique Zstd : rotation, consultation/export GLB exact, protections UI, restauration avec travail non versionné, retour arrière, libération du backup, suppression et recompression confirmée",
+    "Historique Zstd : rotation, consultation/export GLB exact, protections UI, restauration avec travail non versionné, retour arrière, libération du backup et suppression ; diagnostic, recompression et purge confirmées depuis le menu global",
   );
 }
 
@@ -1383,6 +1493,7 @@ try {
       'return document.body.innerText.includes("Importer mon premier asset");',
     ),
   );
+  await testEmptyLibraryStorage();
   // The native listener is installed asynchronously after the library renders.
   // Retry the harmless event until the import form proves it is ready.
   await until(async () => {

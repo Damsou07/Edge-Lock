@@ -53,6 +53,127 @@ fn version(library: &Library, id: &str, work: &Path, n: u8) -> edge_lock_core::S
 }
 
 #[test]
+fn global_actions_work_without_any_variant_and_keep_legacy_calls_compatible() {
+    let empty = tempfile::tempdir().unwrap();
+    let library = Library::open(empty.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    for action in [StorageAction::Recompress, StorageAction::Purge] {
+        let plan = library
+            .preview_library_storage_action(action, &ctx)
+            .unwrap();
+        let applied = library
+            .apply_library_storage_action(action, &plan.plan_token, &ctx)
+            .unwrap();
+        assert_eq!(applied.released_bytes, 0);
+    }
+    assert!(
+        library
+            .preview_library_storage_action(StorageAction::Compact, &ctx)
+            .is_err()
+    );
+
+    let (temp, library, id, work) = fixture();
+    let source = temp.path().join("other-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("main.blend"), vec![2; 128 * 1024]).unwrap();
+    glb(&source.join("main.glb"), "other");
+    let other = library
+        .import_folder(&source, "Other", ExportConfig::default(), &ctx)
+        .unwrap();
+    for variant in [
+        &library.get_variant(&id).unwrap().variant,
+        &other.variants[0],
+    ] {
+        let snapshot = library.get_snapshot(&variant.head_snapshot_id).unwrap();
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|e| e.path == "main.blend")
+            .unwrap();
+        let hash = entry.hash.as_deref().unwrap();
+        let raw = library.root().join("objects").join(&hash[..2]).join(hash);
+        fs::write(
+            &raw,
+            fs::read(Path::new(&variant.workspace_path).join("main.blend")).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(raw.with_extension("zst")).unwrap();
+    }
+    let plan = library
+        .preview_library_storage_action(StorageAction::Recompress, &ctx)
+        .unwrap();
+    let legacy = library
+        .preview_storage_action(&id, StorageAction::Recompress, None, &ctx)
+        .unwrap();
+    assert_eq!(plan.plan_token, legacy.plan_token);
+    assert!(plan.reclaimable_bytes > 200_000);
+    let applied = library
+        .apply_library_storage_action(StorageAction::Recompress, &plan.plan_token, &ctx)
+        .unwrap();
+    assert_eq!(plan.reclaimable_bytes, applied.released_bytes);
+    assert_eq!(
+        fs::read(work.join("main.blend")).unwrap(),
+        vec![1; 128 * 1024]
+    );
+    for variant in [
+        &library.get_variant(&id).unwrap().variant,
+        &other.variants[0],
+    ] {
+        let output = temp.path().join(&variant.id);
+        library
+            .materialize(&variant.head_snapshot_id, &output, &ctx)
+            .unwrap();
+        assert_eq!(
+            fs::read(output.join("main.blend")).unwrap(),
+            fs::read(Path::new(&variant.workspace_path).join("main.blend")).unwrap()
+        );
+    }
+}
+
+#[test]
+fn global_purge_confirmation_tracks_targets_even_when_aggregate_sizes_are_equal() {
+    let (temp, library, _, _) = fixture();
+    let ctx = OperationContext::default();
+    let db = rusqlite::Connection::open(temp.path().join("library/library.sqlite3")).unwrap();
+    let candidate = |bytes: &[u8]| {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = library.root().join("objects").join(&hash[..2]).join(&hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        db.execute(
+            "INSERT INTO garbage_candidates VALUES(?1,?2)",
+            rusqlite::params![hash, bytes.len() as i64],
+        )
+        .unwrap();
+        (hash, path)
+    };
+    let (old_hash, old_path) = candidate(b"old");
+    let plan = library
+        .preview_library_storage_action(StorageAction::Purge, &ctx)
+        .unwrap();
+    db.execute("DELETE FROM garbage_candidates WHERE hash=?1", [&old_hash])
+        .unwrap();
+    fs::remove_file(old_path).unwrap();
+    let (_, new_path) = candidate(b"new");
+    let fresh = library
+        .preview_library_storage_action(StorageAction::Purge, &ctx)
+        .unwrap();
+    assert_eq!(plan.physical_bytes, fresh.physical_bytes);
+    assert_eq!(plan.reclaimable_bytes, fresh.reclaimable_bytes);
+    assert_ne!(plan.plan_token, fresh.plan_token);
+    assert!(
+        library
+            .apply_library_storage_action(StorageAction::Purge, &plan.plan_token, &ctx)
+            .is_err()
+    );
+    assert!(new_path.exists());
+    library
+        .apply_library_storage_action(StorageAction::Purge, &fresh.plan_token, &ctx)
+        .unwrap();
+    assert!(!new_path.exists());
+}
+
+#[test]
 fn retention_preserves_two_full_states_and_exact_preview_then_deletion_reclaims_objects() {
     let (temp, library, id, work) = fixture();
     let ctx = OperationContext::default();

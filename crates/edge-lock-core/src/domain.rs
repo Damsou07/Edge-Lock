@@ -160,6 +160,54 @@ pub struct StorageVersion {
     pub id: String,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageMeasure {
+    pub file_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDiagnosticCategory {
+    pub key: String,
+    pub label: String,
+    pub file_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDiagnosticExample {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDiagnosticDetail {
+    pub key: String,
+    pub label: String,
+    pub count: u64,
+    pub bytes: u64,
+    pub examples: Vec<StorageDiagnosticExample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDiagnostic {
+    pub started_at: String,
+    pub completed_at: String,
+    pub complete: bool,
+    pub total: StorageMeasure,
+    pub categories: Vec<StorageDiagnosticCategory>,
+    pub details: Vec<StorageDiagnosticDetail>,
+    pub logical_object_bytes: u64,
+    pub purge_available: bool,
+    pub purge_blocked_reason: Option<String>,
+    pub warnings: Vec<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetDetail {

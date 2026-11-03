@@ -225,7 +225,7 @@ impl Library {
         Ok(total)
     }
 
-    fn check_storage_integrity(&self) -> Result<()> {
+    pub(super) fn check_storage_integrity(&self) -> Result<()> {
         ensure_no_restore(&self.root)?;
         // Unknown/interrupted imports may own otherwise unreferenced objects. Fail closed.
         for item in fs::read_dir(&self.store.staging)? {
@@ -276,12 +276,23 @@ impl Library {
 
     fn plan_storage(
         &self,
-        variant_id: &str,
+        variant_id: Option<&str>,
         action: StorageAction,
         snapshot_id: Option<&str>,
         ctx: &OperationContext,
     ) -> Result<StorageReport> {
         self.check_storage_integrity()?;
+        if matches!(action, StorageAction::Recompress | StorageAction::Purge) {
+            if snapshot_id.is_some() {
+                return Err(CoreError::Invalid(
+                    "Cette action concerne toute la bibliothèque, sans version ciblée.".into(),
+                ));
+            }
+            return self.plan_library_storage(action, ctx);
+        }
+        let variant_id = variant_id.ok_or_else(|| {
+            CoreError::Invalid("Une variante est requise pour cette action historique.".into())
+        })?;
         let variant = self.get_variant(variant_id)?.variant;
         let scope = self.scope_snapshots(variant_id)?;
         let mut report = StorageReport::default();
@@ -412,6 +423,70 @@ impl Library {
         Ok(report)
     }
 
+    fn plan_library_storage(
+        &self,
+        action: StorageAction,
+        ctx: &OperationContext,
+    ) -> Result<StorageReport> {
+        let refs = self.referenced_objects()?;
+        let mut report = StorageReport {
+            logical_bytes: refs.values().sum(),
+            physical_bytes: directory_bytes(&self.store.objects)?,
+            ..Default::default()
+        };
+        let mut targets = match action {
+            StorageAction::Recompress => refs
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size))
+                .collect::<Vec<_>>(),
+            StorageAction::Purge => self.garbage()?,
+            _ => {
+                return Err(CoreError::Invalid(
+                    "Action globale non prise en charge.".into(),
+                ));
+            }
+        };
+        targets.sort_unstable();
+        let mut representations = Vec::with_capacity(targets.len());
+        for (hash, size) in &targets {
+            ctx.check_cancelled()?;
+            let bytes = self.object_bytes(hash)?;
+            report.reclaimable_bytes += if action == StorageAction::Recompress {
+                self.store.recompression_savings(hash, *size, ctx)?
+            } else {
+                bytes
+            };
+            let raw = self.store.object_path(hash)?;
+            let mut state = Vec::new();
+            for path in [&raw, &raw.with_extension("zst")] {
+                state.push(match fs::symlink_metadata(path) {
+                    Ok(meta) => Some((
+                        meta.len(),
+                        meta.modified()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|time| time.as_nanos()),
+                    )),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                });
+            }
+            representations.push(state);
+        }
+        // Bind confirmation to the global targets, their references and representations,
+        // including metadata changes that leave aggregate byte totals unchanged.
+        report.plan_token = blake3::hash(&serde_json::to_vec(&(
+            action,
+            &refs,
+            &targets,
+            representations,
+            &report,
+        ))?)
+        .to_hex()
+        .to_string();
+        Ok(report)
+    }
+
     pub fn preview_storage_action(
         &self,
         variant_id: &str,
@@ -420,12 +495,41 @@ impl Library {
         ctx: &OperationContext,
     ) -> Result<StorageReport> {
         let _guard = self.write_guard()?;
-        self.plan_storage(variant_id, action, snapshot_id, ctx)
+        self.plan_storage(Some(variant_id), action, snapshot_id, ctx)
+    }
+
+    pub fn preview_library_storage_action(
+        &self,
+        action: StorageAction,
+        ctx: &OperationContext,
+    ) -> Result<StorageReport> {
+        let _guard = self.write_guard()?;
+        self.plan_storage(None, action, None, ctx)
     }
 
     pub fn apply_storage_action(
         &self,
         variant_id: &str,
+        action: StorageAction,
+        snapshot_id: Option<&str>,
+        plan_token: &str,
+        ctx: &OperationContext,
+    ) -> Result<StorageReport> {
+        self.apply_storage_action_inner(Some(variant_id), action, snapshot_id, plan_token, ctx)
+    }
+
+    pub fn apply_library_storage_action(
+        &self,
+        action: StorageAction,
+        plan_token: &str,
+        ctx: &OperationContext,
+    ) -> Result<StorageReport> {
+        self.apply_storage_action_inner(None, action, None, plan_token, ctx)
+    }
+
+    fn apply_storage_action_inner(
+        &self,
+        variant_id: Option<&str>,
         action: StorageAction,
         snapshot_id: Option<&str>,
         plan_token: &str,
@@ -458,7 +562,9 @@ impl Library {
                 self.downgrade(
                     &version.id,
                     &entry,
-                    (action == StorageAction::ReleaseBackup).then_some(variant_id),
+                    (action == StorageAction::ReleaseBackup)
+                        .then_some(variant_id)
+                        .flatten(),
                 )?;
             }
         }

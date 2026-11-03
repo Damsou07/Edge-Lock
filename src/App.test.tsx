@@ -90,6 +90,47 @@ beforeEach(() => {
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("désactive le menu d’optimisation sans bibliothèque ouverte", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Choisir un dossier" });
+    expect(
+      screen.getByRole("button", { name: "Optimisation du stockage" }),
+    ).toBeDisabled();
+  });
+  it("ouvre le stockage global dans une bibliothèque vide et conserve une navigation active unique", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue({
+      ...openedLibrary,
+      library: { ...openedLibrary.library!, assetCount: 0 },
+    });
+    render(<App />);
+    const menu = await screen.findByRole("button", {
+      name: "Optimisation du stockage",
+    });
+    await waitFor(() => expect(menu).toBeEnabled());
+    await userEvent.click(menu);
+    expect(
+      await screen.findByRole("heading", {
+        name: "Optimisation du stockage",
+        level: 1,
+      }),
+    ).toBeInTheDocument();
+    expect(menu).toHaveClass("active");
+    expect(
+      screen.getByRole("button", { name: /Tous les assets/ }),
+    ).not.toHaveClass("active");
+    expect(
+      screen.getByRole("button", { name: "Compresser avec Zstd" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Libérer les objets inutilisés" }),
+    ).toBeEnabled();
+    expect(api.startJob).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Archives" }));
+    expect(
+      await screen.findByRole("heading", { name: /Archives/, level: 1 }),
+    ).toBeInTheDocument();
+    expect(menu).not.toHaveClass("active");
+  });
   it("actualise le catalogue sur un nouvel artefact et ignore les événements anciens ou répétés", async () => {
     let emit!: (status: WorkspaceStatus) => void;
     vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);

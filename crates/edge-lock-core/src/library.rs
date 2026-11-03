@@ -13,6 +13,8 @@ use std::{
 };
 
 const FORMAT: &str = "edge-lock-library-v1\n";
+#[path = "diagnostic.rs"]
+mod diagnostic;
 #[path = "history.rs"]
 mod history;
 pub use history::StorageAction;

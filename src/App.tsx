@@ -17,6 +17,7 @@ import {
   TaxonomyModal,
 } from "./components/AssetForms";
 import { AssetDetailView } from "./components/AssetDetailView";
+import { StorageOptimizationView } from "./components/StorageOptimizationView";
 import {
   errorMessage,
   formatBytes,
@@ -191,6 +192,7 @@ export default function App() {
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [view, setView] = useState<"grid" | "list">("grid");
   const [selected, setSelected] = useState<string | null>(null);
+  const [section, setSection] = useState<"assets" | "storage">("assets");
   const navigation = useRef(0);
   const [modal, setModal] = useState<
     "import" | "create" | "settings" | "category" | "game" | null
@@ -208,7 +210,7 @@ export default function App() {
   } = useAssetThumbnails(
     page.items,
     library?.root,
-    !!library && !selected && !modal && !opening,
+    !!library && section === "assets" && !selected && !modal && !opening,
     runBaseJob,
   );
   const refresh = useCallback(() => setGeneration((value) => value + 1), []);
@@ -293,7 +295,10 @@ export default function App() {
   const selectAsset = async (id: string) => {
     const intent = ++navigation.current;
     await pause();
-    if (navigation.current === intent) setSelected(id);
+    if (navigation.current === intent) {
+      setSection("assets");
+      setSelected(id);
+    }
     resume();
   };
 
@@ -410,6 +415,7 @@ export default function App() {
           version: previous?.version ?? "0.1.0",
         }));
         setSelected(null);
+        setSection("assets");
         setFilter(initialFilter);
         setSearch("");
         refresh();
@@ -423,11 +429,13 @@ export default function App() {
   };
   const changeFilter = (patch: Partial<AssetFilter>) => {
     ++navigation.current;
+    setSection("assets");
     setFilter((previous) => ({ ...previous, ...patch, offset: 0 }));
     setSelected(null);
   };
   const resetFilters = () => {
     ++navigation.current;
+    setSection("assets");
     setSearch("");
     setFilter(initialFilter);
     setSelected(null);
@@ -485,7 +493,7 @@ export default function App() {
         <nav className="sidebar-nav" aria-label="Navigation principale">
           <div className="nav-section-label">BIBLIOTHÈQUE</div>
           <button
-            className={`nav-item ${!filter.categoryId && !filter.gameId && !filter.archived && !selected ? "active" : ""}`}
+            className={`nav-item ${section === "assets" && !filter.categoryId && !filter.gameId && !filter.archived && !selected ? "active" : ""}`}
             onClick={resetFilters}
           >
             <Icon name="grid" />
@@ -509,7 +517,7 @@ export default function App() {
           </div>
           <CategoryTree
             categories={taxonomy.categories}
-            selected={filter.categoryId}
+            selected={section === "assets" ? filter.categoryId : null}
             onSelect={(id) =>
               changeFilter({ categoryId: id, gameId: null, archived: false })
             }
@@ -531,7 +539,7 @@ export default function App() {
           {taxonomy.games.map((game) => (
             <button
               key={game.id}
-              className={`nav-item ${filter.gameId === game.id ? "active" : ""}`}
+              className={`nav-item ${section === "assets" && filter.gameId === game.id ? "active" : ""}`}
               onClick={() =>
                 changeFilter({
                   gameId: game.id,
@@ -549,13 +557,25 @@ export default function App() {
           )}
           <div className="nav-divider" />
           <button
-            className={`nav-item ${filter.archived ? "active" : ""}`}
+            className={`nav-item ${section === "assets" && filter.archived ? "active" : ""}`}
             onClick={() =>
               changeFilter({ archived: true, gameId: null, categoryId: null })
             }
           >
             <Icon name="archive" size={17} />
             <span>Archives</span>
+          </button>
+          <button
+            className={`nav-item storage-nav-item ${section === "storage" ? "active" : ""}`}
+            disabled={!library || opening}
+            onClick={() => {
+              ++navigation.current;
+              setSelected(null);
+              setSection("storage");
+            }}
+          >
+            <Icon name="database" size={17} />
+            <span>Optimisation du stockage</span>
           </button>
         </nav>
         <div className="sidebar-bottom">
@@ -587,7 +607,13 @@ export default function App() {
             <Icon name="folder" size={16} />
             <span>Bibliothèque</span>
             <Icon name="chevron" size={13} />
-            <strong>{selected ? "Fiche de l’asset" : heading}</strong>
+            <strong>
+              {section === "storage"
+                ? "Optimisation du stockage"
+                : selected
+                  ? "Fiche de l’asset"
+                  : heading}
+            </strong>
           </div>
           <div className="local-status">
             <span className="live-dot" />
@@ -671,6 +697,13 @@ export default function App() {
               </p>
             </div>
           </section>
+        ) : section === "storage" ? (
+          <StorageOptimizationView
+            key={library.root}
+            libraryRoot={library.root}
+            jobs={jobs}
+            runJob={runJob}
+          />
         ) : selected ? (
           <AssetDetailView
             id={selected}

@@ -20,7 +20,7 @@ export function HistoryStorageModal({
   onSaved,
   onClose,
 }: {
-  variantId: string;
+  variantId?: string;
   action: StorageAction;
   snapshotId?: string;
   runJob: RunJob;
@@ -76,6 +76,11 @@ export function HistoryStorageModal({
       }}
     >
       <div className="form-stack">
+        {(action === "recompress" || action === "purge") && (
+          <p>
+            <strong>Portée : toute la bibliothèque</strong>
+          </p>
+        )}
         {action === "recompress" && (
           <p>
             Compression sans perte des objets de la bibliothèque. Le contenu des
@@ -113,8 +118,9 @@ export function HistoryStorageModal({
         {report && !result && (
           <>
             <p>
-              Versions de la bibliothèque : {formatBytes(report.logicalBytes)}{" "}
-              de contenu unique, {formatBytes(report.physicalBytes)} stockés.
+              Objets de la bibliothèque : {formatBytes(report.logicalBytes)} de
+              contenu unique avant compression,{" "}
+              {formatBytes(report.physicalBytes)} sur disque.
             </p>
             <p>
               <strong>
