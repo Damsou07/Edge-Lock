@@ -30,6 +30,10 @@ Les contrôles réellement exécutés et leurs limites sont détaillés dans [le
 
 Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieurs tags et plusieurs projets de jeu. Recherche, filtres, tri, archivage et historique paginé permettent de parcourir la bibliothèque. L’archivage conserve les fichiers et les versions.
 
+**Aide et mode d’emploi**, en bas de la barre latérale, reste disponible même sans bibliothèque ouverte. Le guide explique le parcours complet et rappelle en tête la règle stricte : **exactement un `.blend` et un `.glb` par workspace synchronisé de variante**. Lors d’un import ou d’une reprise après suppression du dérivé, le GLB peut manquer avant sa génération ; plusieurs `.blend` ou plusieurs `.glb` bloquent la synchronisation sans suppression automatique.
+
+Dans la fiche d’un asset, l’onglet **Fichiers** filtre le workspace ou la version consultée par type (extension, dossier ou sans extension) et par taille minimum/maximum. Les bornes sont inclusives et facultatives, avec les unités o/Ko/Mo/Go en base 1024. Un filtre de taille exclut les dossiers ; une plage invalide est signalée. Les filtres se combinent avant la pagination et se réinitialisent au changement d’asset, variante ou version. **Réinitialiser** réaffiche toutes les entrées.
+
 ## Aperçu et export
 
 Chaque dossier de travail de variante contient un `.blend` source et un GLB dérivé. La règle s’applique récursivement ; `.blend1` reste une sauvegarde ordinaire. Les variantes, historiques, caches et sauvegardes sont indépendants de ce décompte. Les anciens dossiers non conformes sont conservés avec leur historique ; leur synchronisation et les nouvelles versions restent bloquées jusqu’à correction manuelle.
@@ -46,7 +50,7 @@ Le rendu conserve les textures, UV, transparences et matériaux pris en charge p
 
 La fiche et les vignettes cadrent uniquement la géométrie visible. Un sol de studio horizontal démesuré peut être masqué dans la copie chargée en mémoire, selon des critères géométriques conservateurs, pour rendre le sujet lisible. Le GLB, ses sources et les statistiques restent inchangés. Un sol seul et les cas ambigus reconnus sont conservés ; une grande plaque portant plusieurs accessoires peut toutefois ressembler géométriquement à un sol.
 
-Les armatures restent représentées par les skins glTF et les animations compatibles sont conservées. Les shape keys sans modificateur restent exportables ; une combinaison shape keys/modificateurs qui ferait perdre les morphs bloque la génération avec un message explicite et conserve le dernier GLB. Aucun baking personnalisé des morphs n’est effectué.
+Les armatures restent représentées par les skins glTF et les animations compatibles sont conservées. Les shape keys sans modificateur et les morphs relatifs associés à une unique Armature active et valide sont exportables : cette dernière utilise les données originales du maillage pour conserver les expressions, poids et animations. Les autres objets conservent l’évaluation de leurs modificateurs. Les autres combinaisons shape keys/modificateurs restent refusées avec le nom de l’objet et les modificateurs concernés ; le dernier GLB est conservé. Aucun baking personnalisé des morphs n’est effectué.
 
 Les statistiques affichent la géométrie du GLB effectivement généré : objets maillés, sommets, arêtes, faces et triangles. Elles incluent les effets des modificateurs. La triangulation et les séparations de sommets aux coutures UV peuvent différer des comptes de Blender. Un compte d’arêtes trop coûteux reste indisponible sans empêcher l’aperçu.
 

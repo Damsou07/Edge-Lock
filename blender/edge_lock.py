@@ -1,10 +1,12 @@
 """Edge Lock's isolated Blender worker. Only JSON files cross the process boundary."""
 import glob
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import re
 import sys
 import traceback
+from types import ModuleType
 
 import bpy
 
@@ -260,6 +262,144 @@ def inspect_project(workspace, config, include_geometry=True, paths=None, previe
     return result, scene, collection, objects
 
 
+def export_source_objects(objects):
+    """Include collection instances, whose source objects need not belong to the scene."""
+    sources = set(objects)
+    for instance in bpy.context.evaluated_depsgraph_get().object_instances:
+        if instance.is_instance and instance.parent and instance.parent.original in objects:
+            sources.add(instance.object.original)
+    return sources
+
+
+class MorphSafeExport:
+    """Keep native morphs/skins while evaluating modifiers on other meshes.
+
+    Blender's apply option is global. Its native node hooks let us select the
+    original mesh only for the supported Armature/morph combination. The stack
+    matters because a node's closing hook runs after its children have exported.
+    """
+
+    def __init__(self, objects):
+        self.objects = export_source_objects(objects)
+        self.meshes = {}
+        self.stack = []
+        self.checked = set()
+        self.errors = []
+        for obj in self.objects:
+            self.describe(obj)
+            if obj.type == 'MESH':
+                for modifier in obj.modifiers:
+                    if modifier.type == 'ARMATURE' and modifier.object and modifier.object not in self.objects:
+                        raise ValueError(f"Le rig de {obj.name} se trouve hors de la collection. Exportez la scène ou regroupez le rig dans cette collection.")
+
+    @staticmethod
+    def identity(obj):
+        return obj.original.as_pointer() if obj else None
+
+    def describe(self, obj):
+        if obj is None or obj.type != 'MESH':
+            return None
+        identity = self.identity(obj)
+        if identity in self.meshes:
+            return self.meshes[identity]
+        keys = obj.data.shape_keys
+        if keys is None or len(keys.key_blocks) <= 1:
+            self.meshes[identity] = None
+            return None
+        bypass = bool(obj.modifiers)
+        if bypass:
+            modifiers = list(obj.modifiers)
+            armature = modifiers[0]
+            if (not keys.use_relative or len(modifiers) != 1 or armature.type != 'ARMATURE'
+                    or not armature.show_viewport or armature.object is None
+                    or armature.object.type != 'ARMATURE'):
+                details = ', '.join(f"{item.name} ({item.type}{', désactivé' if not item.show_viewport else ''})"
+                                    for item in modifiers)
+                raise ValueError(f"GLB impossible pour {obj.name} : les shape keys avec modificateurs nécessitent des clés relatives et une unique Armature active avec un rig valide. Modificateurs : {details}. Le fichier .blend et le dernier GLB restent intacts.")
+        # Match Blender's native exclusions: Basis, muted keys and self-relative keys.
+        names = [key.name for key in list(keys.key_blocks)[1:]
+                 if not key.mute and key != key.relative_key]
+        skin_expected = False
+        if bypass:
+            bones = {bone.name for bone in obj.modifiers[0].object.data.bones}
+            groups = {group.index for group in obj.vertex_groups if group.name in bones}
+            skin_expected = any(group.group in groups and group.weight > 0
+                                for vertex in obj.data.vertices for group in vertex.groups)
+        description = (obj.name, names, bypass, skin_expected)
+        self.meshes[identity] = description
+        return description
+
+    def gather_node_mesh_hook(self, _node, obj, settings):
+        self.stack.append((self.identity(obj), settings['gltf_apply']))
+        try:
+            description = self.describe(obj)
+            settings['gltf_apply'] = not (description and description[2])
+        except Exception as error:
+            # The exporter logs and swallows hook exceptions. Fail closed ourselves.
+            self.errors.append(str(error))
+
+    def gather_node_hook(self, node, obj, settings):
+        identity = self.identity(obj)
+        try:
+            description = self.describe(obj)
+            if description:
+                name, names, _, skin_expected = description
+                mesh = node.mesh
+                has_geometry = (bool(obj.data.polygons)
+                                or (settings.get('gltf_loose_edges') and bool(obj.data.edges))
+                                or (settings.get('gltf_loose_points') and bool(obj.data.vertices)))
+                if mesh is None and not has_geometry:
+                    # Blender legitimately omits meshes without exportable primitives.
+                    self.checked.add(identity)
+                    return
+                if (mesh is None or ((mesh.extras or {}).get('targetNames') or []) != names
+                        or not mesh.primitives
+                        or any(len(primitive.targets or []) != len(names) for primitive in mesh.primitives)):
+                    raise ValueError(f"Les morphs de {name} n'ont pas été conservés par l'exporteur glTF.")
+                if skin_expected and (node.skin is None or any(
+                        'JOINTS_0' not in primitive.attributes or 'WEIGHTS_0' not in primitive.attributes
+                        for primitive in mesh.primitives)):
+                    raise ValueError(f"Le skin de {name} n'a pas été conservé par l'exporteur glTF.")
+                self.checked.add(identity)
+        except Exception as error:
+            self.errors.append(str(error))
+        finally:
+            if not self.stack:
+                self.errors.append("Callbacks glTF incomplets : entrée de nœud absente.")
+            else:
+                entered, previous = self.stack.pop()
+                settings['gltf_apply'] = previous
+                if entered != identity:
+                    self.errors.append("Callbacks glTF incohérents : ordre des nœuds inattendu.")
+
+    def validate(self):
+        missing = [description[0] for identity, description in self.meshes.items()
+                   if description and identity not in self.checked]
+        if self.stack or missing:
+            self.errors.append("Callbacks glTF incomplets pour les morphs : " + ', '.join(missing[:10]))
+        if self.errors:
+            raise ValueError("GLB non publié : " + '; '.join(self.errors[:10]) + " Le fichier .blend et le dernier GLB restent intacts.")
+
+
+@contextmanager
+def native_morph_export(objects):
+    """Register trusted hooks only in this worker's memory; never save preferences."""
+    extension = MorphSafeExport(objects)
+    name = '_edge_lock_native_morph_export'
+    module = ModuleType(name)
+    module.glTF2ExportUserExtension = lambda: extension
+    sys.modules[name] = module
+    addon = None
+    try:
+        addon = bpy.context.preferences.addons.new()
+        addon.module = name
+        yield extension
+    finally:
+        if addon is not None:
+            bpy.context.preferences.addons.remove(addon)
+        del sys.modules[name]
+
+
 def run(request):
     if request.get("protocolVersion") != PROTOCOL_VERSION:
         raise ValueError("Version de protocole Edge Lock incompatible.")
@@ -294,18 +434,6 @@ def run(request):
         raise ValueError("Export impossible : dépendances non figées dans cette version : " + "; ".join(item["path"] for item in unresolved[:10]))
     if bpy.app.autoexec_fail and not preview:
         raise ValueError("Export impossible : la scène dépend de scripts embarqués désactivés.")
-    for obj in objects:
-        if obj.type != "MESH":
-            continue
-        # Blender's evaluated export drops morph targets when any modifier is
-        # present, including Armature. Fail before exporting instead of silently
-        # discarding shape keys or their animation. Modifier-free meshes retain
-        # their original data and morph targets with export_apply enabled.
-        if obj.modifiers and obj.data.shape_keys and len(obj.data.shape_keys.key_blocks) > 1:
-            raise ValueError(f"GLB impossible pour {obj.name} : les shape keys sont incompatibles avec l’application des modificateurs. Le fichier .blend reste intact.")
-        for modifier in obj.modifiers:
-            if modifier.type == "ARMATURE" and modifier.object is not None and modifier.object not in objects:
-                raise ValueError(f"Le rig de {obj.name} se trouve hors de la collection. Exportez la scène ou regroupez le rig dans cette collection.")
     result["geometry"] = geometry_stats(objects)
     if preview:
         used, _ = render_ids(objects, collection)
@@ -317,21 +445,23 @@ def run(request):
                 replacement = bpy.data.images.new(image.name + ' (texture manquante)', width=2, height=2)
                 replacement.generated_color = (1, 0, 1, 1)
                 image.user_remap(replacement)
-    result_code = bpy.ops.export_scene.gltf(
-        filepath=request["destination"], check_existing=False, export_format="GLB",
-        use_active_scene=True, use_active_collection=collection is not None,
-        use_active_collection_with_nested=True, use_selection=False,
-        use_visible=False, use_renderable=False,
-        export_animations=True, export_animation_mode="ACTIONS",
-        export_skins=True, export_morph=True, export_apply=True,
-        export_materials="EXPORT", export_image_format="AUTO",
-        export_cameras=False, export_lights=False,
-        export_draco_mesh_compression_enable=False, export_use_gltfpack=False,
-        export_hierarchy_flatten_bones=False, export_hierarchy_flatten_objs=False,
-        will_save_settings=False,
-    )
-    if "FINISHED" not in result_code or not Path(request["destination"]).is_file():
-        raise RuntimeError("Blender n'a pas produit le fichier GLB attendu.")
+    with native_morph_export(objects) as morphs:
+        result_code = bpy.ops.export_scene.gltf(
+            filepath=request["destination"], check_existing=False, export_format="GLB",
+            use_active_scene=True, use_active_collection=collection is not None,
+            use_active_collection_with_nested=True, use_selection=False,
+            use_visible=False, use_renderable=False,
+            export_animations=True, export_animation_mode="ACTIONS",
+            export_skins=True, export_morph=True, export_apply=True,
+            export_materials="EXPORT", export_image_format="AUTO",
+            export_cameras=False, export_lights=False,
+            export_draco_mesh_compression_enable=False, export_use_gltfpack=False,
+            export_hierarchy_flatten_bones=False, export_hierarchy_flatten_objs=False,
+            will_save_settings=False,
+        )
+        if "FINISHED" not in result_code or not Path(request["destination"]).is_file():
+            raise RuntimeError("Blender n'a pas produit le fichier GLB attendu.")
+        morphs.validate()
     return result
 
 

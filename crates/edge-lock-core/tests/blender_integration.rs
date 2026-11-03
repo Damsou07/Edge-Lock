@@ -1,9 +1,10 @@
 //! Real Blender contract tests; only generated disposable assets are opened.
 //! EDGE_LOCK_TEST_BLENDER=<executable> cargo test -p edge-lock-core --test blender_integration -- --ignored
 use edge_lock_core::{
-    CoreError, ExportConfig, OperationContext,
+    CoreError, ExportConfig, Library, OperationContext,
     blender::BlenderRunner,
     glb::{guard_preview, inspect_glb},
+    sync,
 };
 use std::{
     fs,
@@ -243,6 +244,93 @@ fn edit_fixture(root: &Path, workspace: &Path, script: &str) {
         "fixture edit failed: {} {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn glb_document(path: &Path) -> (serde_json::Value, Vec<u8>) {
+    let bytes = fs::read(path).unwrap();
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let document = serde_json::from_slice(&bytes[20..20 + json_length]).unwrap();
+    (document, bytes[28 + json_length..].to_vec())
+}
+
+fn float_accessor(document: &serde_json::Value, binary: &[u8], index: usize) -> Vec<f32> {
+    let accessor = &document["accessors"][index];
+    assert_eq!(accessor["componentType"], 5126);
+    assert_eq!(accessor["type"], "SCALAR");
+    let view = &document["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+    let offset = view["byteOffset"].as_u64().unwrap_or(0) as usize
+        + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let stride = view["byteStride"].as_u64().unwrap_or(4) as usize;
+    (0..accessor["count"].as_u64().unwrap() as usize)
+        .map(|i| {
+            f32::from_le_bytes(
+                binary[offset + i * stride..offset + i * stride + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn assert_animated_skin_and_morphs(path: &Path, node_name: &str) {
+    let (document, binary) = glb_document(path);
+    let (node_index, node) = document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node["name"] == node_name)
+        .unwrap();
+    let skin = node["skin"]
+        .as_u64()
+        .expect("morph mesh must retain its skin") as usize;
+    assert!(
+        !document["skins"][skin]["joints"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mesh = &document["meshes"][node["mesh"].as_u64().unwrap() as usize];
+    assert_eq!(
+        mesh["extras"]["targetNames"],
+        serde_json::json!(["Smile", "Driven"])
+    );
+    for primitive in mesh["primitives"].as_array().unwrap() {
+        assert!(primitive["attributes"]["JOINTS_0"].is_u64());
+        assert!(primitive["attributes"]["WEIGHTS_0"].is_u64());
+        assert!(primitive["attributes"]["TEXCOORD_0"].is_u64());
+        assert_eq!(primitive["targets"].as_array().unwrap().len(), 2);
+    }
+    let mut driven_changes = false;
+    let mut has_bone_animation = false;
+    for animation in document["animations"].as_array().unwrap() {
+        for channel in animation["channels"].as_array().unwrap() {
+            has_bone_animation |= channel["target"]["path"] == "rotation";
+            if channel["target"]["node"] != node_index || channel["target"]["path"] != "weights" {
+                continue;
+            }
+            let sampler = &animation["samplers"][channel["sampler"].as_u64().unwrap() as usize];
+            let weights = float_accessor(
+                &document,
+                &binary,
+                sampler["output"].as_u64().unwrap() as usize,
+            );
+            let driven: Vec<_> = weights
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|sample| sample[1])
+                .collect();
+            driven_changes |= driven
+                .windows(2)
+                .any(|pair| (pair[0] - pair[1]).abs() > 0.001);
+        }
+    }
+    assert!(has_bone_animation, "skeleton animation must survive export");
+    assert!(
+        driven_changes,
+        "bone-driven morph weights must be sampled, not frozen"
     );
 }
 
@@ -594,38 +682,364 @@ bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False
 
 #[test]
 #[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
-fn rejects_shape_keys_with_modifiers_without_silent_morph_loss() {
+fn armature_morphs_keep_drivers_animation_and_sources_across_all_export_paths() {
     let root = test_directory();
     let workspace = fixture_with_shapes(root.path(), false, false, true);
-    let original = fs::read(workspace.join("main.blend")).unwrap();
-    let output = root.path().join("incompatible.glb");
-    let runner = BlenderRunner::new(executable());
-    let result = runner.export_glb(
+    edit_fixture(
+        root.path(),
         &workspace,
-        &ExportConfig::default(),
-        &output,
-        &OperationContext::default(),
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; rig=bpy.data.objects['Rig']
+key=cube.shape_key_add(name='Driven'); key.data[1].co.x+=0.4
+driver=key.driver_add('value').driver
+variable=driver.variables.new(); variable.name='rotation'; variable.type='SINGLE_PROP'
+variable.targets[0].id=rig; variable.targets[0].data_path='pose.bones["Root"].rotation_euler.z'
+driver.expression='rotation'
+muted=cube.shape_key_add(name='Muted'); muted.data[2].co.y+=0.5; muted.mute=True
+bpy.context.scene.frame_end=10; bpy.context.scene.frame_set(1)
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
     );
-    assert!(
-        result.is_err(),
-        "must not drop morph targets from an evaluated mesh"
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let runner = BlenderRunner::new(executable());
+    let context = OperationContext::default();
+    let config = ExportConfig::default();
+    for operation in ["export", "generate", "preview"] {
+        let output = root.path().join(format!("{operation}.glb"));
+        let result = match operation {
+            "export" => runner.export_glb(&workspace, &config, &output, &context),
+            "generate" => runner.generate_glb(&workspace, &workspace, &config, &output, &context),
+            _ => runner.preview_glb(&workspace, &workspace, &config, &output, &context),
+        };
+        result.unwrap_or_else(|error| {
+            panic!("{operation} rejected compatible Armature/morphs: {error}")
+        });
+        assert_animated_skin_and_morphs(&output, "TexturedCube");
+        assert!(guard_preview(&output).is_ok());
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+    }
+
+    let library = Library::open(root.path().join("library")).unwrap();
+    let imported =
+        sync::import_project(&library, &workspace, "Animated face", &runner, &context).unwrap();
+    let variant = &imported.variants[0];
+    let working = Path::new(&variant.workspace_path);
+    let canonical = working.join("main.glb");
+    assert_animated_skin_and_morphs(&canonical, "TexturedCube");
+    let last_glb = fs::read(&canonical).unwrap();
+    let snapshot = library.get_snapshot(&variant.head_snapshot_id).unwrap();
+    edit_fixture(
+        root.path(),
+        working,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+bpy.data.objects['TexturedCube'].modifiers.new('Unsupported Mirror','MIRROR')
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
     );
-    assert!(!output.exists());
-    let generated = root.path().join("incompatible-canonical.glb");
-    assert!(
-        runner
+    let edited = fs::read(working.join("main.blend")).unwrap();
+    let error = sync::synchronize_variant(&library, &variant.id, Some(&runner), &context)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("TexturedCube"), "{error}");
+    assert!(error.to_string().contains("Mirror"), "{error}");
+    assert_eq!(fs::read(&canonical).unwrap(), last_glb);
+    assert_eq!(fs::read(working.join("main.blend")).unwrap(), edited);
+    assert_eq!(
+        library.get_snapshot(&snapshot.id).unwrap().entries,
+        snapshot.entries
+    );
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn armature_morph_export_keeps_other_modifiers_in_nested_shared_and_instanced_meshes() {
+    for morph_first in [false, true] {
+        let root = test_directory();
+        let workspace = fixture_with_shapes(root.path(), false, false, true);
+        let setup = format!(
+            r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; rig=bpy.data.objects['Rig']
+cube.name='A_Morph' if {morph_first} else 'Z_Morph'
+plain=next(obj for obj in bpy.context.scene.objects if obj.type=='MESH' and obj!=cube)
+plain.name='Z_Mirror' if {morph_first} else 'A_Mirror'
+plain.modifiers.new('Mirror','MIRROR').use_mirror_merge=False
+child=plain.copy(); child.data=plain.data.copy(); child.name='NestedMirror'
+bpy.context.scene.collection.objects.link(child); child.parent=cube
+shared=cube.copy(); shared.name='SharedMorph'; shared.parent=rig
+bpy.data.collections['Nested'].objects.link(shared)
+instance=bpy.data.objects.new('Instance',None); instance.instance_type='COLLECTION'; instance.instance_collection=bpy.data.collections['Asset']
+bpy.data.collections['Other'].objects.link(instance); instance.location.x=10
+bpy.context.scene.frame_end=10; bpy.context.scene.frame_set(1)
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+            morph_first = if morph_first { "True" } else { "False" }
+        );
+        edit_fixture(root.path(), &workspace, &setup);
+        let original = fs::read(workspace.join("main.blend")).unwrap();
+        let output = root.path().join("mixed.glb");
+        BlenderRunner::new(executable())
             .generate_glb(
                 &workspace,
                 &workspace,
                 &ExportConfig::default(),
-                &generated,
+                &output,
                 &OperationContext::default(),
             )
-            .unwrap_err()
-            .to_string()
-            .contains("shape keys")
+            .unwrap();
+        let (document, _) = glb_document(&output);
+        let nodes = document["nodes"].as_array().unwrap();
+        let mut morph_nodes = 0;
+        let mut mirrored_nodes = 0;
+        for node in nodes {
+            let Some(mesh_index) = node["mesh"].as_u64() else {
+                continue;
+            };
+            let name = node["name"].as_str().unwrap_or("");
+            let primitives = document["meshes"][mesh_index as usize]["primitives"]
+                .as_array()
+                .unwrap();
+            if name.contains("Morph") {
+                morph_nodes += 1;
+                assert!(node["skin"].is_u64(), "{name} lost its skin");
+                assert!(
+                    primitives.iter().all(|primitive| primitive["targets"]
+                        .as_array()
+                        .is_some_and(|targets| targets.len() == 1)),
+                    "{name} lost its morph"
+                );
+            }
+            if name.contains("Mirror") {
+                mirrored_nodes += 1;
+                let triangles: u64 = primitives
+                    .iter()
+                    .map(|primitive| {
+                        let indices = primitive["indices"].as_u64().unwrap() as usize;
+                        document["accessors"][indices]["count"].as_u64().unwrap() / 3
+                    })
+                    .sum();
+                assert_eq!(
+                    triangles, 24,
+                    "{name} must keep Mirror even near a morph mesh"
+                );
+            }
+        }
+        assert!(
+            morph_nodes >= 4,
+            "original/shared morphs and their instances must export"
+        );
+        assert!(
+            mirrored_nodes >= 3,
+            "root/nested mirrors and their instances must export"
+        );
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+    }
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn rejects_active_geometric_modifiers_on_morphs_including_instanced_collections() {
+    for instanced_only in [false, true] {
+        let root = test_directory();
+        let workspace = fixture_with_shapes(root.path(), false, false, true);
+        let setup = format!(
+            r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; cube.modifiers.new('Unsupported Mirror','MIRROR')
+if {instanced_only}:
+    source=bpy.data.collections.new('InstanceSource')
+    for col in list(cube.users_collection): col.objects.unlink(cube)
+    source.objects.link(cube); cube.parent=None
+    instance=bpy.data.objects.new('Instance',None); instance.instance_type='COLLECTION'; instance.instance_collection=source
+    bpy.context.scene.collection.objects.link(instance)
+    assert cube.name not in bpy.context.scene.objects
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
+            instanced_only = if instanced_only { "True" } else { "False" }
+        );
+        edit_fixture(root.path(), &workspace, &setup);
+        let original = fs::read(workspace.join("main.blend")).unwrap();
+        let runner = BlenderRunner::new(executable());
+        for operation in ["export", "generate", "preview"] {
+            let output = root.path().join(format!("{operation}.glb"));
+            let context = OperationContext::default();
+            let config = ExportConfig::default();
+            let result = match operation {
+                "export" => runner.export_glb(&workspace, &config, &output, &context),
+                "generate" => {
+                    runner.generate_glb(&workspace, &workspace, &config, &output, &context)
+                }
+                _ => runner.preview_glb(&workspace, &workspace, &config, &output, &context),
+            };
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("TexturedCube"), "{error}");
+            assert!(error.to_string().contains("Mirror"), "{error}");
+            assert!(!output.exists());
+            assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn rejects_morph_stacks_outside_the_supported_single_active_armature_case() {
+    for alteration in [
+        "cube.modifiers['Rig'].show_viewport=False",
+        "modifier=cube.modifiers.new('Disabled Mirror','MIRROR'); modifier.show_viewport=False; modifier.show_render=False",
+        "cube.data.shape_keys.use_relative=False",
+    ] {
+        let root = test_directory();
+        let workspace = fixture_with_shapes(root.path(), false, false, true);
+        let setup = format!(
+            r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']
+{alteration}
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#
+        );
+        edit_fixture(root.path(), &workspace, &setup);
+        let original = fs::read(workspace.join("main.blend")).unwrap();
+        let output = root.path().join("unsupported.glb");
+        let error = BlenderRunner::new(executable())
+            .generate_glb(
+                &workspace,
+                &workspace,
+                &ExportConfig::default(),
+                &output,
+                &OperationContext::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("TexturedCube"), "{error}");
+        assert!(!output.exists());
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+    }
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn muted_morphs_keep_native_skin_without_requiring_targets() {
+    let root = test_directory();
+    let workspace = fixture_with_shapes(root.path(), false, false, true);
+    edit_fixture(
+        root.path(),
+        &workspace,
+        r#"
+import bpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
+cube=bpy.data.objects['TexturedCube']; cube.data.shape_keys.key_blocks['Smile'].mute=True
+ignored=cube.shape_key_add(name='Self relative'); ignored.relative_key=ignored
+for name,skinned in [('EmptyMorph',False),('EmptySkinnedMorph',True)]:
+    empty=bpy.data.objects.new(name,bpy.data.meshes.new(name)); bpy.context.scene.collection.objects.link(empty)
+    empty.shape_key_add(name='Basis'); empty.shape_key_add(name='Empty expression')
+    if skinned:
+        empty.modifiers.new('Rig','ARMATURE').object=bpy.data.objects['Rig']
+bpy.context.scene.frame_end=10
+bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
+"#,
     );
-    assert!(!generated.exists());
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let output = root.path().join("muted.glb");
+    BlenderRunner::new(executable())
+        .generate_glb(
+            &workspace,
+            &workspace,
+            &ExportConfig::default(),
+            &output,
+            &OperationContext::default(),
+        )
+        .unwrap();
+    let (document, _) = glb_document(&output);
+    for name in ["EmptyMorph", "EmptySkinnedMorph"] {
+        assert!(
+            document["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|node| { node["name"] != name || node["mesh"].is_null() })
+        );
+    }
+    let node = document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "TexturedCube")
+        .unwrap();
+    assert!(node["skin"].is_u64());
+    let mesh = &document["meshes"][node["mesh"].as_u64().unwrap() as usize];
+    assert!(
+        mesh["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|primitive| {
+                primitive["targets"]
+                    .as_array()
+                    .is_none_or(|targets| targets.is_empty())
+                    && primitive["attributes"]["JOINTS_0"].is_u64()
+                    && primitive["attributes"]["WEIGHTS_0"].is_u64()
+            })
+    );
+    assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
+fn morph_export_rejects_missing_callbacks_and_lost_targets() {
+    let root = test_directory();
+    let workspace = fixture_with_shapes(root.path(), false, false, true);
+    let original = fs::read(workspace.join("main.blend")).unwrap();
+    let worker = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("blender/edge_lock.py");
+    let setup = format!(
+        r#"
+import bpy, runpy, sys
+from pathlib import Path
+root=Path(sys.argv[-1])
+for broken_callbacks in (True,False):
+    worker=runpy.run_path({worker})
+    extension=worker['MorphSafeExport']
+    if broken_callbacks:
+        delattr(extension,'gather_node_mesh_hook'); delattr(extension,'gather_node_hook')
+    else:
+        original_hook=extension.gather_node_hook
+        def lose_targets(self,node,obj,settings):
+            if obj and obj.type=='MESH' and obj.data.shape_keys and node.mesh:
+                node.mesh.primitives[0].targets=[]
+            original_hook(self,node,obj,settings)
+        extension.gather_node_hook=lose_targets
+    output=root.parent/('missing-callbacks.glb' if broken_callbacks else 'lost-targets.glb')
+    try:
+        worker['run']({{'protocolVersion':1,'operation':'generate','workspace':str(root),'blendFile':str(root/'main.blend'),'destination':str(output)}})
+    except ValueError as error:
+        assert 'GLB non publié' in str(error),str(error)
+        assert 'Callbacks' in str(error) if broken_callbacks else 'morphs' in str(error),str(error)
+    else:
+        raise AssertionError('A degraded export must be rejected even when Blender reports FINISHED')
+    finally:
+        output.unlink(missing_ok=True)
+"#,
+        worker = serde_json::to_string(&worker).unwrap()
+    );
+    edit_fixture(root.path(), &workspace, &setup);
     assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
 }
 

@@ -28,6 +28,7 @@ const paths = {
   open: "M14 3h7v7m0-7L10 14M10 3H3v18h18v-7",
   refresh: "M20 7A9 9 0 0 0 4 6L2 9m0-6v6h6m-4 8a9 9 0 0 0 16 1l2-3m0 6v-6h-6",
   warning: "m12 3 10 18H2L12 3Zm0 6v5m0 3h.01",
+  help: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM9.4 9a2.7 2.7 0 0 1 5.2 1c0 1.8-2.6 2.1-2.6 4m0 3h.01",
   play: "m8 4 12 8-12 8V4Z",
   pause: "M7 4v16M17 4v16",
   focus: "M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M8 12h8m-4-4v8",

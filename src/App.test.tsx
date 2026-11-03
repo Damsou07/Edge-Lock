@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -90,6 +90,37 @@ beforeEach(() => {
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("ouvre l’aide sans bibliothèque et retrouve le contexte après fermeture", async () => {
+    vi.spyOn(HTMLDialogElement.prototype, "showModal").mockImplementation(
+      function (this: HTMLDialogElement) {
+        this.setAttribute("open", "");
+      },
+    );
+    vi.spyOn(HTMLDialogElement.prototype, "close").mockImplementation(function (
+      this: HTMLDialogElement,
+    ) {
+      this.removeAttribute("open");
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Choisir un dossier" });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Aide et mode d’emploi" }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "Aide et mode d’emploi",
+    });
+    expect(
+      within(dialog).getByRole("heading", { name: /1 \.blend \+ 1 \.glb/ }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Fermer" }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Choisir un dossier" }),
+    ).toBeInTheDocument();
+    expect(api.startJob).not.toHaveBeenCalled();
+  });
   it("désactive le menu d’optimisation sans bibliothèque ouverte", async () => {
     render(<App />);
     await screen.findByRole("button", { name: "Choisir un dossier" });

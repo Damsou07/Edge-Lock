@@ -21,7 +21,9 @@ Le worker `generate` ouvre une copie cohérente avec les scripts désactivés, r
 
 Les dépendances externes disponibles sont autorisées pour le GLB canonique ; les dépendances utilisées manquantes sont refusées. Les références secondaires inutilisées n’empêchent pas la conversion. Aucune substitution magenta n’est publiée dans le GLB canonique. L’export explicite conserve sa validation stricte des dépendances figées.
 
-Les armatures sont exportées sous forme de skins glTF. Les shape keys sans modificateur sont autorisées ; une combinaison dont l’évaluation perdrait les morphs est refusée explicitement. Les fonctionnalités propres à Blender restent soumises aux limites de glTF.
+Les armatures sont exportées sous forme de skins glTF. Les shape keys sans modificateur sont autorisées. Pour les morphs relatifs associés à une unique Armature active et valide, une extension glTF embarquée dans le worker utilise les données originales du maillage, sans évaluation destructrice des morphs. Les autres objets continuent d’évaluer leurs modificateurs. L’extension existe seulement en mémoire dans les préférences du processus isolé ; elle ne modifie ni l’installation Blender ni le `.blend`.
+
+Les hooks natifs encadrent le réglage `gltf_apply` par une pile pour les hiérarchies récursives et classifient aussi les objets de collections instanciées. Ils contrôlent la présence des skins et des morph targets attendus, selon les exclusions natives des shape keys. Les erreurs des hooks étant interceptées par l’exporteur, elles sont mémorisées puis vérifiées après l’export avant toute publication. Les autres piles avec shape keys sont refusées explicitement, avec les noms de l’objet et des modificateurs. Aucun baking personnalisé n’est ajouté. Les fonctionnalités propres à Blender restent soumises aux limites de glTF.
 
 ## Synchronisation et publication
 
@@ -43,6 +45,10 @@ Les contrats utilisent `camelCase`. `get_workspace_status(variantId)` et `edge-l
 La fiche s’abonne avant sa lecture initiale, ignore les révisions anciennes et recharge l’aperçu courant pour un nouvel artefact réussi. Elle garde le dernier affichage pendant le traitement et libère les ressources obsolètes. La clé d’aperçu ne dépend pas du rafraîchissement global du catalogue, évitant les boucles. Les événements courants ne déplacent pas une consultation historique.
 
 Les fichiers et changements sont renouvelés après stabilisation. Le bouton de version utilise l’autorisation backend et reste indisponible pendant vérification, conversion, erreur ou non-conformité. Les contrôles de source/export et de GLB courant ont disparu. Un GLB vide valide affiche un état calme. Les erreurs gardent l’accès au dossier et à Blender et proposent une reprise.
+
+L’aide permanente de la barre latérale réutilise la modale accessible, sans dépendre d’une bibliothèque active. Elle rappelle le contrat récursif du workspace synchronisé (un `.blend` source et un `.glb` dérivé) et distingue la phase d’import où le GLB peut encore manquer.
+
+Le tableau Fichiers filtre uniquement le manifeste déjà chargé, courant ou historique : extension normalisée du nom de fichier, dossiers/sans extension et bornes de taille inclusives en base 1024. Le filtrage précède la pagination de 100 entrées. La sélection asset/variante/version délimite l’état des filtres ; un rafraîchissement de cette même sélection les conserve. Aucune lecture disque, migration ou modification IPC n’est nécessaire.
 
 La galerie lit les dernières PNG via `get_asset_thumbnails`, puis prépare les seules cartes visibles avec un job `thumbnail` à la fois. La première variante représente l’asset ; sa vignette et son aperçu utilisent le même GLB canonique.
 

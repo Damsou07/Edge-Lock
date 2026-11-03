@@ -1,6 +1,33 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les bilans du 3 novembre 2026 concernent le diagnostic global du stockage, Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les bilans du 3 novembre 2026 concernent l’export des personnages avec morphs, l’aide, les filtres de fichiers, le diagnostic global du stockage, Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+
+## Export des personnages, aide et filtres — 3 novembre 2026
+
+L’inspection en lecture seule du personnage a identifié 42 maillages à morphs relatifs, chacun associé à une unique Armature. Le refus venait du garde-fou Edge Lock appliqué à toute combinaison shape keys/modificateurs. Le worker utilise désormais les données originales pour cette combinaison compatible, via une extension glTF uniquement en mémoire ; les autres objets gardent leurs modificateurs évalués. Les piles hors de ce cas restent refusées explicitement, sans perte du dernier GLB. Aucun changement de schéma, de protocole ou de dépendance n’est ajouté.
+
+### TDD et contrôles automatisés
+
+- Deux tests Blender ont échoué sur le refus initial avant correction ; l’accès à l’aide a également été constaté en échec avant son implémentation, en test frontend puis sur l’ancien binaire Windows.
+- **126 tests frontend passent dans 16 fichiers** avec `npm test -- --maxWorkers=2`. Ils couvrent aide, règles, historique, filtres combinés, bornes inclusives, tailles nulles/négatives/décimales, absence d’extension, pagination, rafraîchissement et changements de sélection. Une relance non limitée pendant les compilations parallèles avait rencontré des dépassements de délai ; la limite de workers permet l’exécution complète sans modifier les délais des tests.
+- **94 tests Rust ordinaires passent** avec `cargo test --workspace --locked`.
+- **22 tests Blender réels passent avec Blender 5.1.1** : 17 tests du worker, 4 du cache/aperçu et le parcours de synchronisation canonique. Les six régressions consacrées aux morphs vérifient les trois chemins export/génération/aperçu, les drivers réellement variables, skins et poids, textures/UV, scènes mixtes avec Mirror, hiérarchies, données partagées et instances. Elles couvrent aussi clés muettes/autoréférentes, maillages vides, callbacks absents, cibles perdues et conservation du dernier GLB et des sources après refus.
+- **4 tests Node des fixtures passent**, y compris la création et la sauvegarde d’un Mirror avec Blender réel.
+- TypeScript, ESLint, Prettier global, `cargo fmt --all --check`, Clippy de toutes les cibles avec `-D warnings`, build Vite et build Tauri debug sans bundle réussissent. Un lint Clippy introduit dans le test des poids a été corrigé avant le passage final.
+
+Les temporaires Rust sont isolés sous `.test-data/morph-tests-temp`. Les avertissements du cache incrémental Rust indiquent une copie à la place des liens physiques et n’empêchent pas la construction.
+
+### Application Windows et personnage réel
+
+Le parcours WebView2 final `.test-data/desktop-zBxJ6e/report.json` est **`passed` pour 17 groupes de contrôles**, avec bibliothèque, réglages et profil WebView jetables. Il vérifie l’aide avant ouverture d’une bibliothèque et depuis la fiche, ouverture par Entrée, navigation Tab, fermeture Échap et retour du focus, filtres type/taille combinés, bornes exactes, plage invalide et réinitialisation. Les captures de l’aide et des filtres à 1440 et 1024 pixels ont été examinées. Le premier passage réussi `.test-data/desktop-FUufgT` avait révélé une troncature du libellé d’aide à 1024 pixels : le retour à la ligne est corrigé, reconstruit puis contrôlé visuellement et automatiquement dans le passage final.
+
+Le personnage est importé dans la bibliothèque jetable depuis sa source personnelle lue seule : **42 maillages à morphs, un skin, une animation et les huit expressions de `EXP_Iris.R` sont conservés**. Les échantillons de poids de son animation varient réellement dans le GLB ; l’aperçu et la vignette sont affichés. La capture `17-character-viewer.png` a été examinée. Les hashes, tailles et dates de modification de tous les fichiers de la source personnelle et le contenu du workspace importé restent identiques après consultation.
+
+Les parcours de non-régression conservent import strict, synchronisation Mirror, versions/variantes, exports historiques, textures, stockage et redémarrage. Dix allers-retours maintiennent un contexte WebGL au maximum dans la fiche, aucun dans la galerie et aucune URL blob conservée. Le benchmark distinct de 50 imports est explicitement omis avec `EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1` ; le scénario optionnel Kitsune n’est pas demandé dans ce passage.
+
+Le binaire final `target/debug/edge-lock.exe` indique **Edge Lock 0.2.0**, mesure **24 882 176 octets** et a pour SHA-256 `6B3A42C402F8930D9FAF36D319B1AD51001F9F94939693D8A6F0E8CB639BE5E9`. Ses octets contiennent le worker courant vérifié. Aucun installateur n’est produit et aucune installation ou mise à niveau n’est effectuée sur le poste personnel.
+
+Le test facultatif du personnage se lance en renseignant `EDGE_LOCK_E2E_CHARACTER_SOURCE` avec un dossier contenant le `.blend` unique avant `npm run test:desktop`. Il importe une copie isolée, vérifie les données du personnage connu (`EXP_Iris.R`) et compare la source avant/après ; les tests automatisés ordinaires restent exclusivement synthétiques.
 
 ## Diagnostic global et menu d’optimisation — 3 novembre 2026
 

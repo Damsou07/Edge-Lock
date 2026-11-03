@@ -18,6 +18,7 @@ import {
 } from "./components/AssetForms";
 import { AssetDetailView } from "./components/AssetDetailView";
 import { StorageOptimizationView } from "./components/StorageOptimizationView";
+import { HelpModal } from "./components/HelpModal";
 import {
   errorMessage,
   formatBytes,
@@ -195,7 +196,7 @@ export default function App() {
   const [section, setSection] = useState<"assets" | "storage">("assets");
   const navigation = useRef(0);
   const [modal, setModal] = useState<
-    "import" | "create" | "settings" | "category" | "game" | null
+    "import" | "create" | "settings" | "category" | "game" | "help" | null
   >(null);
   const [importSource, setImportSource] = useState("");
   const [generation, setGeneration] = useState(0);
@@ -594,6 +595,13 @@ export default function App() {
               </span>
             </div>
           </div>
+          <button
+            className="nav-item help-nav-item"
+            onClick={() => setModal("help")}
+          >
+            <Icon name="help" size={17} />
+            <span>Aide et mode d’emploi</span>
+          </button>
           <button className="nav-item" onClick={() => setModal("settings")}>
             <Icon name="settings" size={17} />
             <span>Réglages</span>
@@ -935,6 +943,7 @@ export default function App() {
         )}
       </main>
       <Jobs jobs={jobs} dismiss={dismiss} onError={setError} />
+      {modal === "help" && <HelpModal onClose={() => setModal(null)} />}
       {(modal === "import" || modal === "create") && (
         <CreateAssetModal
           mode={modal}

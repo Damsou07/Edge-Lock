@@ -214,6 +214,149 @@ async function clickSelector(selector) {
   );
 }
 
+async function keyPress(value) {
+  await request("POST", `/session/${session}/actions`, {
+    actions: [
+      {
+        type: "key",
+        id: "help-keyboard",
+        actions: [
+          { type: "keyDown", value },
+          { type: "keyUp", value },
+        ],
+      },
+    ],
+  });
+}
+
+async function testHelp(width, height) {
+  await viewport(width, height);
+  assert.equal(
+    await script(`
+    const button=[...document.querySelectorAll('button')].find(b=>b.textContent.includes('Aide et mode d’emploi'));
+    const label=button?.querySelector('span');
+    return !!label && label.scrollWidth<=label.clientWidth+1;
+  `),
+    true,
+    "The full help label must remain readable at this width",
+  );
+  await script(
+    `const button=[...document.querySelectorAll('button')].find(b=>b.textContent.includes('Aide et mode d’emploi')); if(!button) throw new Error('Help unavailable'); button.focus();`,
+  );
+  await keyPress("\uE007");
+  await until(() => script("return !!document.querySelector('dialog[open]');"));
+  assert.equal(
+    await script(`
+    const dialog=document.querySelector('dialog[open]');
+    const rect=dialog.getBoundingClientRect();
+    return dialog.contains(document.activeElement) && rect.left>=0 && rect.right<=innerWidth && dialog.scrollWidth<=dialog.clientWidth+1
+      && dialog.textContent.includes('.blend') && dialog.textContent.includes('.glb')
+      && dialog.textContent.includes('.blend1') && !!dialog.querySelector('nav a[href^="#"]');
+  `),
+    true,
+    "Help must be keyboard accessible, explain the file rule and fit the window",
+  );
+  await screenshot(`help-${width}.png`);
+  await keyPress("\uE004");
+  assert.equal(
+    await script(
+      "return document.querySelector('dialog[open]').contains(document.activeElement);",
+    ),
+    true,
+  );
+  await keyPress("\uE00C");
+  await until(() => script("return !document.querySelector('dialog[open]');"));
+  assert.equal(
+    await script(
+      "return document.activeElement?.textContent.includes('Aide et mode d’emploi');",
+    ),
+    true,
+  );
+}
+
+async function setFilter(selector, value) {
+  await script(
+    `
+    const input=document.querySelector(arguments[0]);
+    const prototype=input.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype,'value').set.call(input,arguments[1]);
+    input.dispatchEvent(new Event(input.tagName==='SELECT'?'change':'input',{bubbles:true}));
+  `,
+    [selector, value],
+  );
+}
+
+async function testFileFilters() {
+  await clickText("Fichiers");
+  await until(() =>
+    script("return !!document.querySelector('.file-filters');"),
+  );
+  const type = '[aria-label="Type de fichier"]';
+  const minimum = '[aria-label="Taille minimum"]';
+  const maximum = '[aria-label="Taille maximum"]';
+  const unit = '[aria-label="Unité de taille"]';
+  const txtValue = await script(
+    `return [...document.querySelector(arguments[0]).options].find(o=>o.textContent.toLowerCase().includes('txt'))?.value;`,
+    [type],
+  );
+  assert.ok(txtValue, "Available extensions must include the notes text file");
+  await setFilter(type, txtValue);
+  await until(() =>
+    script(
+      "return document.querySelectorAll('.file-row').length===1 && document.querySelector('.file-row code').textContent==='notes.txt';",
+    ),
+  );
+  const bytesValue = await script(
+    `return [...document.querySelector(arguments[0]).options].find(o=>o.textContent==='o')?.value;`,
+    [unit],
+  );
+  assert.notEqual(bytesValue, undefined);
+  await setFilter(unit, bytesValue);
+  await setFilter(minimum, "8");
+  await setFilter(maximum, "8");
+  assert.equal(
+    await script("return document.querySelectorAll('.file-row').length;"),
+    1,
+    "Exact inclusive bounds must keep the eight-byte notes file",
+  );
+  for (const [width, height] of [
+    [1440, 940],
+    [1024, 700],
+  ]) {
+    await viewport(width, height);
+    await script(
+      "document.querySelector('.file-filters').scrollIntoView({block:'center'});",
+    );
+    assert.equal(
+      await script(
+        `return [...document.querySelectorAll('.file-filters input,.file-filters select,.file-filters button')].every(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;});`,
+      ),
+      true,
+    );
+    await screenshot(`file-filters-${width}.png`);
+    await testHelp(width, height);
+  }
+  await setFilter(minimum, "9");
+  assert.equal(
+    await script("return document.querySelectorAll('.file-row').length;"),
+    0,
+  );
+  assert.equal(
+    await script(
+      "return !!document.querySelector('.file-panel [role=alert]');",
+    ),
+    true,
+  );
+  await clickSelector(".file-filters button");
+  await until(() =>
+    script("return document.querySelectorAll('.file-row').length>1;"),
+  );
+  await viewport(1440, 940);
+  report.checks.push(
+    "Aide accessible au clavier avant bibliothèque et depuis la fiche ; règle .blend/.glb et sommaire ; filtres type/taille combinés et bornes inclusives, plage invalide et réinitialisation ; captures 1440/1024 px",
+  );
+}
+
 let viewportEmulated = false;
 async function viewport(width, height) {
   if (viewportEmulated) {
@@ -1187,6 +1330,137 @@ async function testKitsune() {
   }
 }
 
+async function testCharacterMorphs() {
+  const personalSource = await realpath(
+    resolve(process.env.EDGE_LOCK_E2E_CHARACTER_SOURCE),
+  );
+  const original = await fileManifest(personalSource);
+  report.character = { source: personalSource };
+  try {
+    const imported = await job(
+      {
+        kind: "import",
+        source: personalSource,
+        name: "Personnage — morphs et armature",
+        config: canonicalConfig,
+      },
+      600_000,
+    );
+    const variant = imported.variants[0];
+    assertWithin(
+      await realpath(testRoot),
+      await realpath(variant.workspacePath),
+    );
+    const blend = original.find(
+      (entry) => entry.kind === "file" && /\.blend$/i.test(entry.path),
+    );
+    assert.ok(blend);
+    assert.equal(
+      await fileHash(join(variant.workspacePath, blend.path)),
+      blend.hash,
+    );
+    const detail = await invoke("get_variant", { id: variant.id });
+    const glbs = detail.files.filter(
+      (entry) => entry.kind === "file" && /\.glb$/i.test(entry.path),
+    );
+    assert.equal(glbs.length, 1);
+    const bytes = await readFile(join(variant.workspacePath, glbs[0].path));
+    const document = JSON.parse(
+      bytes.subarray(20, 20 + bytes.readUInt32LE(12)).toString(),
+    );
+    const irisIndex = document.nodes.findIndex(
+      (node) => node.name === "EXP_Iris.R",
+    );
+    assert.ok(irisIndex >= 0);
+    const iris = document.nodes[irisIndex];
+    assert.notEqual(iris.skin, undefined);
+    const mesh = document.meshes[iris.mesh];
+    assert.equal(mesh.extras.targetNames.length, 8);
+    for (const primitive of mesh.primitives) {
+      assert.equal(primitive.targets.length, 8);
+      assert.notEqual(primitive.attributes.JOINTS_0, undefined);
+      assert.notEqual(primitive.attributes.WEIGHTS_0, undefined);
+    }
+    const morphMeshes = document.meshes.filter((mesh) =>
+      mesh.primitives.some((primitive) => primitive.targets?.length),
+    );
+    assert.equal(morphMeshes.length, 42);
+    assert.ok(
+      document.animations.some((animation) =>
+        animation.channels.some(
+          (channel) =>
+            channel.target.node === irisIndex &&
+            channel.target.path === "weights",
+        ),
+      ),
+      "The iris driver animation must be sampled into morph weights",
+    );
+    const irisAnimation = document.animations.find((animation) =>
+      animation.channels.some(
+        (channel) =>
+          channel.target.node === irisIndex &&
+          channel.target.path === "weights",
+      ),
+    );
+    const irisChannel = irisAnimation.channels.find(
+      (channel) =>
+        channel.target.node === irisIndex && channel.target.path === "weights",
+    );
+    const weights =
+      document.accessors[irisAnimation.samplers[irisChannel.sampler].output];
+    const view = document.bufferViews[weights.bufferView];
+    assert.equal(weights.componentType, 5126);
+    assert.equal(weights.type, "SCALAR");
+    const binaryStart = 28 + bytes.readUInt32LE(12);
+    const offset =
+      binaryStart + (view.byteOffset ?? 0) + (weights.byteOffset ?? 0);
+    const sample = (index) =>
+      bytes.readFloatLE(offset + index * (view.byteStride ?? 4));
+    assert.ok(
+      Array.from({ length: weights.count }, (_, index) => sample(index)).some(
+        (value, index) => Math.abs(value - sample(index % 8)) > 1e-5,
+      ),
+      "The character iris morph animation must vary over time",
+    );
+    report.character.geometry = {
+      meshesWithMorphs: morphMeshes.length,
+      skins: document.skins.length,
+      animations: document.animations.length,
+      irisMorphs: mesh.extras.targetNames,
+    };
+    const workspaceBefore = await fileManifest(variant.workspacePath);
+    await script("window.location.reload(); return true;");
+    await waitForThumbnail("Personnage");
+    await screenshot("16-character-library.png");
+    await clickText("Personnage — morphs et armature");
+    await waitForModel(glbs[0].path);
+    await screenshot("17-character-viewer.png");
+    assert.deepEqual(
+      await fileManifest(variant.workspacePath),
+      workspaceBefore,
+    );
+    await clickText("Retour à la bibliothèque");
+    await invoke("update_asset", {
+      id: imported.asset.id,
+      name: imported.asset.name,
+      categoryId: imported.asset.categoryId,
+      tags: imported.asset.tags,
+      gameIds: imported.asset.gameIds,
+      archived: true,
+    });
+    report.checks.push(
+      "Copie isolée du personnage : 42 maillages à morphs, huit expressions EXP_Iris.R, skins/poids et animation pilotée conservés ; aperçu et vignette affichés ; source personnelle inchangée",
+    );
+  } finally {
+    assert.deepEqual(
+      await fileManifest(personalSource),
+      original,
+      "Personal character files and modification times must remain unchanged",
+    );
+    report.character.sourcePreserved = true;
+  }
+}
+
 async function testEmptyLibraryStorage() {
   const stableManifest = async () =>
     fileManifest(
@@ -1485,6 +1759,7 @@ try {
   await viewport(1440, 940);
   await assertTheme();
   await screenshot("01-onboarding.png");
+  await testHelp(1440, 940);
   const opened = await invoke("open_library", { path: library });
   assert.equal(opened.assetCount, 0);
   await script("window.location.reload(); return true;");
@@ -1594,6 +1869,7 @@ try {
     "03-viewer.png",
   );
   await testVisualRefreshAndCanonicalRules();
+  await testFileFilters();
   await testAutomaticMirror(main);
   report.checks.push(
     "Texture PNG rouge et verte réellement visible dans la vignette statique et dans l’aperçu automatique, contrôlée par pixels des captures WebDriver",
@@ -1763,6 +2039,7 @@ try {
     "Export historique vérifié, remplacement refusé sans consentement, travail courant intact",
   );
   if (process.env.EDGE_LOCK_E2E_KITSUNE_SOURCE) await testKitsune();
+  if (process.env.EDGE_LOCK_E2E_CHARACTER_SOURCE) await testCharacterMorphs();
   const created = await job({ kind: "create", name: "Nouveau projet Blender" });
   await access(join(created.variants[0].workspacePath, "main.blend"));
   await access(join(created.variants[0].workspacePath, "main.glb"));

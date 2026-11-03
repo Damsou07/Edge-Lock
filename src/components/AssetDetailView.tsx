@@ -23,7 +23,6 @@ import { defaultExportConfig } from "../contracts";
 import { useWorkspaceStatus } from "../lib/useWorkspaceStatus";
 import {
   errorMessage,
-  extension,
   formatBytes,
   formatCount,
   formatDate,
@@ -33,6 +32,7 @@ import { Icon } from "./Icon";
 import { MetadataModal } from "./AssetForms";
 import { Modal } from "./Modal";
 import { HistoryStorageModal, RestoreBackupModal } from "./HistoryStorageModal";
+import { AssetFilesPanel } from "./AssetFilesPanel";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
@@ -177,7 +177,6 @@ export function AssetDetailView({
   const [previewFile, setPreviewFile] = useState("");
   const [localRefresh, setLocalRefresh] = useState(0);
   const [tab, setTab] = useState<"files" | "history" | "changes">("files");
-  const [fileLimit, setFileLimit] = useState(100);
   const [modal, setModal] = useState<
     "metadata" | "snapshot" | "variant" | null
   >(null);
@@ -307,7 +306,6 @@ export function AssetDetailView({
     setPreviewError("");
     setPreviewCandidates([]);
     setPreviewFile("");
-    setFileLimit(100);
   }, [selection]);
   useEffect(() => {
     if (!variantId) return;
@@ -1020,54 +1018,12 @@ export function AssetDetailView({
             Actualiser
           </button>
         </div>
-        {tab === "files" && (
-          <div role="tabpanel" className="file-panel">
-            {files.length ? (
-              <>
-                <div className="file-table-header">
-                  <span>NOM</span>
-                  <span>TYPE</span>
-                  <span>TAILLE</span>
-                </div>
-                {files.slice(0, fileLimit).map((file) => (
-                  <div className="file-row" key={file.path}>
-                    <span>
-                      <Icon
-                        name={file.kind === "directory" ? "folder" : "file"}
-                        size={17}
-                      />
-                      <code>{file.path}</code>
-                      {file.path === activeConfig.primaryFile && (
-                        <span className="primary-file-badge">Principal</span>
-                      )}
-                    </span>
-                    <span>
-                      {file.kind === "directory"
-                        ? "Dossier"
-                        : extension(file.path)}
-                    </span>
-                    <span>
-                      {file.kind === "directory" ? "—" : formatBytes(file.size)}
-                    </span>
-                  </div>
-                ))}
-                {files.length > fileLimit && (
-                  <button
-                    className="button secondary load-more"
-                    onClick={() => setFileLimit((value) => value + 100)}
-                  >
-                    Afficher les 100 suivants
-                  </button>
-                )}
-              </>
-            ) : (
-              <div className="small-empty">
-                <Icon name="folder" size={24} />
-                <p>Ce dossier est prêt à accueillir vos fichiers.</p>
-              </div>
-            )}
-          </div>
-        )}
+        <AssetFilesPanel
+          key={selection}
+          files={files}
+          primaryFile={activeConfig.primaryFile}
+          hidden={tab !== "files"}
+        />
         {tab === "history" && (
           <div role="tabpanel" className="history-panel">
             <div className="history-storage-actions">

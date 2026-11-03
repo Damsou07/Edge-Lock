@@ -163,6 +163,40 @@ function renderDetail() {
 }
 
 describe("versions, aperçu et dépendances", () => {
+  it("conserve les filtres au rafraîchissement et les réinitialise pour une autre version", async () => {
+    const props = {
+      id: "asset-1",
+      taxonomy: { categories: [], games: [], tags: [] },
+      generation: 0,
+      onBack: vi.fn(),
+      onChanged: vi.fn(),
+      onError,
+      runJob: run as RunJob,
+    };
+    const { rerender } = render(<AssetDetailView {...props} />);
+    await screen.findByText("Modifications non versionnées");
+    await userEvent.type(screen.getByLabelText("Taille minimum"), "12");
+    const readsBeforeRefresh = vi.mocked(api.getVariant).mock.calls.length;
+    rerender(<AssetDetailView {...props} generation={1} />);
+    await waitFor(() =>
+      expect(vi.mocked(api.getVariant).mock.calls.length).toBeGreaterThan(
+        readsBeforeRefresh,
+      ),
+    );
+    expect(screen.getByLabelText("Taille minimum")).toHaveValue(12);
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /Fichiers/ }));
+    expect(screen.getByLabelText("Taille minimum")).toHaveValue(12);
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Consulter/ }),
+    );
+    await userEvent.click(screen.getByRole("tab", { name: /Fichiers/ }));
+    expect(screen.getByLabelText("Taille minimum")).toHaveValue(null);
+    expect(
+      await within(screen.getByRole("tabpanel")).findByText("10 o"),
+    ).toBeInTheDocument();
+  });
   it("affiche la géométrie de la variante et les tailles de la version sélectionnée", async () => {
     renderDetail();
     await screen.findByText("Modifications non versionnées");
