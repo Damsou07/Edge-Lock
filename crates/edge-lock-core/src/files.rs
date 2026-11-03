@@ -2,7 +2,7 @@ use crate::{CoreError, ManifestEntry, OperationContext, Result};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
@@ -113,6 +113,154 @@ fn inventory(root: &Path, ctx: &OperationContext) -> Result<BTreeMap<String, Fin
 }
 
 impl FileStore {
+    // An explicit suffix distinguishes the codec; raw objects may themselves contain Zstd data.
+    pub fn stored_path(&self, hash: &str) -> Result<PathBuf> {
+        let raw = self.object_path(hash)?;
+        let compressed = raw.with_extension("zst");
+        Ok(if fs::symlink_metadata(&compressed).is_ok() {
+            compressed
+        } else {
+            raw
+        })
+    }
+
+    pub fn copy_object(
+        &self,
+        hash: &str,
+        size: u64,
+        output: &mut impl Write,
+        ctx: &OperationContext,
+    ) -> Result<()> {
+        Self::decode_object(&self.stored_path(hash)?, hash, size, output, ctx)
+    }
+
+    fn decode_object(
+        path: &Path,
+        hash: &str,
+        expected: u64,
+        output: &mut impl Write,
+        ctx: &OperationContext,
+    ) -> Result<()> {
+        let meta = fs::symlink_metadata(path)?;
+        if is_link(&meta) || !meta.is_file() {
+            return Err(CoreError::Inconsistent("Objet invalide.".into()));
+        }
+        let file = File::open(path)?;
+        let mut input: Box<dyn Read> = if path.extension().is_some_and(|ext| ext == "zst") {
+            let mut decoder = zstd::stream::read::Decoder::new(file)?;
+            decoder.window_log_max(23)?;
+            Box::new(decoder)
+        } else {
+            Box::new(file)
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        let mut size = 0u64;
+        loop {
+            ctx.check_cancelled()?;
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            size = size
+                .checked_add(count as u64)
+                .ok_or_else(|| CoreError::Inconsistent("Taille d’objet invalide.".into()))?;
+            if size > expected {
+                return Err(CoreError::Inconsistent(format!(
+                    "Objet trop grand : {hash}"
+                )));
+            }
+            hasher.update(&buffer[..count]);
+            output.write_all(&buffer[..count])?;
+            ctx.report("Lecture des objets", size, Some(expected));
+        }
+        if size != expected || hasher.finalize().to_hex().as_str() != hash {
+            return Err(CoreError::Inconsistent(format!("Objet corrompu : {hash}")));
+        }
+        Ok(())
+    }
+
+    fn compressed(
+        &self,
+        source: &Path,
+        hash: &str,
+        size: u64,
+        ctx: &OperationContext,
+    ) -> Result<Option<tempfile::NamedTempFile>> {
+        let mut compressed = tempfile::Builder::new()
+            .suffix(".zst")
+            .tempfile_in(&self.staging)?;
+        let mut encoder = zstd::stream::write::Encoder::new(&mut compressed, 3)?;
+        encoder.window_log(23)?;
+        encoder.include_checksum(true)?;
+        encoder.set_pledged_src_size(Some(size))?;
+        let mut source = File::open(source)?;
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            ctx.check_cancelled()?;
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            encoder.write_all(&buffer[..count])?;
+        }
+        encoder.finish()?;
+        if compressed.as_file().metadata()?.len() >= size {
+            return Ok(None);
+        }
+        compressed.as_file().sync_all()?;
+        Self::decode_object(compressed.path(), hash, size, &mut std::io::sink(), ctx)?;
+        Ok(Some(compressed))
+    }
+
+    pub fn recompress(&self, hash: &str, size: u64, ctx: &OperationContext) -> Result<u64> {
+        let raw = self.object_path(hash)?;
+        if !raw.exists() {
+            self.verify_object(hash, size, ctx)?;
+            return Ok(0);
+        }
+        Self::decode_object(&raw, hash, size, &mut std::io::sink(), ctx)?;
+        let destination = raw.with_extension("zst");
+        if destination.exists() {
+            self.verify_object(hash, size, ctx)?;
+            ctx.check_cancelled()?;
+            fs::remove_file(raw)?;
+            return Ok(size);
+        }
+        if let Some(compressed) = self.compressed(&raw, hash, size, ctx)? {
+            let saved = size - compressed.as_file().metadata()?.len();
+            ctx.check_cancelled()?;
+            compressed
+                .persist_noclobber(destination)
+                .map_err(|e| CoreError::Io(e.error))?;
+            fs::remove_file(raw)?;
+            return Ok(saved);
+        }
+        Ok(0)
+    }
+
+    pub fn recompression_savings(
+        &self,
+        hash: &str,
+        size: u64,
+        ctx: &OperationContext,
+    ) -> Result<u64> {
+        let raw = self.object_path(hash)?;
+        self.verify_object(hash, size, ctx)?;
+        if !raw.exists() {
+            return Ok(0);
+        }
+        Self::decode_object(&raw, hash, size, &mut std::io::sink(), ctx)?;
+        if raw.with_extension("zst").exists() {
+            return Ok(size);
+        }
+        Ok(self
+            .compressed(&raw, hash, size, ctx)?
+            .map(|f| f.as_file().metadata().map(|m| size - m.len()))
+            .transpose()?
+            .unwrap_or(0))
+    }
+
     pub fn object_path(&self, hash: &str) -> Result<PathBuf> {
         if hash.len() != 64
             || !hash
@@ -215,13 +363,19 @@ impl FileStore {
                 )));
             }
             let hash = hasher.finalize().to_hex().to_string();
-            if let Some(temp) = temp {
+            if let Some(mut temp) = temp {
                 temp.as_file().sync_all()?;
                 let destination = self.object_path(&hash)?;
                 fs::create_dir_all(destination.parent().expect("object parent"))?;
-                if destination.exists() {
+                if self.stored_path(&hash)?.exists() {
                     self.verify_object(&hash, size, ctx)?;
+                } else if let Some(compressed) = self.compressed(temp.path(), &hash, size, ctx)? {
+                    ctx.check_cancelled()?;
+                    compressed
+                        .persist_noclobber(destination.with_extension("zst"))
+                        .map_err(|error| CoreError::Io(error.error))?;
                 } else {
+                    temp.rewind()?;
                     temp.persist_noclobber(&destination)
                         .map_err(|error| CoreError::Io(error.error))?;
                 }
@@ -243,29 +397,13 @@ impl FileStore {
         Ok(entries)
     }
 
-    fn verify_object(&self, hash: &str, expected_size: u64, ctx: &OperationContext) -> Result<()> {
-        let path = self.object_path(hash)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if is_link(&metadata) || !metadata.is_file() || metadata.len() != expected_size {
-            return Err(CoreError::Inconsistent(format!(
-                "Objet absent ou corrompu : {hash}"
-            )));
-        }
-        let mut input = File::open(path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            ctx.check_cancelled()?;
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-        }
-        if hasher.finalize().to_hex().as_str() != hash {
-            return Err(CoreError::Inconsistent(format!("Objet corrompu : {hash}")));
-        }
-        Ok(())
+    pub fn verify_object(
+        &self,
+        hash: &str,
+        expected_size: u64,
+        ctx: &OperationContext,
+    ) -> Result<()> {
+        self.copy_object(hash, expected_size, &mut std::io::sink(), ctx)
     }
 
     pub fn materialize(
@@ -299,33 +437,12 @@ impl FileStore {
                         .hash
                         .as_deref()
                         .ok_or_else(|| CoreError::Inconsistent("Fichier sans hash.".into()))?;
-                    let source = self.object_path(hash)?;
-                    let meta = fs::symlink_metadata(&source)?;
-                    if is_link(&meta) || !meta.is_file() {
-                        return Err(CoreError::Inconsistent("Objet invalide.".into()));
-                    }
                     fs::create_dir_all(path.parent().expect("file parent"))?;
-                    let mut input = File::open(source)?;
                     let mut output = File::create(path)?;
-                    let mut hasher = blake3::Hasher::new();
-                    let mut buffer = vec![0u8; 1024 * 1024];
-                    let mut size = 0u64;
-                    loop {
-                        ctx.check_cancelled()?;
-                        let count = input.read(&mut buffer)?;
-                        if count == 0 {
-                            break;
-                        }
-                        output.write_all(&buffer[..count])?;
-                        hasher.update(&buffer[..count]);
-                        size += count as u64;
-                        completed += count as u64;
-                        ctx.report("materialize", completed, Some(total));
-                    }
+                    self.copy_object(hash, entry.size, &mut output, ctx)?;
+                    completed += entry.size;
+                    ctx.report("materialize", completed, Some(total));
                     output.sync_all()?;
-                    if size != entry.size || hasher.finalize().to_hex().as_str() != hash {
-                        return Err(CoreError::Inconsistent(format!("Objet corrompu : {hash}")));
-                    }
                 }
                 _ => return Err(CoreError::Inconsistent("Type d’entrée inconnu.".into())),
             }
@@ -382,6 +499,46 @@ pub(crate) fn list_files(root: &Path) -> Result<Vec<ManifestEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_and_legacy_objects_round_trip_and_reject_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("empty")).unwrap();
+        let content = vec![42; 3 * 1024 * 1024];
+        fs::write(source.join("model.blend"), &content).unwrap();
+        fs::write(source.join("tiny.txt"), b"tiny").unwrap();
+        let store = FileStore {
+            objects: dir.path().join("objects"),
+            staging: dir.path().to_path_buf(),
+        };
+        fs::create_dir(&store.objects).unwrap();
+        let ctx = OperationContext::default();
+        let entries = store.capture(&source, true, &ctx).unwrap();
+        let entry = entries.iter().find(|e| e.path == "model.blend").unwrap();
+        let hash = entry.hash.as_deref().unwrap();
+        let encoded = store.stored_path(hash).unwrap();
+        assert_eq!(encoded.extension().unwrap(), "zst");
+        assert!(fs::metadata(&encoded).unwrap().len() < 1024);
+        let output = dir.path().join("restored");
+        store.materialize(&entries, &output, &ctx).unwrap();
+        assert_eq!(fs::read(output.join("model.blend")).unwrap(), content);
+        assert!(output.join("empty").is_dir());
+        // Legacy raw object, including a raw file whose bytes happen to be a Zstd frame.
+        fs::rename(&encoded, dir.path().join("encoded.zst")).unwrap();
+        fs::write(store.object_path(hash).unwrap(), &content).unwrap();
+        store
+            .verify_object(hash, content.len() as u64, &ctx)
+            .unwrap();
+        assert!(store.recompress(hash, content.len() as u64, &ctx).unwrap() > 0);
+        assert!(!store.object_path(hash).unwrap().exists());
+        assert!(store.verify_object(hash, 2, &ctx).is_err());
+        let frame = fs::read(&encoded).unwrap();
+        fs::write(&encoded, &frame[..frame.len() - 1]).unwrap();
+        let failed = dir.path().join("failed");
+        assert!(store.materialize(&entries, &failed, &ctx).is_err());
+        assert!(!failed.exists());
+    }
 
     #[test]
     fn manifest_paths_cannot_escape_or_address_windows_streams() {

@@ -13,7 +13,11 @@ use std::{
 };
 
 const FORMAT: &str = "edge-lock-library-v1\n";
-const SCHEMA_VERSION: i64 = 1;
+#[path = "history.rs"]
+mod history;
+pub use history::StorageAction;
+
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES categories(id));
 CREATE TABLE games(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
@@ -135,11 +139,11 @@ impl Library {
             )));
         }
         let foreign_key_error = connection.prepare("PRAGMA foreign_key_check")?.exists([])?;
-        let invalid_head: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots s ON s.id=v.head_snapshot_id WHERE s.id IS NULL OR s.variant_id<>v.id)", [], |row| row.get(0))?;
+        let invalid_head: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots s ON s.id=v.head_snapshot_id LEFT JOIN snapshots b ON b.id=v.backup_snapshot_id LEFT JOIN variants bv ON bv.id=b.variant_id WHERE s.id IS NULL OR s.variant_id<>v.id OR s.storage_kind<>'full' OR (v.backup_snapshot_id IS NOT NULL AND (b.id IS NULL OR b.storage_kind<>'full' OR bv.asset_id<>v.asset_id)))", [], |row| row.get(0))?;
         if foreign_key_error || invalid_head {
             return Err(CoreError::Inconsistent("Le catalogue contient des références manquantes. Restaurez une sauvegarde de la bibliothèque.".into()));
         }
-        let mut notices = Vec::new();
+        let mut notices = history::recover_restores(&root, &mut connection)?;
         for entry in fs::read_dir(root.join("staging"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -204,20 +208,27 @@ impl Library {
             .map_err(|_| CoreError::Inconsistent("Verrou du catalogue indisponible.".into()))
     }
     fn write_guard(&self) -> Result<MutexGuard<'_, ()>> {
-        self.mutation
+        let guard = self
+            .mutation
             .lock()
-            .map_err(|_| CoreError::Inconsistent("Verrou d’écriture indisponible.".into()))
+            .map_err(|_| CoreError::Inconsistent("Verrou d’écriture indisponible.".into()))?;
+        history::ensure_no_restore(&self.root)?;
+        Ok(guard)
     }
 
     pub fn info(&self) -> Result<LibraryInfo> {
         let asset_count = self
             .db()?
             .query_row("SELECT COUNT(*) FROM assets", [], |row| sql_u64(row, 0))?;
+        let mut recovery_notices = self.recovery_notices.clone();
+        if let Err(error) = history::ensure_no_restore(&self.root) {
+            recovery_notices.push(error.to_string());
+        }
         Ok(LibraryInfo {
             root: dunce::simplified(&self.root).to_string_lossy().into_owned(),
             asset_count,
             physical_bytes: directory_bytes(&self.root)?,
-            recovery_notices: self.recovery_notices.clone(),
+            recovery_notices,
         })
     }
 
@@ -398,6 +409,7 @@ impl Library {
         let workspace = format!("workspaces/{asset_id}/{variant_id}");
         let journal = self.prepare_workspace(&variant_id, &workspace, &entries, ctx)?;
         let snapshot = Snapshot {
+            storage: SnapshotStorage::default(),
             id: snapshot_id.clone(),
             variant_id: variant_id.clone(),
             parent_id: None,
@@ -500,9 +512,10 @@ impl Library {
             ));
         }
         let snapshot = Snapshot {
+            storage: SnapshotStorage::default(),
             id: new_id(),
             variant_id: variant.id.clone(),
-            parent_id: Some(previous.id),
+            parent_id: Some(previous.id.clone()),
             created_at: now(),
             message,
             logical_bytes: entries.iter().map(|entry| entry.size).sum(),
@@ -514,7 +527,7 @@ impl Library {
         let transaction = db.transaction()?;
         insert_snapshot(&transaction, &snapshot)?;
         transaction.execute(
-            "UPDATE variants SET head_snapshot_id=?1,working_bytes=?2,triangles=NULL,config=?4 WHERE id=?3",
+            "UPDATE variants SET backup_snapshot_id=head_snapshot_id,head_snapshot_id=?1,working_bytes=?2,triangles=NULL,config=?4 WHERE id=?3",
             params![snapshot.id, sql_size(snapshot.logical_bytes)?, variant.id,serde_json::to_string(&snapshot.config)?],
         )?;
         transaction.execute(
@@ -522,7 +535,10 @@ impl Library {
             params![snapshot.created_at, variant.asset_id],
         )?;
         transaction.commit()?;
-        Ok(snapshot)
+        drop(db);
+        // The new version is already durable. Failed retention must never turn publication into failure.
+        self.rotate_history(variant_id, ctx);
+        self.get_snapshot(&snapshot.id)
     }
 
     pub fn create_variant(
@@ -534,6 +550,7 @@ impl Library {
         let _guard = self.write_guard()?;
         let name = checked_name(name)?;
         let base = self.get_snapshot(snapshot_id)?;
+        history::require_full(&base)?;
         self.publish_variant(base.clone(), &name, base.entries, base.config, ctx)
     }
 
@@ -548,6 +565,7 @@ impl Library {
         let _guard = self.write_guard()?;
         let name = checked_name(name)?;
         let base = self.get_snapshot(snapshot_id)?;
+        history::require_full(&base)?;
         let entries = self.store.capture(source, true, ctx)?;
         crate::sync::validate_project(&entries)?;
         validate_config(&config, &entries)?;
@@ -578,6 +596,7 @@ impl Library {
         }
         let journal = self.prepare_workspace(&variant_id, &workspace, &entries, ctx)?;
         let snapshot = Snapshot {
+            storage: SnapshotStorage::default(),
             id: new_id(),
             variant_id: variant_id.clone(),
             parent_id: Some(base.id),
@@ -737,6 +756,7 @@ impl Library {
         ctx: &OperationContext,
     ) -> Result<()> {
         let snapshot = self.get_snapshot(snapshot_id)?;
+        history::require_full(&snapshot)?;
         self.validate_destination(destination)?;
         self.store.materialize(&snapshot.entries, destination, ctx)
     }
@@ -790,6 +810,7 @@ impl Library {
             )?;
         }
         Ok(Snapshot {
+            storage: SnapshotStorage::default(),
             id: new_id(),
             variant_id: variant.id,
             parent_id: Some(variant.head_snapshot_id),
@@ -1015,6 +1036,22 @@ fn apply_migrations(
     if version == 0 {
         transaction.execute_batch(SCHEMA)?;
     }
+    if version < 2 {
+        transaction.execute_batch("PRAGMA user_version=2;")?;
+    }
+    if version < 3 {
+        transaction.execute_batch("
+            ALTER TABLE variants ADD COLUMN backup_snapshot_id TEXT REFERENCES snapshots(id);
+            ALTER TABLE snapshots ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'full' CHECK(storage_kind IN ('full','preview','deleted'));
+            ALTER TABLE snapshots ADD COLUMN preview_path TEXT;
+            ALTER TABLE snapshots ADD COLUMN restored_from TEXT REFERENCES snapshots(id);
+            ALTER TABLE snapshots ADD COLUMN legacy INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE snapshots ADD COLUMN preview_trusted INTEGER NOT NULL DEFAULT 1;
+            CREATE TABLE garbage_candidates(hash TEXT PRIMARY KEY,size INTEGER NOT NULL);
+            UPDATE variants SET backup_snapshot_id=(SELECT parent_id FROM snapshots WHERE id=variants.head_snapshot_id);
+            PRAGMA user_version=3;
+        ")?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1084,7 +1121,7 @@ fn resolve_config(mut config: ExportConfig, entries: &[ManifestEntry]) -> Result
 fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
     let row = db
         .query_row(
-            "SELECT id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,triangles FROM variants WHERE id=?1",
+            "SELECT id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,triangles,backup_snapshot_id FROM variants WHERE id=?1",
             [id],
             |row| {
                 Ok((
@@ -1096,6 +1133,7 @@ fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
                     row.get::<_, String>(5)?,
                     sql_u64(row,6)?,
                     sql_optional_u64(row,7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -1119,6 +1157,7 @@ fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
         name: row.2,
         workspace_path,
         head_snapshot_id: row.4,
+        backup_snapshot_id: row.8,
         config: serde_json::from_str(&row.5)?,
         working_bytes: row.6,
         triangles: row.7,
@@ -1126,7 +1165,7 @@ fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
 }
 
 fn read_snapshot_summary(db: &Connection, id: &str) -> Result<Snapshot> {
-    let mut snapshot = db.query_row("SELECT id,variant_id,parent_id,created_at,message,logical_bytes,config FROM snapshots WHERE id=?1", [id], |row| Ok((Snapshot { id:row.get(0)?,variant_id:row.get(1)?,parent_id:row.get(2)?,created_at:row.get(3)?,message:row.get(4)?,logical_bytes:sql_u64(row,5)?,config:ExportConfig::default(),entries:Vec::new() },row.get::<_,String>(6)?))).optional()?.ok_or_else(|| CoreError::NotFound(id.into()))?;
+    let mut snapshot = db.query_row("SELECT id,variant_id,parent_id,created_at,message,logical_bytes,config,storage_kind,preview_path,restored_from,legacy,EXISTS(SELECT 1 FROM variants WHERE head_snapshot_id=snapshots.id OR backup_snapshot_id=snapshots.id),preview_trusted FROM snapshots WHERE id=?1", [id], |row| Ok((Snapshot { id:row.get(0)?,variant_id:row.get(1)?,parent_id:row.get(2)?,created_at:row.get(3)?,message:row.get(4)?,logical_bytes:sql_u64(row,5)?,config:ExportConfig::default(),entries:Vec::new(), storage: SnapshotStorage { kind:row.get(7)?,preview_path:row.get(8)?,restored_from:row.get(9)?,legacy:row.get(10)?,protected:row.get(11)?,preview_trusted:row.get(12)? } },row.get::<_,String>(6)?))).optional()?.ok_or_else(|| CoreError::NotFound(id.into()))?;
     snapshot.0.config = serde_json::from_str(&snapshot.1)?;
     Ok(snapshot.0)
 }
@@ -1160,11 +1199,11 @@ fn read_snapshot_page(
     // a parent cycle. Snapshot manifests are not loaded for a history list.
     let chain = "WITH RECURSIVE history(id,parent_id) AS (SELECT s.id,s.parent_id FROM snapshots s JOIN variants v ON v.head_snapshot_id=s.id WHERE v.id=?1 UNION SELECT s.id,s.parent_id FROM snapshots s JOIN history h ON s.id=h.parent_id)";
     let total = db.query_row(
-        &format!("{chain} SELECT COUNT(*) FROM history"),
+        &format!("{chain} SELECT COUNT(*) FROM history h JOIN snapshots s ON s.id=h.id WHERE s.storage_kind<>'deleted'"),
         [variant_id],
         |row| sql_u64(row, 0),
     )?;
-    let mut statement = db.prepare(&format!("{chain} SELECT s.id FROM history h JOIN snapshots s ON s.id=h.id ORDER BY s.created_at DESC,s.id DESC LIMIT ?2 OFFSET ?3"))?;
+    let mut statement = db.prepare(&format!("{chain} SELECT s.id FROM history h JOIN snapshots s ON s.id=h.id WHERE s.storage_kind<>'deleted' ORDER BY s.created_at DESC,s.id DESC LIMIT ?2 OFFSET ?3"))?;
     let ids = statement
         .query_map(params![variant_id, limit.clamp(1, 500), offset], |row| {
             row.get::<_, String>(0)
@@ -1179,6 +1218,22 @@ fn read_snapshot_page(
 
 fn insert_snapshot(transaction: &Transaction<'_>, snapshot: &Snapshot) -> Result<()> {
     transaction.execute("INSERT INTO snapshots(id,variant_id,parent_id,created_at,message,logical_bytes,config) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![snapshot.id,snapshot.variant_id,snapshot.parent_id,snapshot.created_at,snapshot.message,sql_size(snapshot.logical_bytes)?,serde_json::to_string(&snapshot.config)?])?;
+    let glbs: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|e| {
+            e.kind == "file"
+                && Path::new(&e.path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("glb"))
+        })
+        .collect();
+    let preview = snapshot
+        .storage
+        .preview_path
+        .as_deref()
+        .or_else(|| (glbs.len() == 1).then(|| glbs[0].path.as_str()));
+    transaction.execute("UPDATE snapshots SET storage_kind=?2,preview_path=?3,restored_from=?4,legacy=?5,preview_trusted=?6 WHERE id=?1", params![snapshot.id,snapshot.storage.kind,preview,snapshot.storage.restored_from,snapshot.storage.legacy,snapshot.storage.preview_trusted])?;
     let mut statement = transaction.prepare(
         "INSERT INTO snapshot_entries(snapshot_id,path,kind,hash,size) VALUES(?1,?2,?3,?4,?5)",
     )?;

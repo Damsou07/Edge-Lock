@@ -48,13 +48,21 @@ La galerie lit les dernières PNG via `get_asset_thumbnails`, puis prépare les 
 
 ## Versions et compatibilité
 
+Le stockage reconnaît les objets bruts et les objets `.zst`, tous identifiés par le BLAKE3 des octets originaux. `files.rs` centralise compression, décompression bornée et vérification. Le schéma 3 conserve les anciennes entrées sans réduction implicite et empêche les anciennes applications d’ouvrir ce nouveau stockage.
+
+`history.rs`, sous-module de la bibliothèque, gère les rôles courant/backup, la conversion en consultation seule, les estimations confirmables, la purge des objets libérés et les journaux de restauration. Les mêmes verrous que les captures sérialisent ces mutations. Les références entre variantes restent valides grâce à des enregistrements de filiation conservés lors des suppressions. Les objets du GLB historique restent hors des caches évictables.
+
+Les jobs IPC `storagePlan`, `storageApply` et `restore` réutilisent les tâches longues existantes. La confirmation présente le résultat du plan ; le backend le recalcule et rejette un jeton périmé. Les snapshots exposent leur état de stockage et leurs protections. Les backups actifs et les versions courantes ne passent pas par la suppression ordinaire. Une restauration réconcilie la surveillance et le reçu canonique après remplacement du dossier. Les captures de sécurité sans aperçu certifié restent complètes.
+
+L’interface d’historique propose compression sans perte, conversion explicite des anciens historiques, restauration, libération du backup et suppression des aperçus anciens. Aucune fonctionnalité de nettoyage du workspace n’est prévue ; tous les fichiers ordinaires restent capturés. Meshopt est reporté.
+
 L’import copie et valide le dossier dans un staging, génère le GLB, puis publie workspace et première version. L’original reste intact. Nouveau projet et création de variante depuis un historique conforme suivent la même préparation.
 
 Le prédicat commun des changements compare les fichiers et dossiers utilisateur en excluant uniquement les fichiers `.glb`. Les anciennes options d’export ne créent pas de changement artificiel. Le GLB reste inclus dans les manifestes et comptes d’octets.
 
 La création backend synchronise puis capture le workspace. Les sources et le GLB capturés doivent correspondre au reçu : une sauvegarde externe entre conversion et capture entraîne un nouvel essai puis un refus si le projet reste instable. La porte d’opération protège contre les opérations Edge Lock concurrentes ; les empreintes protègent contre Blender.
 
-Les anciens assets non conformes ne sont ni supprimés ni réorganisés. Les historiques restent lisibles ; synchronisation et nouvelles versions sont bloquées avec diagnostic. Les aperçus historiques utilisent les données immuables ; les nouvelles générations GLB appliquent toujours les modificateurs. Le schéma SQLite reste inchangé, les reçus étant régénérables.
+Les anciens assets non conformes ne sont ni supprimés ni réorganisés. Les historiques restent lisibles ; synchronisation et nouvelles versions sont bloquées avec diagnostic. Les aperçus historiques utilisent les données immuables ; les nouvelles générations GLB appliquent toujours les modificateurs. Les reçus restent régénérables ; le stockage historique utilise le schéma 3.
 
 ## Ressources et rendu
 

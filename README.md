@@ -23,7 +23,9 @@ Les contrôles réellement exécutés et leurs limites sont détaillés dans [le
 3. **Importer un dossier** accepte exactement un `.blend` et au plus un `.glb`, sous-dossiers compris. Utiliser le sélecteur ou déposer un dossier, puis confirmer l’import. Edge Lock copie les fichiers, génère le GLB avec les modificateurs et publie la première version après réussite. Un GLB fourni est régénéré dans la copie ; le dossier d’origine reste intact. Les imports GLB seuls ne sont plus acceptés.
 4. **Nouveau projet** crée `main.blend`, son GLB et des dossiers pour textures, références, rapports et captures. Une scène vide affiche un état adapté.
 5. Ouvrir le dossier ou le fichier Blender depuis la fiche. Enregistrer dans Blender : le GLB et l’aperçu se mettent à jour automatiquement. **Créer une version** devient disponible après détection d’un changement source et synchronisation réussie.
-6. Choisir une ancienne version pour l’inspecter, l’exporter ou **Créer une variante**. Chaque variante possède son propre dossier stable ; créer une variante ne remplace pas le travail courant.
+6. Choisir une ancienne version pour l’inspecter ou exporter son GLB enregistré. **Créer une variante** reste disponible pour les versions complètes. Chaque variante possède son propre dossier stable.
+7. Dans **Historique**, **Restaurer le backup** remplace le workspace après capture de son état réel. Enregistrer et fermer le projet dans Blender avant de confirmer. Le travail précédant la restauration devient le nouveau backup.
+8. L’historique propose **Compresser avec Zstd**, **Alléger l’ancien historique**, **Libérer le backup complet** et la suppression des versions de consultation. Chaque opération explicite présente son effet et l’espace récupérable avant confirmation. Le nettoyage des fichiers du workspace reste entièrement manuel.
 
 Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieurs tags et plusieurs projets de jeu. Recherche, filtres, tri, archivage et historique paginé permettent de parcourir la bibliothèque. L’archivage conserve les fichiers et les versions.
 
@@ -31,7 +33,7 @@ Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieur
 
 Chaque dossier de travail de variante contient un `.blend` source et un GLB dérivé. La règle s’applique récursivement ; `.blend1` reste une sauvegarde ordinaire. Les variantes, historiques, caches et sauvegardes sont indépendants de ce décompte. Les anciens dossiers non conformes sont conservés avec leur historique ; leur synchronisation et les nouvelles versions restent bloquées jusqu’à correction manuelle.
 
-Le `.blend` est l’autorité. La scène active enregistrée est exportée entière, avec ses modificateurs actifs évalués. Edge Lock ne sauvegarde jamais un `.blend` existant et ne lui applique aucun modificateur. Seule la création explicite d’un nouveau projet écrit un nouveau `.blend`. Les sélecteurs de fichier principal, scène, collection et application des modificateurs ont disparu.
+Le `.blend` est l’autorité. La scène active enregistrée est exportée entière, avec ses modificateurs actifs évalués. Le worker Blender ne réenregistre jamais un `.blend` existant et ne lui applique aucun modificateur. La création explicite écrit un nouveau `.blend` ; la restauration remplace les fichiers du dossier par les octets sauvegardés. Les sélecteurs de fichier principal, scène, collection et application des modificateurs ont disparu.
 
 La surveillance porte sur les workspaces de la bibliothèque active, même lorsque la fiche est fermée. Les événements sont regroupés pendant 500 ms après la dernière écriture, puis les contenus sont comparés par BLAKE3. Une sauvegarde pendant une conversion impose une nouvelle vérification. L’ouverture et le retour au premier plan réconcilient également l’état ; une défaillance de surveillance active une vérification périodique. Edge Lock doit être ouvert pour synchroniser.
 
@@ -57,18 +59,19 @@ Le cache est vérifié avant la copie de l’asset ou le lancement de Blender. I
 
 La version 2 du rendu régénère automatiquement les anciennes vignettes visibles avec ce cadrage. Elle n’invalide pas le cache GLB et ne déclenche pas de réexport Blender lorsque les sources et le GLB certifié sont inchangés.
 
-Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. Il passe par une copie temporaire et ne sauvegarde pas le `.blend` source. Les exports Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut donc influencer un aperçu historique.
+Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. L’export historique réutilise son GLB enregistré lorsqu’il existe ; il ne régénère pas ses sources. Les exports nécessitant Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut influencer une génération d’aperçu pour un ancien snapshot sans GLB enregistré.
 
 L’export explicite est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner un projet dont le GLB canonique est valide. Les GLB exigeant des ressources externes ou des extensions non prises en charge restent refusés.
 
 ## Stockage et limites du MVP
 
 - Versions immuables avec déduplication des fichiers identiques par BLAKE3. Ce n’est pas un dépôt Git ; il n’existe ni fusion, ni rebase, ni synchronisation distante.
-- Un `.blend` modifié est stocké intégralement à nouveau. Les textures inchangées sont partagées dans l’historique. Chaque variante dispose toutefois d’une copie physique de travail.
+- Les nouveaux objets utilisent Zstd sans perte si la compression réduit leur taille ; les empreintes restent celles des octets originaux. Les anciens objets bruts restent lisibles et peuvent être recompressés explicitement. Un `.blend` modifié reste un objet distinct ; les textures inchangées sont partagées. Chaque variante dispose d’une copie physique de travail.
 - Tous les fichiers ordinaires du dossier sont conservés, y compris références, rapports, captures et sauvegardes `.blend1`. Les dossiers vides sont conservés. Les liens symboliques, junctions et fichiers spéciaux sont refusés.
 - Les snapshots sont manuels et portent sur les données déjà enregistrées sur disque. Les écritures concurrentes détectées font réessayer puis échouer la capture ; le MVP ne peut pas figer atomiquement un dossier modifié par un programme externe.
 - Une bibliothèque active à la fois, Windows comme plateforme validée, aucun serveur ni compte. Bibliothèques réseau et dossiers synchronisés à chaud non pris en charge.
-- Aucune suppression définitive ni récupération automatique d’espace historique. L’historique local ne remplace pas une sauvegarde sur un autre support.
+- Les nouvelles versions conservent normalement deux états complets par variante : version courante figée et backup précédent. Les plus anciennes deviennent des GLB de consultation après validation. Les anciennes données migrées et les captures sans GLB certifié restent complètes jusqu’à une conversion explicite ou une résolution du blocage ; ces exceptions sont affichées.
+- Les versions courantes et backups actifs sont protégés contre la suppression ordinaire. La libération dédiée du backup conserve son GLB. Le ramasse-miettes libère seulement les objets internes devenus inutilisés après une conversion ou suppression, en tenant compte de toutes les variantes. L’historique local ne remplace pas une sauvegarde sur un autre support.
 
 Voir [le format de stockage et la sauvegarde](docs/storage.md), [l’architecture](docs/architecture.md) et [les validations réellement exécutées](docs/validation.md).
 

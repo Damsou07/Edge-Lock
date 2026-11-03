@@ -1,7 +1,7 @@
 use crate::preview_resources::{self, PreviewResource, ThumbnailSource};
 use crate::state::*;
 use edge_lock_core::{
-    ExportConfig, Library, OperationContext, Snapshot,
+    ExportConfig, Library, OperationContext, Snapshot, StorageAction,
     blender::{BlenderRunner, Inspection},
     glb,
     preview::{self, PreviewOutcome, PreviewRequest},
@@ -24,6 +24,22 @@ use tauri::{AppHandle, Emitter};
     rename_all_fields = "camelCase"
 )]
 pub enum JobRequest {
+    StoragePlan {
+        variant_id: String,
+        action: StorageAction,
+        snapshot_id: Option<String>,
+    },
+    StorageApply {
+        variant_id: String,
+        action: StorageAction,
+        snapshot_id: Option<String>,
+        plan_token: String,
+    },
+    Restore {
+        variant_id: String,
+        expected_head: String,
+        expected_backup: String,
+    },
     Import {
         source: String,
         name: String,
@@ -65,6 +81,9 @@ pub enum JobRequest {
 impl JobRequest {
     fn kind(&self) -> &str {
         match self {
+            Self::StoragePlan { .. } => "storagePlan",
+            Self::StorageApply { .. } => "storageApply",
+            Self::Restore { .. } => "restore",
             Self::Import { .. } => "import",
             Self::Create { .. } => "create",
             Self::Snapshot { .. } => "snapshot",
@@ -158,6 +177,7 @@ pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppRe
                 .into_iter()
                 .collect(),
             (JobRequest::Snapshot { variant_id, .. }, Ok(_)) => vec![variant_id.clone()],
+            (JobRequest::Restore { variant_id, .. }, _) => vec![variant_id.clone()],
             _ => Vec::new(),
         };
         update_job(&app, &state, &job_id, |job| match result {
@@ -240,6 +260,38 @@ fn run(
     ctx: &OperationContext,
 ) -> AppResult<Value> {
     match request {
+        JobRequest::StoragePlan {
+            variant_id,
+            action,
+            snapshot_id,
+        } => Ok(serde_json::to_value(library.preview_storage_action(
+            variant_id,
+            *action,
+            snapshot_id.as_deref(),
+            ctx,
+        )?)?),
+        JobRequest::StorageApply {
+            variant_id,
+            action,
+            snapshot_id,
+            plan_token,
+        } => Ok(serde_json::to_value(library.apply_storage_action(
+            variant_id,
+            *action,
+            snapshot_id.as_deref(),
+            plan_token,
+            ctx,
+        )?)?),
+        JobRequest::Restore {
+            variant_id,
+            expected_head,
+            expected_backup,
+        } => Ok(serde_json::to_value(library.restore_backup(
+            variant_id,
+            expected_head,
+            expected_backup,
+            ctx,
+        )?)?),
         JobRequest::Import {
             source,
             name,
@@ -406,6 +458,31 @@ fn run(
                     "destination_exists",
                     "Ce fichier existe déjà. Confirmez son remplacement.",
                 ));
+            }
+            if let Some(id) = snapshot_id {
+                let snapshot = library.get_snapshot(id)?;
+                if library.get_variant(&snapshot.variant_id)?.variant.asset_id
+                    != library.get_variant(variant_id)?.variant.asset_id
+                {
+                    return Err(AppError::new(
+                        "invalid",
+                        "Cette version appartient à un autre asset.",
+                    ));
+                }
+                // Historical export serves the saved artifact, without regenerating old sources.
+                let stored_glb = library.snapshot_glb_path(id);
+                if snapshot.storage.preview_path.is_some()
+                    || snapshot.storage.kind == "preview"
+                    || stored_glb.is_ok()
+                {
+                    let relative = stored_glb?;
+                    let temp = tempfile::tempdir_in(library.root().join("staging"))?;
+                    let path = temp.path().join("historical.glb");
+                    library.extract_snapshot_file(id, &relative, &path, ctx)?;
+                    glb::validate_glb(&path)?;
+                    publish_export(&path, &destination, *overwrite, ctx)?;
+                    return Ok(json!({"path":destination.to_string_lossy()}));
+                }
             }
             let material = prepare(library, variant_id, snapshot_id.as_deref(), ctx)?;
             let (path, _) = derived_glb(state, library, &material, ctx)?;

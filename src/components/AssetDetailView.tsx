@@ -15,6 +15,7 @@ import type {
   ChangeSet,
   PreviewResult,
   Snapshot,
+  StorageAction,
   Taxonomy,
   VariantDetail,
 } from "../contracts";
@@ -31,6 +32,7 @@ import type { RunJob } from "../lib/useJobs";
 import { Icon } from "./Icon";
 import { MetadataModal } from "./AssetForms";
 import { Modal } from "./Modal";
+import { HistoryStorageModal, RestoreBackupModal } from "./HistoryStorageModal";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
@@ -182,6 +184,11 @@ export function AssetDetailView({
   const [copyDone, setCopyDone] = useState(false);
   const [replacePath, setReplacePath] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
+  const [storageAction, setStorageAction] = useState<{
+    action: StorageAction;
+    snapshotId?: string;
+  } | null>(null);
+  const [restoreOpen, setRestoreOpen] = useState(false);
   const selection = [id, variantId, snapshotId ?? "current"].join(":");
   const currentSelection = useRef(selection);
   currentSelection.current = selection;
@@ -605,7 +612,7 @@ export function AssetDetailView({
         </div>
         <button
           className="text-button"
-          disabled={!variant}
+          disabled={!variant || selectedSnapshot?.storage?.kind === "preview"}
           onClick={() => setModal("variant")}
         >
           <Icon name="plus" size={15} />
@@ -791,7 +798,7 @@ export function AssetDetailView({
             </div>
             <div>
               <Icon name="history" />
-              <span title="Stockage de l’historique de toutes les variantes">
+              <span title="Contenu unique de l’historique de toutes les variantes, avant compression Zstd">
                 Historique
               </span>
               <strong>{formatBytes(asset.historyBytes)}</strong>
@@ -1063,8 +1070,46 @@ export function AssetDetailView({
         )}
         {tab === "history" && (
           <div role="tabpanel" className="history-panel">
+            <div className="history-storage-actions">
+              <button
+                className="button secondary small-button"
+                onClick={() => setStorageAction({ action: "recompress" })}
+              >
+                Compresser avec Zstd
+              </button>
+              <button
+                className="button secondary small-button"
+                onClick={() => setStorageAction({ action: "compact" })}
+              >
+                Alléger l’ancien historique
+              </button>
+              <button
+                className="button secondary small-button"
+                onClick={() => setStorageAction({ action: "purge" })}
+              >
+                Libérer les objets inutilisés
+              </button>
+              {variant?.backupSnapshotId && (
+                <>
+                  <button
+                    className="button secondary small-button"
+                    onClick={() => setRestoreOpen(true)}
+                  >
+                    Restaurer le backup
+                  </button>
+                  <button
+                    className="button secondary small-button"
+                    onClick={() =>
+                      setStorageAction({ action: "releaseBackup" })
+                    }
+                  >
+                    Libérer le backup complet
+                  </button>
+                </>
+              )}
+            </div>
             {snapshots.length ? (
-              snapshots.map((snapshot, index) => (
+              snapshots.map((snapshot) => (
                 <div
                   className={`history-row ${snapshotId === snapshot.id ? "selected" : ""}`}
                   key={snapshot.id}
@@ -1075,8 +1120,25 @@ export function AssetDetailView({
                   <div className="history-description">
                     <div>
                       <strong>{snapshot.message}</strong>
-                      {index === 0 && (
+                      {snapshot.id === variant?.headSnapshotId && (
                         <span className="head-badge">Dernière version</span>
+                      )}
+                      {snapshot.id === variant?.backupSnapshotId && (
+                        <span className="head-badge">Backup complet</span>
+                      )}
+                      {snapshot.storage?.kind === "preview" && (
+                        <span className="head-badge">Consultation seule</span>
+                      )}
+                      {snapshot.storage?.kind === "full" &&
+                        !snapshot.storage.protected && (
+                          <span className="head-badge">
+                            {snapshot.storage.legacy
+                              ? "Historique complet conservé"
+                              : "Complet · conversion en attente"}
+                          </span>
+                        )}
+                      {snapshot.storage?.previewTrusted === false && (
+                        <span className="head-badge">Aperçu non certifié</span>
                       )}
                     </div>
                     <span>
@@ -1089,11 +1151,26 @@ export function AssetDetailView({
                   </div>
                   <button
                     className="button secondary small-button"
+                    disabled={snapshot.storage?.previewTrusted === false}
                     onClick={() => openSnapshot(snapshot)}
                   >
                     Consulter
                     <Icon name="chevron" size={13} />
                   </button>
+                  {snapshot.storage?.kind === "preview" &&
+                    !snapshot.storage.protected && (
+                      <button
+                        className="button secondary small-button"
+                        onClick={() =>
+                          setStorageAction({
+                            action: "deleteVersion",
+                            snapshotId: snapshot.id,
+                          })
+                        }
+                      >
+                        Supprimer
+                      </button>
+                    )}
                 </div>
               ))
             ) : (
@@ -1182,6 +1259,33 @@ export function AssetDetailView({
           taxonomy={taxonomy}
           onClose={() => setModal(null)}
           onSaved={onChanged}
+        />
+      )}
+      {storageAction && variant && (
+        <HistoryStorageModal
+          key={`${variant.id}:${storageAction.action}:${storageAction.snapshotId ?? ""}`}
+          variantId={variant.id}
+          {...storageAction}
+          runJob={runJob}
+          onSaved={() => {
+            setSnapshotId(null);
+            setLocalRefresh((value) => value + 1);
+            onChanged();
+          }}
+          onClose={() => setStorageAction(null)}
+        />
+      )}
+      {restoreOpen && variant && (
+        <RestoreBackupModal
+          key={variant.id}
+          variant={variant}
+          runJob={runJob}
+          onRestored={() => {
+            setSnapshotId(null);
+            setLocalRefresh((value) => value + 1);
+            onChanged();
+          }}
+          onClose={() => setRestoreOpen(false)}
         />
       )}
       {(modal === "snapshot" || modal === "variant") && variant && (

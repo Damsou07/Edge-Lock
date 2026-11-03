@@ -2052,6 +2052,17 @@ legend {
 .history-panel {
   padding: 7px 20px;
 }
+.history-storage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.storage-version-list {
+  max-height: 240px;
+  overflow: auto;
+}
 .history-row {
   display: flex;
   align-items: center;

@@ -856,6 +856,23 @@ pub fn guard_preview(path: &Path) -> Result<GlbStats> {
         ));
     }
     let document = read_document(path)?;
+    for extension in array(&document.json, "extensionsRequired")? {
+        let name = extension
+            .as_str()
+            .ok_or_else(|| invalid("Extension GLB invalide"))?;
+        if [
+            "KHR_draco_mesh_compression",
+            "EXT_meshopt_compression",
+            "KHR_meshopt_compression",
+            "KHR_texture_basisu",
+        ]
+        .contains(&name)
+        {
+            return Err(invalid(format!(
+                "Compression {name} non prise en charge par l’aperçu"
+            )));
+        }
+    }
     let stats = statistics(&document)?;
     let expanded = document.accessors.iter().try_fold(0, |sum, a| {
         checked_add(sum, checked_mul(a.count, a.element_bytes)?)

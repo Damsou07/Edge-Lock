@@ -267,7 +267,14 @@ export default function App() {
       try {
         const result = await runBaseJob<T>(request, options);
         if (
-          ["import", "create", "variant", "snapshot"].includes(request.kind)
+          [
+            "import",
+            "create",
+            "variant",
+            "snapshot",
+            "restore",
+            "storageApply",
+          ].includes(request.kind)
         ) {
           try {
             setBootstrap(await api.bootstrap());

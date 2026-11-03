@@ -277,7 +277,11 @@ async function assertTheme() {
   assert.equal(theme.logo.loaded, true);
   assert.ok(
     theme.logo.width >
-      (theme.viewport.width <= 860 ? 46 : theme.viewport.width <= 1080 ? 50 : 56),
+      (theme.viewport.width <= 860
+        ? 46
+        : theme.viewport.width <= 1080
+          ? 50
+          : 56),
     "The logo must be larger than before at each sidebar breakpoint.",
   );
   assert.equal(
@@ -1182,6 +1186,181 @@ async function testKitsune() {
   }
 }
 
+async function testHistoryStorage() {
+  const asset = await job({
+    kind: "import",
+    source,
+    name: "Historique Zstd",
+    config: canonicalConfig,
+  });
+  const variant = asset.variants[0];
+  assertWithin(await realpath(testRoot), await realpath(variant.workspacePath));
+  const first = variant.headSnapshotId;
+  const originalGlb = await fileHash(join(variant.workspacePath, "model.glb"));
+  await writeFile(join(variant.workspacePath, "notes.txt"), "version deux");
+  await writeFile(
+    join(variant.workspacePath, "rapport.txt"),
+    "rapport conservé\n".repeat(20000),
+  );
+  const second = await job({
+    kind: "snapshot",
+    variantId: variant.id,
+    message: "Deuxième état complet",
+  });
+  await writeFile(join(variant.workspacePath, "notes.txt"), "version trois");
+  const third = await job({
+    kind: "snapshot",
+    variantId: variant.id,
+    message: "Troisième état complet",
+  });
+  assert.equal(
+    (await invoke("get_snapshot", { id: first })).storage.kind,
+    "preview",
+  );
+  const exported = join(testRoot, "historical-consultation.glb");
+  await job({
+    kind: "export",
+    variantId: variant.id,
+    snapshotId: first,
+    destination: exported,
+    overwrite: false,
+  });
+  assert.equal(await fileHash(exported), originalGlb);
+  await script("location.reload();");
+  await waitForThumbnail("Historique Zstd");
+  await clickText("Historique Zstd");
+  await waitForModel("model.glb");
+  await clickText("Historique");
+  await until(() =>
+    script("return document.body.innerText.includes('Consultation seule');"),
+  );
+  await script(
+    "document.querySelector('.history-storage-actions').scrollIntoView({block:'center'});",
+  );
+  await screenshot("storage-history.png");
+  await script(
+    "const row=[...document.querySelectorAll('.history-row')].find(r=>r.textContent.includes(arguments[0])); [...row.querySelectorAll('button')].find(b=>b.textContent.includes('Consulter')).click();",
+    [first.slice(0, 8)],
+  );
+  await waitForModel("model.glb");
+  assert.equal(
+    await script(
+      "return [...document.querySelectorAll('button')].find(b=>b.textContent.includes('Nouvelle variante')).disabled;",
+    ),
+    true,
+  );
+  await clickText("Revenir au travail en cours");
+  await writeFile(
+    join(variant.workspacePath, "notes.txt"),
+    "modification non versionnée",
+  );
+  await clickText("Restaurer le backup");
+  await until(() =>
+    script(
+      "return !!document.querySelector('dialog[open] input[type=checkbox]');",
+    ),
+  );
+  assert.equal(
+    await script(
+      "return document.querySelector('dialog[open] .button.primary').disabled;",
+    ),
+    true,
+  );
+  await screenshot("storage-restore-confirmation.png");
+  await clickSelector('dialog[open] input[type="checkbox"]');
+  const checkboxSize = await script(
+    "const box=document.querySelector('dialog[open] input[type=checkbox]').getBoundingClientRect(); return {width:box.width,height:box.height};",
+  );
+  assert.equal(checkboxSize.width, checkboxSize.height);
+  await screenshot("storage-restore-confirmed.png");
+  await clickSelector("dialog[open] .button.primary");
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: variant.id })).variant
+        .headSnapshotId !== third.id,
+  );
+  await until(() => script("return !document.querySelector('dialog[open]');"));
+  assert.equal(
+    await readFile(join(variant.workspacePath, "notes.txt"), "utf8"),
+    "version deux",
+  );
+  const restored = (await invoke("get_variant", { id: variant.id })).variant;
+  assert.equal(
+    (await invoke("get_snapshot", { id: restored.backupSnapshotId })).storage
+      .previewTrusted,
+    false,
+  );
+  await job({
+    kind: "restore",
+    variantId: variant.id,
+    expectedHead: restored.headSnapshotId,
+    expectedBackup: restored.backupSnapshotId,
+  });
+  assert.equal(
+    await readFile(join(variant.workspacePath, "notes.txt"), "utf8"),
+    "modification non versionnée",
+  );
+  const plan = await job({
+    kind: "storagePlan",
+    variantId: variant.id,
+    action: "releaseBackup",
+  });
+  await job({
+    kind: "storageApply",
+    variantId: variant.id,
+    action: "releaseBackup",
+    planToken: plan.planToken,
+  });
+  assert.equal(
+    (await invoke("get_variant", { id: variant.id })).variant.backupSnapshotId,
+    null,
+  );
+  const deletion = await job({
+    kind: "storagePlan",
+    variantId: variant.id,
+    action: "deleteVersion",
+    snapshotId: first,
+  });
+  await job({
+    kind: "storageApply",
+    variantId: variant.id,
+    action: "deleteVersion",
+    snapshotId: first,
+    planToken: deletion.planToken,
+  });
+  assert.equal(
+    (await invoke("get_snapshot", { id: first })).storage.kind,
+    "deleted",
+  );
+  await script("location.reload();");
+  await waitForThumbnail("Historique Zstd");
+  await clickText("Historique Zstd");
+  await waitForModel("model.glb");
+  await clickText("Historique");
+  await clickText("Compresser avec Zstd");
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Espace récupérable');",
+    ),
+  );
+  await screenshot("storage-compression-plan.png");
+  await clickSelector("dialog[open] .button.primary");
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Opération terminée');",
+    ),
+  );
+  await screenshot("storage-compression-result.png");
+  await clickSelector('dialog[open] [aria-label="Fermer"]');
+  assert.equal(
+    (await invoke("get_snapshot", { id: second.id })).storage.kind,
+    "preview",
+  );
+  report.checks.push(
+    "Historique Zstd : rotation, consultation/export GLB exact, protections UI, restauration avec travail non versionné, retour arrière, libération du backup, suppression et recompression confirmée",
+  );
+}
+
 try {
   await until(async () => {
     const response = await fetch(base + "/status", {
@@ -1571,6 +1750,7 @@ try {
     sourceOriginal,
     "The imported source folder must remain unchanged throughout the desktop scenarios",
   );
+  await testHistoryStorage();
   report.status = "passed";
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {

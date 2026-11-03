@@ -9,4 +9,4 @@ pub mod preview;
 pub mod sync;
 
 pub use domain::*;
-pub use library::Library;
+pub use library::{Library, StorageAction};

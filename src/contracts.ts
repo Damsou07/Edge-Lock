@@ -30,6 +30,7 @@ export interface Variant {
   name: string;
   workspacePath: string;
   headSnapshotId: string;
+  backupSnapshotId?: string | null;
   workingBytes: number;
   triangles: number | null;
   config: ExportConfig;
@@ -41,6 +42,14 @@ export interface ManifestEntry {
   size: number;
 }
 export interface Snapshot {
+  storage?: {
+    kind: "full" | "preview" | "deleted";
+    previewPath: string | null;
+    restoredFrom: string | null;
+    protected: boolean;
+    legacy: boolean;
+    previewTrusted: boolean;
+  };
   id: string;
   variantId: string;
   parentId: string | null;
@@ -164,6 +173,25 @@ export interface WorkspaceStatus {
   error: AppError | null;
 }
 export type JobRequest =
+  | {
+      kind: "storagePlan";
+      variantId: string;
+      action: StorageAction;
+      snapshotId?: string;
+    }
+  | {
+      kind: "storageApply";
+      variantId: string;
+      action: StorageAction;
+      snapshotId?: string;
+      planToken: string;
+    }
+  | {
+      kind: "restore";
+      variantId: string;
+      expectedHead: string;
+      expectedBackup: string;
+    }
   | { kind: "thumbnail"; assetId: string }
   | { kind: "import"; source: string; name: string; config: ExportConfig }
   | { kind: "create"; name: string }
@@ -193,4 +221,16 @@ export interface Job {
   total: number | null;
   result: unknown;
   error: AppError | null;
+}
+
+export type StorageAction =
+  "compact" | "releaseBackup" | "deleteVersion" | "recompress" | "purge";
+export interface StorageReport {
+  planToken: string;
+  logicalBytes: number;
+  physicalBytes: number;
+  reclaimableBytes: number;
+  releasedBytes: number;
+  versions: { id: string; message: string }[];
+  warnings: string[];
 }

@@ -452,6 +452,9 @@ pub fn prepare_preview(
         .map(|id| library.get_snapshot(id))
         .transpose()?;
     let (logical_root, entries, mut config) = if let Some(snapshot) = &snapshot {
+        if snapshot.storage.kind == "deleted" || !snapshot.storage.preview_trusted {
+            return Err(CoreError::Invalid("Cette capture ne dispose pas d’un aperçu historique certifié. Son dossier complet reste restaurable.".into()));
+        }
         let owner = library.get_variant(&snapshot.variant_id)?;
         if owner.variant.asset_id != variant.variant.asset_id {
             return Err(CoreError::Invalid(
@@ -610,9 +613,7 @@ pub fn prepare_preview(
                 let paths = vec![primary.to_string_lossy().into_owned()];
                 let before = fingerprints(&paths, &logical_root, manifest, ctx)?;
                 if let Some(snapshot) = &snapshot {
-                    let material = temporary.path().join("source");
-                    library.materialize(&snapshot.id, &material, ctx)?;
-                    copy_file(&material.join(&source_file), &staged, ctx)?;
+                    library.extract_snapshot_file(&snapshot.id, &source_file, &staged, ctx)?;
                 } else {
                     copy_file(&primary, &staged, ctx)?;
                 }

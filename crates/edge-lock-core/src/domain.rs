@@ -92,6 +92,7 @@ pub struct Variant {
     pub name: String,
     pub workspace_path: String,
     pub head_snapshot_id: String,
+    pub backup_snapshot_id: Option<String>,
     pub config: ExportConfig,
     pub working_bytes: u64,
     pub triangles: Option<u64>,
@@ -115,6 +116,49 @@ pub struct Snapshot {
     pub logical_bytes: u64,
     pub config: ExportConfig,
     pub entries: Vec<ManifestEntry>,
+    #[serde(default)]
+    pub storage: SnapshotStorage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotStorage {
+    pub kind: String,
+    pub preview_path: Option<String>,
+    pub restored_from: Option<String>,
+    pub protected: bool,
+    pub legacy: bool,
+    pub preview_trusted: bool,
+}
+impl Default for SnapshotStorage {
+    fn default() -> Self {
+        Self {
+            kind: "full".into(),
+            preview_path: None,
+            restored_from: None,
+            protected: false,
+            legacy: false,
+            preview_trusted: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReport {
+    pub plan_token: String,
+    pub logical_bytes: u64,
+    pub physical_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub released_bytes: u64,
+    pub versions: Vec<StorageVersion>,
+    pub warnings: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageVersion {
+    pub id: String,
+    pub message: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

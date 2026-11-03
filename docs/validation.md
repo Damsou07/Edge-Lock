@@ -1,6 +1,29 @@
 # Validation du MVP
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 2 novembre 2026 concerne le script de génération d’installateur de la version 0.2.0. Les bilans précédents sont conservés plus bas comme historique ; leurs mesures, binaires et hashes ne décrivent pas cette génération.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le dernier bilan du 3 novembre 2026 concerne le stockage Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+
+## Zstd, historique et restauration — 3 novembre 2026
+
+Le stockage utilise des objets Zstd sans perte lorsque leur compression réduit la taille, tout en lisant les anciens objets bruts. Le schéma 3 conserve les anciennes versions complètes jusqu’à une conversion explicitement confirmée. Les nouveaux historiques conservent le courant et le backup complets, puis les GLB autonomes des versions antérieures. Une version sans aperçu vérifiable reste complète. Aucun nettoyage des fichiers du workspace ni traitement Meshopt n’est ajouté.
+
+### Contrôles exécutés
+
+- **86 tests Rust ordinaires passent**, dont 22 de l’adaptateur Tauri et 10 de l’historique. Les tests couvrent la migration depuis le schéma 1, la sauvegarde préalable du catalogue, la lecture mixte brut/Zstd, la corruption, les limites de décompression, la rotation, les protections entre variantes, l’estimation et la libération d’espace, les plans périmés et la conversion explicite de l’historique ancien.
+- Les restaurations sont vérifiées avec ajout/suppression de fichiers non versionnés, retour vers l’état remplacé, écriture concurrente, fichier Windows verrouillé et annulation après publication du journal. Un sous-processus est arrêté aux quatre frontières de publication ; la réouverture récupère un état cohérent. Un backup corrompu après publication conserve le dossier précédent et bloque la purge.
+- **106 tests frontend passent dans 13 fichiers**, dont les confirmations de stockage, la nouvelle analyse après plan périmé et la confirmation de fermeture de Blender avant restauration.
+- Le typage TypeScript, ESLint, le build Vite, Clippy du workspace et de toutes ses cibles avec `-D warnings`, `cargo fmt --all --check` et le contrôle du diff passent. Prettier passe sur les fichiers frontend modifiés ; le contrôle global signale deux fichiers préexistants non modifiés (`App.test.tsx` et `Icon.tsx`).
+- Les suites `blender_integration`, `preview` et `sync`, avec les cas ignorés activés, passent avec **Blender 5.1.1** : 24 tests, dont 17 scénarios nécessitant Blender. Un passage préalable avec Blender 5.2.3 a trouvé une incompatibilité de fixture existante (`eraser_brush` retiré) ; la suite complète n’est donc pas certifiée avec 5.2.
+- Le test opt-in de stockage crée 1 000 assets en environ 35,4 s ; la pagination de 50 éléments a une médiane de 18,4 ms et un p95 de 23,5 ms. Une capture synthétique de 128 Mio prend environ 1,70 s, avec un pic mémoire passant de 11,3 à 21,0 Mio. Mesures en debug pendant d’autres contrôles : elles ne prédisent pas le gain de compression de fichiers 3D réels.
+
+Les temporaires Rust utilisent `.test-data/storage-temp`. Le temporaire système et les liens physiques du cache incrémental rencontrent des restrictions dans le sandbox ; les tests passent avec le temporaire isolé du workspace et la copie du cache. Aucun scénario n’utilise la bibliothèque personnelle comme donnée de test.
+
+### Application Windows
+
+Le build Tauri debug sans bundle réussit, avec versions fichier et produit 0.2.0. L’exécutable `target/storage-plan/debug/edge-lock.exe` mesure 24 647 680 octets et son SHA-256 est `D47E87A6FA1FA9FE07037FB88E7830D79CB395D6774E1708585477A211C2124B`. Le parcours WebView2 final `.test-data/desktop-iLyPgQ/report.json` est `passed` : il vérifie notamment la consultation et l’export exact d’un ancien GLB, la restauration du travail non versionné et son retour arrière, la libération du backup, la suppression d’une version et la confirmation de recompression. L’accès localhost du pilote a nécessité une relance hors des restrictions réseau du sandbox, toujours avec bibliothèque, réglages et profil WebView jetables.
+
+Le benchmark desktop de 50 imports est explicitement ignoré ; les dix allers-retours, le rendu des textures et la persistance après redémarrage restent vérifiés. L’inspection visuelle a détecté une case de confirmation étirée ; elle a été alignée sur le composant de case existant. Les captures finales de l’historique et des états coché/décoché de la confirmation ont été examinées ; la case est carrée, les libellés sont lisibles et les boutons de l’historique restent accessibles. Les captures du plan et du résultat de compression du premier passage `.test-data/desktop-1p8wLv` ont également été examinées.
+
+Aucun installateur, déploiement ou test de mise à niveau en VM n’a été produit pour cette évolution. La migration de données est validée sur une bibliothèque synthétique ; les anciens exécutables refusent désormais le schéma 3.
 
 ## Génération de l’installateur — 0.2.0 — 2 novembre 2026
 

@@ -4,6 +4,9 @@ import { errorMessage } from "../lib/format";
 import { Icon } from "./Icon";
 
 const names: Record<Job["kind"], string> = {
+  storagePlan: "Analyse du stockage",
+  storageApply: "Optimisation de l’historique",
+  restore: "Restauration du backup",
   thumbnail: "Préparation de la vignette",
   import: "Import du dossier",
   create: "Création de l’asset",
