@@ -7,6 +7,7 @@ import type {
   AssetPage,
   Bootstrap,
   ExportConfig,
+  FileSelections,
   Job,
   JobRequest,
   LibraryInfo,
@@ -70,6 +71,19 @@ export const api = {
   deleteGame: (id: string) => invoke<number>("delete_game", { id }),
   updateConfig: (variantId: string, config: ExportConfig) =>
     invoke<void>("update_config", { variantId, config }),
+  renameSnapshot: (id: string, message: string) =>
+    invoke<void>("rename_snapshot", { id, message }),
+  renameVariant: (id: string, name: string) =>
+    invoke<void>("rename_variant", { id, name }),
+  getFileSelections: (variantId: string, snapshotId: string | null = null) =>
+    invoke<FileSelections>("get_file_selections", { variantId, snapshotId }),
+  setFileSelection: (
+    variantId: string,
+    snapshotId: string | null,
+    kind: "preview" | "export",
+    file: string | null,
+  ) =>
+    invoke<void>("set_file_selection", { variantId, snapshotId, kind, file }),
   setBlenderPath: (path: string) =>
     invoke<string>("set_blender_path", { path }),
   openWorkspace: (variantId: string) =>

@@ -25,6 +25,8 @@ vi.mock("../api", () => ({
     getVariant: vi.fn(),
     getSnapshot: vi.fn(),
     listSnapshots: vi.fn(),
+    getFileSelections: vi.fn(),
+    setFileSelection: vi.fn(),
     onWorkspaceChanged: vi.fn(),
     onWorkspaceStatus: vi.fn(),
     getWorkspaceStatus: vi.fn(),
@@ -114,6 +116,11 @@ beforeEach(() => {
   emitStatus = () => {};
   vi.mocked(api.getAsset).mockResolvedValue(detail);
   vi.mocked(api.getVariant).mockResolvedValue(variant);
+  vi.mocked(api.getFileSelections).mockResolvedValue({
+    previewFile: null,
+    exportFile: null,
+  });
+  vi.mocked(api.setFileSelection).mockResolvedValue(undefined);
   vi.mocked(api.listSnapshots).mockResolvedValue({ items: [], total: 0 });
   vi.mocked(api.onWorkspaceChanged).mockResolvedValue(() => {});
   vi.mocked(api.onWorkspaceStatus).mockImplementation(async (callback) => {
@@ -252,7 +259,7 @@ it("conserve l’aperçu et bloque la version après un échec de synchronisatio
     screen.getByRole("button", { name: "Créer une version" }),
   ).toBeDisabled();
   await userEvent.click(
-    screen.getByRole("button", { name: "Réessayer la synchronisation" }),
+    screen.getByRole("button", { name: "Réessayer la vérification" }),
   );
   expect(api.requestWorkspaceSync).toHaveBeenCalledWith("variant");
 });

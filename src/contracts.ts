@@ -11,6 +11,10 @@ export const defaultExportConfig: ExportConfig = {
   collection: null,
   applyModifiers: true,
 };
+export interface FileSelections {
+  previewFile: string | null;
+  exportFile: string | null;
+}
 export interface Asset {
   id: string;
   name: string;
@@ -176,6 +180,8 @@ export interface WorkspaceStatus {
   error: AppError | null;
 }
 export type JobRequest =
+  | { kind: "variantDeletionPlan"; variantId: string }
+  | { kind: "variantDeletionApply"; variantId: string; planToken: string }
   | { kind: "archiveDeletionPlan"; assetId?: string }
   | { kind: "archiveDeletionApply"; assetId?: string; planToken: string }
   | { kind: "storageDiagnostic" }
@@ -241,6 +247,16 @@ export interface ArchiveDeletionPlan {
   snapshotCount: number;
   workspaceBytes: number;
   workspaceBytesComplete?: boolean;
+  warnings: string[];
+}
+export interface VariantDeletionPlan {
+  planToken: string;
+  variantId: string;
+  variantName: string;
+  snapshotCount: number;
+  retainedSnapshotCount: number;
+  workspaceBytes: number;
+  workspaceBytesComplete: boolean;
   warnings: string[];
 }
 export interface WorkspaceDiscardReport {

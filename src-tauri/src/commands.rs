@@ -6,8 +6,8 @@ use crate::{
     workspace,
 };
 use edge_lock_core::{
-    AssetDetail, AssetFilter, AssetPage, ExportConfig, Library, LibraryInfo, Taxonomy,
-    VariantDetail, blender::BlenderRunner,
+    AssetDetail, AssetFilter, AssetPage, ExportConfig, FileSelectionKind, FileSelections, Library,
+    LibraryInfo, Taxonomy, VariantDetail, blender::BlenderRunner,
 };
 use serde::Serialize;
 use std::{
@@ -254,6 +254,82 @@ pub async fn update_config(
     blocking(move || {
         let _pending = pending;
         persist_config(&state, &library, &variant_id, config)
+    })
+    .await
+}
+
+async fn write_metadata(
+    state: Arc<AppState>,
+    operation: impl FnOnce(&Library) -> edge_lock_core::Result<()> + Send + 'static,
+) -> AppResult<()> {
+    let pending = state.register_config_write()?;
+    let library = state.library()?;
+    blocking(move || {
+        let _pending = pending;
+        persist_metadata(&state, &library, operation)
+    })
+    .await
+}
+
+fn persist_metadata(
+    state: &AppState,
+    library: &Arc<Library>,
+    operation: impl FnOnce(&Library) -> edge_lock_core::Result<()>,
+) -> AppResult<()> {
+    let _gate = lock(&state.operation_gate)?;
+    if !Arc::ptr_eq(library, &state.library()?) {
+        return Err(AppError::new(
+            "library_changed",
+            "La bibliothèque a changé. Relancez cette opération.",
+        ));
+    }
+    Ok(operation(library)?)
+}
+
+#[tauri::command]
+pub async fn rename_snapshot(
+    id: String,
+    message: String,
+    state: State<'_, ManagedState>,
+) -> AppResult<()> {
+    write_metadata(state.0.clone(), move |library| {
+        library.rename_snapshot(&id, &message)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn rename_variant(
+    id: String,
+    name: String,
+    state: State<'_, ManagedState>,
+) -> AppResult<()> {
+    write_metadata(state.0.clone(), move |library| {
+        library.rename_variant(&id, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_file_selections(
+    variant_id: String,
+    snapshot_id: Option<String>,
+    state: State<'_, ManagedState>,
+) -> AppResult<FileSelections> {
+    let library = state.0.library()?;
+    blocking(move || Ok(library.get_file_selections(&variant_id, snapshot_id.as_deref())?)).await
+}
+
+#[tauri::command]
+pub async fn set_file_selection(
+    variant_id: String,
+    snapshot_id: Option<String>,
+    kind: FileSelectionKind,
+    file: Option<String>,
+    state: State<'_, ManagedState>,
+) -> AppResult<()> {
+    write_metadata(state.0.clone(), move |library| {
+        library.set_file_selection(&variant_id, snapshot_id.as_deref(), kind, file.as_deref())
     })
     .await
 }
@@ -585,5 +661,46 @@ mod tests {
         let error =
             persist_config(&state, &library, "unused", ExportConfig::default()).unwrap_err();
         assert_eq!(error.code, "library_changed");
+    }
+
+    #[test]
+    fn metadata_writes_reject_a_library_switch_without_running_the_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = Arc::new(Library::open(root.path().join("previous")).unwrap());
+        let current = Arc::new(Library::open(root.path().join("current")).unwrap());
+        let state = crate::state::test_state(current);
+        let mut called = false;
+        let error = persist_metadata(&state, &previous, |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "library_changed");
+        assert!(!called);
+    }
+
+    #[test]
+    fn submitted_metadata_write_completes_before_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let state = Arc::new(crate::state::test_state(library.clone()));
+        let gate = lock(&state.operation_gate).unwrap();
+        let pending = state.register_config_write().unwrap();
+        let worker_state = state.clone();
+        let worker_library = library.clone();
+        let worker = std::thread::spawn(move || {
+            let _pending = pending;
+            persist_metadata(&worker_state, &worker_library, |library| {
+                library.save_game(None, "Après fermeture").map(|_| ())
+            })
+        });
+        assert!(matches!(
+            state.request_close().unwrap(),
+            CloseDecision::Wait
+        ));
+        drop(gate);
+        worker.join().unwrap().unwrap();
+        assert_eq!(library.taxonomy().unwrap().games[0].name, "Après fermeture");
+        assert!(!state.busy().unwrap());
     }
 }

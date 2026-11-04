@@ -1,6 +1,6 @@
-//! Library-wide, trailing-edge synchronization of editable Blender projects.
+//! Library-wide, trailing-edge checks of editable project files.
 use crate::state::*;
-use edge_lock_core::{AssetFilter, Library, OperationContext, blender::BlenderRunner, sync};
+use edge_lock_core::{AssetFilter, Library, OperationContext, sync};
 use notify::Watcher;
 use serde::Serialize;
 use std::{
@@ -209,21 +209,15 @@ fn synchronize(
                 entry.status.state = "syncing".into();
                 emit(app, &entry.status);
             }
-            let blender = lock(&state.settings)?
-                .blender_path
-                .as_ref()
-                .map(|path| BlenderRunner::new(path.into()));
             let context = OperationContext {
                 cancelled: state.sync_cancelled.clone(),
                 ..Default::default()
             };
-            let files = library.get_variant(variant_id)?.files;
-            sync::validate_project(&files)
-                .map_err(|error| AppError::new("invalid_project", error))?;
-            let artifact =
-                sync::synchronize_variant(library, variant_id, blender.as_ref(), &context)?;
-            crate::jobs::trim_cache(&library.root().join("cache"), &artifact.path, state);
-            Ok(Some(artifact))
+            let previous = lock(&state.workspaces)?
+                .get(variant_id)
+                .and_then(|entry| entry.status.artifact_key.clone());
+            let checked = check_project(library, variant_id, previous.as_deref(), &context)?;
+            Ok(Some(checked))
         })();
         if matches!(result, Ok(None)) {
             continue;
@@ -238,11 +232,11 @@ fn synchronize(
                 entry.running = false;
                 entry.status.revision += 1;
                 match result {
-                    Ok(Some(artifact)) => {
+                    Ok(Some(checked)) => {
                         entry.status.state = "ready".into();
-                        entry.status.source_changed = artifact.source_changed;
-                        entry.status.can_create_snapshot = artifact.source_changed;
-                        entry.status.artifact_key = Some(artifact.artifact_key);
+                        entry.status.source_changed = checked.changes.has_source_changes();
+                        entry.status.can_create_snapshot = checked.changes.has_source_changes();
+                        entry.status.artifact_key = Some(checked.fingerprint);
                         entry.status.error = None;
                     }
                     Err(error) => {
@@ -264,6 +258,24 @@ fn synchronize(
             break;
         }
     }
+}
+
+fn check_project(
+    library: &Library,
+    variant_id: &str,
+    previous_fingerprint: Option<&str>,
+    context: &OperationContext,
+) -> AppResult<edge_lock_core::WorkspaceCheck> {
+    let files = library.get_variant(variant_id)?.files;
+    sync::validate_project(&files).map_err(|error| AppError::new("invalid_project", error))?;
+    let checked = library.check_workspace(variant_id, context)?;
+    if previous_fingerprint.map_or_else(
+        || checked.changes.has_source_changes(),
+        |key| key != checked.fingerprint,
+    ) {
+        library.mark_workspace_changed(variant_id)?;
+    }
+    Ok(checked)
 }
 
 fn variants(library: &Library) -> AppResult<Vec<String>> {
@@ -320,26 +332,6 @@ fn affected(root: &Path, paths: &[std::path::PathBuf]) -> HashSet<String> {
         .collect()
 }
 
-fn generated_paths_only(
-    workspace: &Path,
-    generated: Option<&str>,
-    paths: &[std::path::PathBuf],
-) -> bool {
-    let Some(generated) = generated else {
-        return false;
-    };
-    let output = workspace.join(generated);
-    !paths.is_empty()
-        && paths.iter().all(|path| {
-            dunce::simplified(path) == dunce::simplified(&output)
-                || (path.parent().map(dunce::simplified) == output.parent().map(dunce::simplified)
-                    && path.extension().is_none()
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(".edge-lock-")))
-        })
-}
-
 pub fn install(app: &AppHandle, state: &Arc<AppState>) {
     let generation = state.watcher_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut watcher) = state.watcher.lock() {
@@ -366,30 +358,11 @@ pub fn install(app: &AppHandle, state: &Arc<AppState>) {
                     return;
                 }
                 for id in ids {
-                    let generated_only = state
-                        .library()
-                        .ok()
-                        .and_then(|library| library.get_variant(&id).ok())
-                        .is_some_and(|detail| {
-                            generated_paths_only(
-                                Path::new(&detail.variant.workspace_path),
-                                detail.variant.config.generated_glb_file.as_deref(),
-                                &event.paths,
-                            )
-                        });
-                    let running = state
-                        .workspaces
-                        .lock()
-                        .ok()
-                        .and_then(|entries| entries.get(&id).map(|e| e.running))
-                        .unwrap_or(false);
-                    if !(generated_only && running) {
-                        let _ = handle.emit(
-                            "edge-lock://workspace-changed",
-                            serde_json::json!({"variantId": id}),
-                        );
-                        let _ = request(&handle, &state, &id);
-                    }
+                    let _ = handle.emit(
+                        "edge-lock://workspace-changed",
+                        serde_json::json!({"variantId": id}),
+                    );
+                    let _ = request(&handle, &state, &id);
                 }
             }
             Err(_) => reconcile(&handle, &state),
@@ -436,35 +409,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secondary_glb_events_are_never_mistaken_for_generated_output() {
-        let workspace = Path::new("workspaces/asset/variant");
-        assert!(generated_paths_only(
-            workspace,
-            Some("main.glb"),
-            &[workspace.join("main.glb")]
-        ));
-        assert!(!generated_paths_only(
-            workspace,
-            Some("main.glb"),
-            &[workspace.join("other.glb")]
-        ));
-        assert!(!generated_paths_only(
-            workspace,
-            None,
-            &[workspace.join("main.glb")]
-        ));
-        for user_model in [".edge-lock-secondary.glb", ".edge-lock-secondary.blend"] {
-            assert!(!generated_paths_only(
-                workspace,
-                Some("main.glb"),
-                &[workspace.join(user_model)]
-            ));
+    fn first_scan_invalidates_offline_edits_but_preserves_unchanged_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("main.blend"), b"saved").unwrap();
+        let library_path = root.path().join("library");
+        let library = Library::open(&library_path).unwrap();
+        let ctx = OperationContext::default();
+        let asset = library
+            .import_folder(
+                &source,
+                "Offline",
+                edge_lock_core::ExportConfig::default(),
+                &ctx,
+            )
+            .unwrap();
+        let variant_id = asset.variants[0].id.clone();
+        let blend = Path::new(&asset.variants[0].workspace_path).join("main.blend");
+        library.set_geometry(&variant_id, 123).unwrap();
+        let updated_at = asset.asset.updated_at;
+        let clean = check_project(&library, &variant_id, None, &ctx).unwrap();
+        assert!(!clean.changes.has_source_changes());
+        assert_eq!(
+            library.get_variant(&variant_id).unwrap().variant.triangles,
+            Some(123)
+        );
+        assert_eq!(
+            library.get_asset(&asset.asset.id).unwrap().asset.updated_at,
+            updated_at
+        );
+        drop(library);
+        std::fs::write(blend, b"saved while application was closed").unwrap();
+        let library = Library::open(&library_path).unwrap();
+        let dirty = check_project(&library, &variant_id, None, &ctx).unwrap();
+        assert!(dirty.changes.has_source_changes());
+        assert_eq!(
+            library.get_variant(&variant_id).unwrap().variant.triangles,
+            None
+        );
+        let refreshed_at = library.get_asset(&asset.asset.id).unwrap().asset.updated_at;
+        assert_ne!(refreshed_at, updated_at);
+        library.set_geometry(&variant_id, 456).unwrap();
+        check_project(&library, &variant_id, Some(&dirty.fingerprint), &ctx).unwrap();
+        assert_eq!(
+            library.get_variant(&variant_id).unwrap().variant.triangles,
+            Some(456)
+        );
+        assert_eq!(
+            library.get_asset(&asset.asset.id).unwrap().asset.updated_at,
+            refreshed_at
+        );
+    }
+
+    #[test]
+    fn all_glb_events_including_former_outputs_resolve_the_variant() {
+        let root = Path::new("workspaces");
+        for model in ["main.glb", "other.glb", ".edge-lock-secondary.glb"] {
+            assert_eq!(
+                affected(root, &[root.join("asset/variant").join(model)]),
+                HashSet::from(["variant".into()])
+            );
         }
-        assert!(generated_paths_only(
-            workspace,
-            Some("main.glb"),
-            &[workspace.join(".edge-lock-r4nd0m")]
-        ));
     }
 
     #[test]

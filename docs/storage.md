@@ -16,8 +16,8 @@ Bibliothèque/
   cache/previews/             # GLB d’aperçu, index JSON et temporaires marqués
   cache/thumbnails/           # PNG fixes et index par variante, régénérables
   cache/exports/              # résultats dérivés des exports stricts
-  cache/canonical/            # GLB immuables utilisés par aperçu et vignette
-  cache/sync/                 # reçus régénérables source → GLB
+  cache/canonical/            # anciens GLB canoniques conservés
+  cache/sync/                 # anciens reçus de génération conservés
   backups/                    # sauvegardes de catalogue avant migration
   backups/glb/                # GLB non historisés préservés avant adoption
 ```
@@ -68,9 +68,9 @@ Une capture précédant la restauration dont les fichiers diffèrent de la versi
 
 Les fichiers cachés et sauvegardes Blender font partie de la capture. Aucune exclusion implicite ne supprime les rapports, textures ou captures. Les dossiers vides sont conservés. Le format ne promet pas de reproduire les ACL, flux alternatifs NTFS, permissions Unix ou horodatages d’origine. Les chemins doivent être Unicode et rester relatifs ; liens symboliques, junctions, fichiers spéciaux et échappements de chemin sont refusés.
 
-Depuis 0.3.0, chaque workspace accepte plusieurs `.blend` et `.glb`, avec au moins un `.blend` à l’import. `.blend1` reste une sauvegarde ordinaire. `primaryFile` mémorise le principal et `generatedGlbFile` identifie son dérivé ; seuls les changements du dérivé géré sont exclus de la détection de changements. Les GLB utilisateur et le choix du principal sont versionnables. Les configurations historiques restent figées.
+Chaque workspace accepte plusieurs `.blend` et `.glb`, avec au moins un `.blend` à l’import. `.blend1` reste une sauvegarde ordinaire. `primaryFile` mémorise le principal ; `generatedGlbFile` reste lisible pour les historiques antérieurs. Tous les GLB du workspace, y compris les anciens dérivés gérés, sont versionnables et restent sous la responsabilité de l’utilisateur. Aucun GLB n’est généré ou remplacé automatiquement dans ce dossier.
 
-La capture d’une version vérifie ses empreintes de sources et de GLB contre le reçu de synchronisation. Elle refuse de publier un nouveau `.blend` accompagné d’un ancien GLB. Une sauvegarde concurrente impose une nouvelle synchronisation/capture, avec une seule nouvelle tentative. Les anciens manifestes et configurations ne sont pas réécrits. Les dossiers non conformes restent présents et consultables, mais ne peuvent pas publier de nouvelle version avant correction.
+La capture d’une version ne dépend plus d’un reçu de conversion Blender : elle conserve les fichiers présents. Les anciens manifestes et configurations ne sont pas réécrits. Les dossiers non conformes restent présents et consultables, mais ne peuvent pas publier de nouvelle version avant correction.
 
 L’inventaire est contrôlé avant et après capture. Une modification détectée entraîne une seconde tentative, puis une erreur si l’état reste instable. Cette détection protège les sauvegardes habituelles de Blender, mais ne constitue pas un gel atomique de plusieurs fichiers écrits par d’autres processus. Enregistrer et attendre la fin des écritures avant de versionner.
 
@@ -93,9 +93,9 @@ Les gros transferts sont annulables. Une annulation survenue après une frontiè
 3. Sauvegarder séparément `settings.json` si les réglages globaux doivent aussi être conservés. Les fichiers externes référencés par un `.blend` ne font pas partie de la bibliothèque.
 4. Pour tester une restauration, copier la sauvegarde vers **un nouveau dossier**, ouvrir cette copie et matérialiser une version représentative. Conserver la bibliothèque actuelle jusqu’à validation de la copie restaurée.
 
-Le cache est régénérable, mais copier l’ensemble est le procédé le plus simple. Aperçus GLB, GLB canoniques, vignettes PNG et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les PNG sont associés à la clé d’artefact et à une version du rendu ; ils ne font pas partie des versions de l’asset. Le worker Blender ne réenregistre pas le `.blend` existant ; une restauration explicite peut remplacer ses octets par ceux du backup. Le GLB de travail est un dérivé géré, remplacé atomiquement après validation. Avant sa première prise en charge, un GLB non certifié est conservé dans l’historique ou dans `backups/glb/` ; les sorties déjà certifiées ne produisent pas une sauvegarde à chaque conversion. Ces sauvegardes ne sont pas un cache évictable.
+Le cache est régénérable, mais copier l’ensemble reste le procédé de sauvegarde le plus simple. Aperçus GLB, vignettes PNG et exports stricts ont des espaces séparés et un budget commun de 2 Gio. Les conversions de `.blend` pour l’aperçu restent dans ce cache ; les PNG et GLB techniques ne font pas partie des versions. Les anciennes sauvegardes GLB restent préservées selon leurs propriétaires. Le worker ne réenregistre jamais un `.blend` existant ; une restauration explicite peut remplacer ses octets par ceux du backup.
 
-Les reçus `cache/sync` contiennent les empreintes du `.blend`, des dépendances de rendu et du GLB, ainsi que l’identité du traitement. Un reçu absent, corrompu ou périmé impose une vérification et éventuellement une régénération. Une panne entre remplacement du GLB et publication du reçu est ainsi récupérable. Les reçus restent régénérables, hors du workspace et du catalogue. Ne pas fusionner manuellement deux bibliothèques, ne pas modifier les objets, et ne pas remplacer seulement leur catalogue par celui d’une autre sauvegarde.
+Les anciens reçus `cache/sync` et artefacts canoniques restent conservés pour compatibilité et ne déclenchent plus de régénération automatique dans le workspace. Ne pas fusionner manuellement deux bibliothèques, modifier les objets ou remplacer seulement le catalogue par celui d’une autre sauvegarde.
 
 Lorsqu’une notice signale une publication interrompue, fermer l’application et sauvegarder l’ensemble avant intervention. Le journal contient `workspace`, relatif à la racine. Si ce dossier existe, en faire une copie hors de la bibliothèque et importer cette copie comme un nouvel asset après vérification. Conserver les temporaires signalés pour diagnostic. Les temporaires d’aperçu identifiés sont nettoyés automatiquement ; les dossiers de restauration ne sont retirés qu’après récupération et vérification des contenus décrites ci-dessus.
 
@@ -123,8 +123,17 @@ Supprimer une catégorie retire sa branche et archive ses assets en retirant leu
 
 ## Migrations et compatibilité
 
-Le marqueur reste `edge-lock-library-v1` et le catalogue courant utilise `PRAGMA user_version=4`. La migration 1→2 réserve la lecture Zstd aux versions compatibles ; 2→3 ajoute les rôles, types de snapshots et candidats de purge ; 3→4 ajoute `glb_backup_owners` et `archive_deletions`. Les anciennes applications refusent ce schéma. Lorsqu’un catalogue **existant** migre, une sauvegarde SQLite `backups/catalog-schema-<version>-<id>.sqlite3` précède la transaction. Aucune version n’est réduite ou réécrite. Un schéma plus récent est refusé sans réinitialisation ni rétrogradation.
+Le marqueur reste `edge-lock-library-v1` et le catalogue courant utilise `PRAGMA user_version=6`. Les migrations précédentes restent en place ; 5→6 ajoute `variants.deleted_name` et la table des choix de fichiers par variante/contexte. Une sauvegarde SQLite `backups/catalog-schema-<version>-<id>.sqlite3` précède toute migration d’un catalogue existant. Aucune version ni aucun fichier n’est réécrit. Un schéma plus récent est refusé sans réinitialisation ni rétrogradation.
 
 Les tests de migration utilisent des catalogues synthétiques de versions 0 et 1 avec réglages, tags, historique et objets bruts préexistants. Ils vérifient leur conservation, la sauvegarde du catalogue et la restitution exacte après recompression explicite. Les futures migrations doivent conserver le contrat de sauvegarde préalable et ajouter leurs propres fixtures représentatives.
 
 Une sauvegarde de catalogue avant migration ne remplace pas une sauvegarde de bibliothèque : elle ne contient pas les objets, dossiers de travail ou ressources externes. Toute récupération doit partir d’une copie isolée et vérifiée.
+
+
+## Préférences et suppression des variantes
+
+Les sources d’aperçu et d’export sont des préférences SQLite propres à la variante et à la version consultée, séparées des configurations versionnées. La valeur nulle signifie détection automatique. Une mise à jour n’affecte qu’un champ ; les préférences survivent aux évictions de cache, aux restaurations et au redémarrage. Une source devenue indisponible reste signalée jusqu’à un nouveau choix.
+
+La suppression d’une variante exige un plan confirmé et refuse la dernière variante active. Le journal v3 reprend le moteur des archives et cible exactement `workspaces/<asset>/<variante>` ; les journaux v1/v2 restent récupérables. Le propriétaire supprimé est conservé en base pour les clés étrangères, avec son ancien nom dans `deleted_name` et un nom interne réservé. Aucun élément supprimé n’est proposé comme variante récupérable.
+
+Les manifestes encore accessibles depuis les autres variantes, leurs têtes, backups et filiations de restauration sont conservés. Les versions exclusives sont marquées supprimées, sans réécriture des liens de filiation ; seuls les objets sans référence globale peuvent être libérés. Les préférences de la variante retirée sont supprimées, celles des variantes survivantes sont préservées. Le nettoyage différé conserve les mêmes garanties d’identité et de reprise que les archives. Le renommage d’une version modifie uniquement son libellé partagé, celui d’une variante uniquement son nom visible.

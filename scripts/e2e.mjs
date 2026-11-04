@@ -43,6 +43,8 @@ await writeFile(
 );
 await mkdir(join(source, "empty"));
 await prepareBlendFixture(blender, source, join(testRoot, "fixture-blender"));
+// A user-supplied GLB is authored explicitly by the fixture, never by Edge Lock.
+await writeFile(join(source, "model.glb"), animatedTexturedTriangle());
 await writeFile(join(source, "notes.txt"), "original");
 const sourceOriginal = await fileManifest(source);
 const executable = resolve(
@@ -184,9 +186,20 @@ async function concurrentPreviews(requestValue) {
   return Promise.all(ids.map((id) => awaitJob(id, 300_000)));
 }
 async function clickText(text) {
-  const element = await request("POST", `/session/${session}/element`, {
-    using: "xpath",
-    value: `//button[contains(normalize-space(.),${JSON.stringify(text)})]`,
+  const element = await until(async () => {
+    const scope = await script(
+      "return document.querySelector('dialog[open]') ? '//dialog[@open]' : '';",
+    );
+    const exact = await request("POST", `/session/${session}/elements`, {
+      using: "xpath",
+      value: `${scope}//button[not(@disabled) and normalize-space(.)=${JSON.stringify(text)}]`,
+    });
+    if (exact[0]) return exact[0];
+    const partial = await request("POST", `/session/${session}/elements`, {
+      using: "xpath",
+      value: `${scope}//button[not(@disabled) and contains(normalize-space(.),${JSON.stringify(text)})]`,
+    });
+    return partial[0];
   });
   await request(
     "POST",
@@ -287,6 +300,12 @@ async function testHelp(width, height) {
 }
 
 async function setFilter(selector, value) {
+  await until(() =>
+    script(
+      "const input=document.querySelector(arguments[0]);return !!input&&!input.disabled;",
+      [selector],
+    ),
+  );
   await script(
     `
     const input=document.querySelector(arguments[0]);
@@ -295,6 +314,12 @@ async function setFilter(selector, value) {
     input.dispatchEvent(new Event(input.tagName==='SELECT'?'change':'input',{bubbles:true}));
   `,
     [selector, value],
+  );
+  await until(() =>
+    script(
+      "const input=document.querySelector(arguments[0]);return input?.value===arguments[1]&&!input.disabled;",
+      [selector, value],
+    ),
   );
 }
 
@@ -715,10 +740,11 @@ async function testAutomaticMirror(variant) {
   const blendFile = join(variant.workspacePath, "model.blend");
   const glbFile = join(variant.workspacePath, "model.glb");
   const beforeGlb = await fileHash(glbFile);
+  await setFilter('[aria-label="Source de l’aperçu"]', "model.blend");
+  await waitForModel("model.blend");
   await saveMirrorFixture(blender, blendFile, join(testRoot, "fixture-edit"));
   const savedBlend = await fileHash(blendFile);
-  // No refresh/job call here: only the filesystem save may trigger generation.
-  await until(async () => (await fileHash(glbFile)) !== beforeGlb, 300_000);
+  // Only the save triggers source detection and internal preview-cache refresh.
   await until(
     () =>
       script(`
@@ -729,14 +755,21 @@ async function testAutomaticMirror(variant) {
     300_000,
   );
   assert.equal(
+    await fileHash(glbFile),
+    beforeGlb,
+    "Saving a .blend must never regenerate the user's workspace GLB",
+  );
+  assert.equal(
     await fileHash(blendFile),
     savedBlend,
-    "Synchronization must not save or apply modifiers in the .blend",
+    "Preview preparation must not save or apply modifiers in the .blend",
   );
   await screenshot("11-mirror-autosync.png");
   report.checks.push(
-    "Sauvegarde réelle d’un Mirror : GLB et géométrie d’aperçu passent de 1 à 2 triangles automatiquement, .blend inchangé par Edge Lock, version vide refusée",
+    "Sauvegarde réelle d’un Mirror : aperçu .blend actualisé à deux triangles dans le cache interne, GLB utilisateur inchangé, .blend préservé et version vide refusée",
   );
+  await setFilter('[aria-label="Source de l’aperçu"]', "model.glb");
+  await waitForModel("model.glb");
 }
 
 async function testFlexibleImportRules(variant) {
@@ -785,7 +818,13 @@ async function testFlexibleImportRules(variant) {
   });
   const work = imported.variants[0];
   assert.equal(work.config.primaryFile, "principal.blend");
-  assert.equal(work.config.generatedGlbFile, "principal.edge-lock.glb");
+  assert.equal(work.config.generatedGlbFile ?? null, null);
+  assert.deepEqual(
+    (await fileManifest(work.workspacePath)).map(
+      ({ modifiedAt, ...entry }) => entry,
+    ),
+    before.map(({ modifiedAt, ...entry }) => entry),
+  );
   for (const entry of before.filter((entry) => entry.kind === "file"))
     assert.equal(
       await fileHash(join(work.workspacePath, entry.path)),
@@ -876,7 +915,7 @@ async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
     ),
   );
   await clickText("Principal");
-  await waitForModel("principal.edge-lock.glb");
+  await waitForModel("principal.glb");
   for (const selected of ["choix.glb", "nested/alternative.blend"]) {
     await setFilter('[aria-label="Source de l’aperçu"]', selected);
     await waitForModel(selected);
@@ -1680,6 +1719,10 @@ async function testDataUriTexture() {
     join(testRoot, "fixture-data-uri"),
     { dataUri: true },
   );
+  await writeFile(
+    join(dataSource, "model.glb"),
+    animatedTexturedTriangle({ dataUri: true }),
+  );
   const original = await fileManifest(dataSource);
   const imported = await job({
     kind: "import",
@@ -1736,6 +1779,10 @@ async function testStudioFloor() {
     directory,
     join(testRoot, "fixture-studio-floor"),
     { studioFloor: true },
+  );
+  await copyFile(
+    join(testRoot, "fixture-studio-floor", "seed.glb"),
+    join(directory, "model.glb"),
   );
   const original = await fileManifest(directory);
   const imported = await job({
@@ -1912,7 +1959,7 @@ async function testKitsune() {
     assert.deepEqual(await fileManifest(variant.workspacePath), before);
     report.kitsune.geometry = previews[0].inspection.geometry;
     report.checks.push(
-      "Kitsune facultatif : sniper visible sur au moins 25 % de la largeur en vignette et fiche, GLB canonique et source personnelle préservés",
+      "Kitsune facultatif : sniper visible sur au moins 25 % de la largeur en vignette et fiche, workspace et source personnelle préservés",
     );
   } finally {
     assert.deepEqual(
@@ -1953,12 +2000,19 @@ async function testCharacterMorphs() {
       await fileHash(join(variant.workspacePath, blend.path)),
       blend.hash,
     );
-    const detail = await invoke("get_variant", { id: variant.id });
-    const glbs = detail.files.filter(
-      (entry) => entry.kind === "file" && /\.glb$/i.test(entry.path),
+    // Exercise the user's explicit export separately from automatic preview caches.
+    const exportedCharacter = join(testRoot, "character-explicit-export.glb");
+    await job(
+      {
+        kind: "export",
+        variantId: variant.id,
+        sourceFile: blend.path,
+        destination: exportedCharacter,
+        overwrite: false,
+      },
+      600_000,
     );
-    assert.equal(glbs.length, 1);
-    const bytes = await readFile(join(variant.workspacePath, glbs[0].path));
+    const bytes = await readFile(exportedCharacter);
     const document = JSON.parse(
       bytes.subarray(20, 20 + bytes.readUInt32LE(12)).toString(),
     );
@@ -2027,7 +2081,13 @@ async function testCharacterMorphs() {
     await waitForThumbnail("Personnage");
     await screenshot("16-character-library.png");
     await clickText("Personnage — morphs et armature");
-    await waitForModel(glbs[0].path);
+    await until(() =>
+      script(
+        "return !!document.querySelector('[aria-label=\"Source de l’aperçu\"]:not(:disabled)');",
+      ),
+    );
+    await setFilter('[aria-label="Source de l’aperçu"]', blend.path);
+    await waitForModel(blend.path);
     await screenshot("17-character-viewer.png");
     assert.deepEqual(
       await fileManifest(variant.workspacePath),
@@ -2165,6 +2225,217 @@ async function testWorkspaceDiscard() {
   await clickText("Retour à la bibliothèque");
   report.checks.push(
     "Annulation confirmée : ajouts/modifications/suppressions et réglages rétablis, tête/backup/historique inchangés, confirmation annulable à1440 et1024px",
+  );
+}
+
+async function testManualGlbAndManagement() {
+  const directory = join(testRoot, "blend-only-management");
+  await mkdir(directory);
+  await copyFile(join(source, "model.blend"), join(directory, "model.blend"));
+  const original = await fileManifest(directory);
+  const imported = await job({
+    kind: "import",
+    source: directory,
+    name: "Blend seul — gestion",
+    config: canonicalConfig,
+  });
+  const main = imported.variants[0];
+  const first = main.headSnapshotId;
+  const noGlb = async (variant) =>
+    assert.equal(
+      (await fileManifest(variant.workspacePath)).filter(
+        (entry) => entry.kind === "file" && /\.glb$/i.test(entry.path),
+      ).length,
+      0,
+      "No automatic GLB may appear in the workspace",
+    );
+  await noGlb(main);
+  assert.equal(
+    (await invoke("get_snapshot", { id: first })).entries.some((entry) =>
+      /\.glb$/i.test(entry.path),
+    ),
+    false,
+  );
+  await script("location.reload();return true;");
+  await waitForThumbnail("Blend seul — gestion");
+  await noGlb(main);
+  await clickText("Blend seul — gestion");
+  await waitForModel("model.blend");
+  await noGlb(main);
+  await writeFile(join(main.workspacePath, "notes.txt"), "deuxième état");
+  await job({
+    kind: "snapshot",
+    variantId: main.id,
+    message: "Étape intermédiaire",
+  });
+  await writeFile(join(main.workspacePath, "notes.txt"), "troisième état");
+  await job({ kind: "snapshot", variantId: main.id, message: "Étape finale" });
+  assert.equal(
+    (await invoke("get_snapshot", { id: first })).storage.kind,
+    "full",
+    "Versions without user GLBs must retain their full sources",
+  );
+  const branch = await job({
+    kind: "variant",
+    snapshotId: first,
+    name: "Variante à supprimer",
+  });
+  await noGlb(main);
+  await noGlb(branch);
+  await script("location.reload();return true;");
+  await waitForThumbnail("Blend seul — gestion");
+  await clickText("Blend seul — gestion");
+  await waitForModel("model.blend");
+  await setFilter('[aria-label="Source de l’aperçu"]', "model.blend");
+  await setFilter(".config-form label:last-of-type select", "model.blend");
+  await clickText("Historique");
+  await until(() =>
+    script("return document.querySelectorAll('.history-row').length===3;"),
+  );
+  await script(
+    "const row=[...document.querySelectorAll('.history-row')].find(r=>r.textContent.includes(arguments[0])); [...row.querySelectorAll('button')].find(b=>b.textContent.includes('Renommer')).click();",
+    [first.slice(0, 8)],
+  );
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Renommer la version');",
+    ),
+  );
+  await setFilter("dialog[open] input", "Première version renommée E2E");
+  await clickText("Enregistrer");
+  await until(
+    async () =>
+      (await invoke("get_snapshot", { id: first })).message ===
+      "Première version renommée E2E",
+  );
+  await script(
+    "const row=[...document.querySelectorAll('.history-row')].find(r=>r.textContent.includes(arguments[0])); [...row.querySelectorAll('button')].find(b=>b.textContent.includes('Consulter')).click();",
+    [first.slice(0, 8)],
+  );
+  await waitForModel("model.blend");
+  await setFilter('[aria-label="Source de l’aperçu"]', "model.blend");
+  await setFilter(".config-form label:last-of-type select", "");
+  assert.equal(
+    (
+      await invoke("get_file_selections", {
+        variantId: main.id,
+        snapshotId: first,
+      })
+    ).exportFile,
+    null,
+  );
+  await clickText("Revenir au travail en cours");
+  await until(() =>
+    script(
+      "return document.querySelector('.config-form label:last-of-type select')?.value==='model.blend';",
+    ),
+  );
+  await setFilter("#variant-select", branch.id);
+  await waitForModel("model.blend");
+  await clickSelector('[aria-label="Renommer la variante"]');
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Renommer la variante');",
+    ),
+  );
+  await setFilter("dialog[open] input", "Variante renommée E2E");
+  await clickText("Enregistrer");
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: branch.id })).variant.name ===
+      "Variante renommée E2E",
+  );
+  assert.equal(
+    (await invoke("get_variant", { id: branch.id })).variant.workspacePath,
+    branch.workspacePath,
+  );
+  const inherited = await invoke("list_snapshots", {
+    variantId: branch.id,
+    offset: 0,
+    limit: 50,
+  });
+  assert.ok(
+    inherited.items.some(
+      (item) =>
+        item.id === first && item.message === "Première version renommée E2E",
+    ),
+  );
+  await clickText("Retour à la bibliothèque");
+  await waitForThumbnail("Blend seul — gestion");
+  await request("DELETE", `/session/${session}`);
+  session = undefined;
+  await newSession();
+  await waitForThumbnail("Blend seul — gestion");
+  await clickText("Blend seul — gestion");
+  await waitForModel("model.blend");
+  await until(() =>
+    script(
+      "return document.querySelector('.config-form label:last-of-type select')?.value==='model.blend';",
+    ),
+  );
+  assert.equal(
+    (
+      await invoke("get_file_selections", {
+        variantId: main.id,
+        snapshotId: null,
+      })
+    ).exportFile,
+    "model.blend",
+  );
+  assert.equal(
+    (
+      await invoke("get_file_selections", {
+        variantId: main.id,
+        snapshotId: first,
+      })
+    ).exportFile,
+    null,
+  );
+  assert.equal(
+    (await invoke("get_variant", { id: branch.id })).variant.name,
+    "Variante renommée E2E",
+  );
+  await setFilter("#variant-select", branch.id);
+  await waitForModel("model.blend");
+  await clickSelector('[aria-label="Supprimer la variante"]');
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('Supprimer cette variante');",
+    ),
+  );
+  await clickText("Annuler");
+  await access(join(branch.workspacePath, "model.blend"));
+  await clickSelector('[aria-label="Supprimer la variante"]');
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('dialog[open] button')].some(button=>button.textContent==='Supprimer définitivement'&&!button.disabled);",
+    ),
+  );
+  await clickText("Supprimer définitivement");
+  await until(
+    async () =>
+      (await invoke("get_asset", { id: imported.asset.id })).variants.length ===
+      1,
+  );
+  await clickText("Fermer");
+  await waitForModel("model.blend");
+  assert.equal(
+    await script(
+      "return document.querySelector('[aria-label=\"Supprimer la variante\"]')?.disabled;",
+    ),
+    true,
+  );
+  assert.equal(
+    (await invoke("get_snapshot", { id: first })).message,
+    "Première version renommée E2E",
+  );
+  await noGlb(main);
+  await assert.rejects(() => access(branch.workspacePath));
+  assert.deepEqual(await fileManifest(directory), original);
+  await screenshot("manual-glb-management.png");
+  await clickText("Retour à la bibliothèque");
+  report.checks.push(
+    "Sans GLB utilisateur : vignette .blend, aperçu, versions et variante sans écriture GLB ; sources historiques complètes ; renommage version partagée et variante ; choix distincts courant/historique après redémarrage ; suppression annulable puis définitive et dernière variante protégée",
   );
 }
 
@@ -2512,7 +2783,7 @@ try {
   const first = main.headSnapshotId;
   assert.equal(
     (await readdir(source)).filter((name) => /\.glb$/i.test(name)).length,
-    0,
+    1,
   );
   assert.equal(
     (await readdir(main.workspacePath)).filter((name) => /\.glb$/i.test(name))
@@ -2581,6 +2852,9 @@ try {
   await testAutomaticMirror(main);
   report.checks.push(
     "Texture PNG rouge et verte réellement visible dans la vignette statique et dans l’aperçu automatique, contrôlée par pixels des captures WebDriver",
+  );
+  await until(() =>
+    script(`return !!document.querySelector('[aria-label="Lire l’animation"]');`),
   );
   const play = await request("POST", `/session/${session}/element`, {
     using: "css selector",
@@ -2750,8 +3024,10 @@ try {
   if (process.env.EDGE_LOCK_E2E_CHARACTER_SOURCE) await testCharacterMorphs();
   const created = await job({ kind: "create", name: "Nouveau projet Blender" });
   await access(join(created.variants[0].workspacePath, "main.blend"));
-  await access(join(created.variants[0].workspacePath, "main.glb"));
-  assert.equal(created.variants[0].triangles, 0);
+  await assert.rejects(() =>
+    access(join(created.variants[0].workspacePath, "main.glb")),
+  );
+  assert.equal(created.variants[0].triangles, null);
   if (await script('return !!document.querySelector(".workspace-panel");'))
     await clickText("Retour à la bibliothèque");
   await waitForThumbnail("Éclaireur");
@@ -2854,6 +3130,7 @@ try {
   );
   await testWorkspaceDiscard();
   await testHistoryStorage();
+  await testManualGlbAndManagement();
   await testFlexibleWorkspaceAndArchives(flexibleFixture, imported.asset.id);
   assert.deepEqual(await fileManifest(source), sourceOriginal);
   if (report.textureStress?.status === "failed")

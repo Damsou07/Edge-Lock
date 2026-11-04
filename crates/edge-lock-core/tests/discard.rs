@@ -38,7 +38,7 @@ fn schema_four_upgrade_keeps_versions_config_and_creates_a_catalog_backup() {
     drop(library);
     let root = temp.path().join("library");
     let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
-    db.execute_batch("DROP TABLE workspace_discards; PRAGMA user_version=4;")
+    db.execute_batch("DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; DROP TABLE workspace_discards; PRAGMA user_version=4;")
         .unwrap();
     drop(db);
     let upgraded = Library::open(&root).unwrap();

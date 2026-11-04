@@ -31,6 +31,13 @@ pub enum JobRequest {
         asset_id: Option<String>,
         plan_token: String,
     },
+    VariantDeletionPlan {
+        variant_id: String,
+    },
+    VariantDeletionApply {
+        variant_id: String,
+        plan_token: String,
+    },
     StorageDiagnostic,
     StoragePlan {
         variant_id: Option<String>,
@@ -97,6 +104,8 @@ impl JobRequest {
         match self {
             Self::ArchiveDeletionPlan { .. } => "archiveDeletionPlan",
             Self::ArchiveDeletionApply { .. } => "archiveDeletionApply",
+            Self::VariantDeletionPlan { .. } => "variantDeletionPlan",
+            Self::VariantDeletionApply { .. } => "variantDeletionApply",
             Self::StorageDiagnostic => "storageDiagnostic",
             Self::StoragePlan { .. } => "storagePlan",
             Self::StorageApply { .. } => "storageApply",
@@ -266,31 +275,19 @@ fn runner(state: &AppState) -> AppResult<BlenderRunner> {
     Ok(BlenderRunner::new(PathBuf::from(path)))
 }
 
-fn optional_runner(state: &AppState) -> AppResult<Option<BlenderRunner>> {
-    Ok(lock(&state.settings)?
-        .blender_path
-        .as_ref()
-        .map(|path| BlenderRunner::new(path.into())))
-}
-
 fn current_preview(
     state: &AppState,
     library: &Library,
     variant_id: &str,
     ctx: &OperationContext,
 ) -> AppResult<Box<preview::PreviewArtifact>> {
-    let artifact =
-        sync::synchronize_variant(library, variant_id, optional_runner(state)?.as_ref(), ctx)?;
-    // Viewer budgets do not limit the canonical export or the version history.
-    glb::guard_preview(&artifact.path)?;
-    Ok(Box::new(preview::PreviewArtifact {
-        path: artifact.path,
-        artifact_key: artifact.artifact_key,
-        inspection: artifact.inspection,
-        source_file: artifact.source_file,
-        source_kind: preview::PreviewKind::GeneratedGlb,
-        updates_geometry: true,
-    }))
+    let blender = lock(&state.settings)?.blender_path.clone();
+    Ok(preview::prepare_library_preview(
+        library,
+        variant_id,
+        blender.as_deref().map(Path::new),
+        ctx,
+    )?)
 }
 
 fn run(
@@ -308,6 +305,21 @@ fn run(
             plan_token,
         } => {
             let report = library.apply_archive_deletion(asset_id.as_deref(), plan_token, ctx)?;
+            lock(&state.previews)?.revoke_variants(&report.deleted_variant_ids);
+            let mut entries = lock(&state.workspaces)?;
+            for id in &report.deleted_variant_ids {
+                entries.remove(id);
+            }
+            Ok(serde_json::to_value(report)?)
+        }
+        JobRequest::VariantDeletionPlan { variant_id } => Ok(serde_json::to_value(
+            library.plan_variant_deletion(variant_id, ctx)?,
+        )?),
+        JobRequest::VariantDeletionApply {
+            variant_id,
+            plan_token,
+        } => {
+            let report = library.apply_variant_deletion(variant_id, plan_token, ctx)?;
             lock(&state.previews)?.revoke_variants(&report.deleted_variant_ids);
             let mut entries = lock(&state.workspaces)?;
             for id in &report.deleted_variant_ids {
@@ -380,44 +392,47 @@ fn run(
             source,
             name,
             config,
-        } => {
-            // Retain the old IPC field for callers; the canonical policy owns export settings.
-            let _ = config;
-            Ok(serde_json::to_value(sync::import_project(
-                library,
-                Path::new(source),
-                name,
-                &runner(state)?,
-                ctx,
-            )?)?)
-        }
+        } => Ok(serde_json::to_value(sync::import_source(
+            library,
+            Path::new(source),
+            name,
+            config.clone(),
+            ctx,
+        )?)?),
         JobRequest::Create { name } => {
             let project = tempfile::tempdir()?;
             for directory in ["textures", "references", "reports", "screenshots"] {
                 fs::create_dir(project.path().join(directory))?;
             }
             runner(state)?.create_project(project.path(), ctx)?;
-            Ok(serde_json::to_value(sync::import_project(
+            Ok(serde_json::to_value(sync::import_source(
                 library,
                 project.path(),
                 name,
-                &runner(state)?,
+                ExportConfig {
+                    apply_modifiers: true,
+                    ..ExportConfig::default()
+                },
                 ctx,
             )?)?)
         }
         JobRequest::Snapshot {
             variant_id,
             message,
-        } => Ok(serde_json::to_value(sync::create_snapshot(
-            library,
-            variant_id,
-            message,
-            optional_runner(state)?.as_ref(),
-            ctx,
-        )?)?),
-        JobRequest::Variant { snapshot_id, name } => Ok(serde_json::to_value(
-            sync::create_variant(library, snapshot_id, name, &runner(state)?, ctx)?,
-        )?),
+        } => {
+            sync::validate_project(&library.get_variant(variant_id)?.files)?;
+            Ok(serde_json::to_value(
+                library.create_snapshot(variant_id, message, ctx)?,
+            )?)
+        }
+        JobRequest::Variant { snapshot_id, name } => {
+            sync::validate_project(&library.get_snapshot(snapshot_id)?.entries)?;
+            Ok(serde_json::to_value(library.create_variant(
+                snapshot_id,
+                name,
+                ctx,
+            )?)?)
+        }
         JobRequest::Changes { variant_id } => {
             Ok(serde_json::to_value(library.changes(variant_id, ctx)?)?)
         }
@@ -425,15 +440,6 @@ fn run(
             variant_id,
             snapshot_id,
         } => {
-            if snapshot_id.is_none() {
-                let artifact = sync::synchronize_variant(
-                    library,
-                    variant_id,
-                    optional_runner(state)?.as_ref(),
-                    ctx,
-                )?;
-                return Ok(serde_json::to_value(artifact.inspection)?);
-            }
             let material = prepare(library, variant_id, snapshot_id.as_deref(), None, ctx)?;
             let inspection = inspect(state, &material.path, &material.snapshot.config, ctx)?;
             if snapshot_id.is_none() {
@@ -447,7 +453,7 @@ fn run(
             preview_file,
         } => {
             let blender_path = lock(&state.settings)?.blender_path.clone();
-            let artifact = match preview::prepare_preview(
+            let artifact = match preview::prepare_view_preview(
                 library,
                 PreviewRequest {
                     variant_id,
@@ -493,6 +499,7 @@ fn run(
                 })?;
             let artifact = current_preview(state, library, &variant.id, ctx)?;
             ctx.check_cancelled()?;
+            library.set_geometry(&variant.id, artifact.inspection.geometry.triangles)?;
             let source = ThumbnailSource {
                 variant_id: variant.id,
                 artifact_key: artifact.artifact_key.clone(),
@@ -542,14 +549,7 @@ fn run(
             }
             if let Some(id) = snapshot_id {
                 let snapshot = library.get_snapshot(id)?;
-                if library.get_variant(&snapshot.variant_id)?.variant.asset_id
-                    != library.get_variant(variant_id)?.variant.asset_id
-                {
-                    return Err(AppError::new(
-                        "invalid",
-                        "Cette version appartient à un autre asset.",
-                    ));
-                }
+                library.snapshot_workspace(variant_id, id)?;
                 // Historical export serves the saved artifact, without regenerating old sources.
                 if let Some(relative) = source_file
                     .as_deref()
@@ -611,13 +611,7 @@ fn prepare(
     let path = temporary.path().join("source");
     let mut snapshot = if let Some(id) = snapshot_id {
         let snapshot = library.get_snapshot(id)?;
-        let source_asset = library.get_variant(&snapshot.variant_id)?.variant.asset_id;
-        if source_asset != library.get_variant(variant_id)?.variant.asset_id {
-            return Err(AppError::new(
-                "invalid",
-                "Cette version appartient à un autre asset.",
-            ));
-        }
+        library.snapshot_workspace(variant_id, id)?;
         library.materialize(id, &path, ctx)?;
         snapshot
     } else {
@@ -625,9 +619,6 @@ fn prepare(
     };
     if let Some(selected) = source_file {
         select_export_source(&mut snapshot.config, &snapshot.entries, selected)?;
-    } else if snapshot_id.is_none() {
-        snapshot.config =
-            sync::resolve_project(&path, &snapshot.entries, &snapshot.config)?.config();
     }
     Ok(Material {
         _temporary: temporary,
@@ -928,6 +919,20 @@ fn publish_export(
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn empty_glb_bytes() -> Vec<u8> {
+        let mut json = br#"{"asset":{"version":"2.0"},"scenes":[{"nodes":[]}],"scene":0}"#.to_vec();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(((20 + json.len()) as u32).to_le_bytes());
+        glb.extend((json.len() as u32).to_le_bytes());
+        glb.extend(0x4e4f534au32.to_le_bytes());
+        glb.extend(json);
+        glb
+    }
     #[test]
     fn cache_never_replaces_an_unrelated_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -968,6 +973,299 @@ mod tests {
         assert!(
             matches!(discard, JobRequest::DiscardChanges {variant_id,expected_head} if variant_id == "variant" && expected_head == "head")
         );
+    }
+
+    #[test]
+    fn import_snapshot_and_fork_preserve_files_without_generating_glbs_or_requiring_blender() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"unconverted source").unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let state = test_state(library.clone());
+        let ctx = OperationContext::default();
+        let imported = run(
+            &state,
+            &library,
+            &JobRequest::Import {
+                source: source.to_string_lossy().into_owned(),
+                name: "No generated files".into(),
+                config: ExportConfig {
+                    scene: Some("Legacy export scene".into()),
+                    collection: Some("Legacy export collection".into()),
+                    apply_modifiers: false,
+                    ..ExportConfig::default()
+                },
+            },
+            &ctx,
+        )
+        .unwrap();
+        let variant_id = imported["variants"][0]["id"].as_str().unwrap();
+        let detail = library.get_variant(variant_id).unwrap();
+        let work = Path::new(&detail.variant.workspace_path);
+        assert_eq!(detail.files.len(), 1);
+        assert!(detail.variant.config.generated_glb_file.is_none());
+        assert!(detail.variant.config.apply_modifiers);
+        assert!(detail.variant.config.scene.is_none());
+        assert!(detail.variant.config.collection.is_none());
+        fs::write(work.join("main.blend"), b"edited source").unwrap();
+        let saved = run(
+            &state,
+            &library,
+            &JobRequest::Snapshot {
+                variant_id: variant_id.into(),
+                message: "Edited".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(saved["entries"].as_array().unwrap().len(), 1);
+        let fork = run(
+            &state,
+            &library,
+            &JobRequest::Variant {
+                snapshot_id: saved["id"].as_str().unwrap().into(),
+                name: "Alternative".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let fork_detail = library.get_variant(fork["id"].as_str().unwrap()).unwrap();
+        assert_eq!(fork_detail.files.len(), 1);
+        assert_eq!(
+            fs::read(Path::new(&fork_detail.variant.workspace_path).join("main.blend")).unwrap(),
+            b"edited source"
+        );
+        assert_eq!(
+            fs::read(source.join("main.blend")).unwrap(),
+            b"unconverted source"
+        );
+    }
+
+    #[test]
+    fn gallery_uses_existing_glb_without_blender_and_ignores_detail_preview_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"source").unwrap();
+        let glb = empty_glb_bytes();
+        fs::write(source.join("a.glb"), &glb).unwrap();
+        fs::write(source.join("z.glb"), &glb).unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let ctx = OperationContext::default();
+        let asset = library
+            .import_folder(&source, "Gallery", ExportConfig::default(), &ctx)
+            .unwrap();
+        let id = &asset.variants[0].id;
+        let state = test_state(library.clone());
+        preview::prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: id,
+                snapshot_id: None,
+                preview_file: Some("z.glb"),
+                blender_path: None,
+            },
+            &ctx,
+        )
+        .unwrap();
+        let result = current_preview(&state, &library, id, &ctx).unwrap();
+        assert_eq!(result.source_file, "a.glb");
+        assert_eq!(library.get_variant(id).unwrap().files.len(), 3);
+        let automatic = run(
+            &state,
+            &library,
+            &JobRequest::Preview {
+                variant_id: id.clone(),
+                snapshot_id: None,
+                preview_file: None,
+            },
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(automatic.code, "preview_ambiguous");
+        let selected = run(
+            &state,
+            &library,
+            &JobRequest::Preview {
+                variant_id: id.clone(),
+                snapshot_id: None,
+                preview_file: Some("z.glb".into()),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(selected["sourceFile"], "z.glb");
+        run(
+            &state,
+            &library,
+            &JobRequest::Thumbnail {
+                asset_id: asset.asset.id.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(library.get_variant(id).unwrap().variant.triangles, Some(0));
+    }
+
+    #[test]
+    fn deleting_a_variant_revokes_its_handles_and_keeps_shared_history_preview_and_export() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"shared blend").unwrap();
+        let glb = empty_glb_bytes();
+        fs::write(source.join("main.glb"), &glb).unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let ctx = OperationContext::default();
+        let asset = library
+            .import_folder(&source, "Shared", ExportConfig::default(), &ctx)
+            .unwrap();
+        let parent = &asset.variants[0];
+        let child = library
+            .create_variant(&parent.head_snapshot_id, "Child", &ctx)
+            .unwrap();
+        let state = test_state(library.clone());
+        let resource = preview_resources::register(
+            &state,
+            &library,
+            PreviewResource::glb(Path::new(&parent.workspace_path).join("main.glb"), None)
+                .with_owner(&parent.id),
+        )
+        .unwrap();
+        let plan = run(
+            &state,
+            &library,
+            &JobRequest::VariantDeletionPlan {
+                variant_id: parent.id.clone(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        run(
+            &state,
+            &library,
+            &JobRequest::VariantDeletionApply {
+                variant_id: parent.id.clone(),
+                plan_token: plan["planToken"].as_str().unwrap().into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            lock(&state.previews)
+                .unwrap()
+                .get(&resource.resource_token)
+                .is_none()
+        );
+        assert_eq!(
+            library.get_asset(&asset.asset.id).unwrap().variants.len(),
+            1
+        );
+        let historical = run(
+            &state,
+            &library,
+            &JobRequest::Preview {
+                variant_id: child.id.clone(),
+                snapshot_id: Some(parent.head_snapshot_id.clone()),
+                preview_file: Some("main.glb".into()),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(historical["sourceFile"], "main.glb");
+        for (index, source_file) in [None, Some("main.glb".into())].into_iter().enumerate() {
+            let destination = root.path().join(format!("history-{index}.glb"));
+            run(
+                &state,
+                &library,
+                &JobRequest::Export {
+                    variant_id: child.id.clone(),
+                    snapshot_id: Some(parent.head_snapshot_id.clone()),
+                    source_file,
+                    destination: destination.to_string_lossy().into_owned(),
+                    overwrite: false,
+                },
+                &ctx,
+            )
+            .unwrap();
+            assert_eq!(fs::read(destination).unwrap(), glb);
+        }
+        let material = prepare(
+            &library,
+            &child.id,
+            Some(&parent.head_snapshot_id),
+            Some("main.blend"),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(material.path.join("main.blend")).unwrap(),
+            b"shared blend"
+        );
+        assert!(
+            prepare(
+                &library,
+                &child.id,
+                Some(&parent.head_snapshot_id),
+                Some("../main.blend"),
+                &ctx
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured Blender; uses a disposable empty project"]
+    fn new_project_and_blend_gallery_keep_workspace_free_of_generated_glbs() {
+        let root = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let state = test_state(library.clone());
+        lock(&state.settings).unwrap().blender_path =
+            Some(std::env::var("EDGE_LOCK_TEST_BLENDER").expect("Set EDGE_LOCK_TEST_BLENDER"));
+        let ctx = OperationContext::default();
+        let created = run(
+            &state,
+            &library,
+            &JobRequest::Create {
+                name: "Empty project".into(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let id = created["variants"][0]["id"].as_str().unwrap();
+        let detail = library.get_variant(id).unwrap();
+        let blend = Path::new(&detail.variant.workspace_path).join("main.blend");
+        let original = blake3::hash(&fs::read(&blend).unwrap());
+        assert!(
+            detail
+                .files
+                .iter()
+                .all(|entry| !is_model_extension(&entry.path, "glb"))
+        );
+        let preview = current_preview(&state, &library, id, &ctx).unwrap();
+        assert_eq!(preview.source_file, "main.blend");
+        assert!(
+            preview
+                .path
+                .starts_with(library.root().join("cache/previews"))
+        );
+        let modified = fs::metadata(&preview.path).unwrap().modified().unwrap();
+        let cached = current_preview(&state, &library, id, &ctx).unwrap();
+        assert_eq!(preview.artifact_key, cached.artifact_key);
+        assert_eq!(
+            modified,
+            fs::metadata(&cached.path).unwrap().modified().unwrap()
+        );
+        assert!(
+            library
+                .get_variant(id)
+                .unwrap()
+                .files
+                .iter()
+                .all(|entry| !is_model_extension(&entry.path, "glb"))
+        );
+        assert_eq!(original, blake3::hash(&fs::read(blend).unwrap()));
     }
 
     #[test]
@@ -1199,7 +1497,10 @@ mod tests {
         let request = JobRequest::Thumbnail {
             asset_id: asset.asset.id.clone(),
         };
-        assert!(run(&state, &library, &request, &ctx).is_err());
+        assert_eq!(
+            run(&state, &library, &request, &ctx).unwrap()["state"],
+            "render"
+        );
         let PreviewOutcome::Ready(artifact) = preview::prepare_preview(
             &library,
             PreviewRequest {
@@ -1247,7 +1548,10 @@ mod tests {
                 .unwrap();
         }
         let stored = preview_resources::store(&state, &library, token, &png).unwrap();
-        assert!(run(&state, &library, &request, &ctx).is_err());
+        assert_eq!(
+            run(&state, &library, &request, &ctx).unwrap()["state"],
+            "ready"
+        );
         assert!(
             lock(&state.previews)
                 .unwrap()

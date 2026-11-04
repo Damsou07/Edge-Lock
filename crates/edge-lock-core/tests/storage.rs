@@ -146,7 +146,7 @@ fn changes_versions_and_variants_are_isolated_and_deduplicated() {
 }
 
 #[test]
-fn a_derived_glb_change_alone_never_creates_a_version() {
+fn a_former_derived_glb_change_is_versioned_as_a_user_file() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
     source(&input);
@@ -168,12 +168,10 @@ fn a_derived_glb_change_alone_never_creates_a_version() {
     let work = Path::new(&variant.workspace_path);
     fs::write(work.join("model.glb"), b"regenerated output").unwrap();
     let changes = library.changes(&variant.id, &ctx).unwrap();
-    assert!(changes.modified.is_empty());
-    assert!(
-        library
-            .create_snapshot(&variant.id, "Only GLB", &ctx)
-            .is_err()
-    );
+    assert_eq!(changes.modified, ["model.glb"]);
+    library
+        .create_snapshot(&variant.id, "Only GLB", &ctx)
+        .unwrap();
     fs::write(work.join("model.blend"), b"source edit").unwrap();
     let snapshot = library
         .create_snapshot(&variant.id, "Source edit", &ctx)
@@ -686,7 +684,7 @@ fn existing_schema_zero_is_backed_up_and_migrated_without_losing_records() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(preserved, "preserved");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let backup = fs::read_dir(root.join("backups"))
         .unwrap()
         .next()

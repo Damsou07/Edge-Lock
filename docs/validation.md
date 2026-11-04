@@ -1,6 +1,38 @@
 # Validation d’Edge Lock
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le premier bilan concerne les suppressions non bloquantes et l’annulation des modifications, avec le catalogue au schéma 5. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas ces modifications, même lorsque leur version applicative est également 0.3.0.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le premier bilan concerne les GLB manuels, les renommages, la suppression de variantes et les sélections persistantes, avec le catalogue au schéma 6. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas ces modifications, même lorsque leur version applicative est également 0.3.0.
+
+## GLB manuels, variantes et sélections persistantes — 4 novembre 2026
+
+### TDD et compatibilité
+
+Les régressions ont été observées en échec avant correction : import et versions exigeant Blender, vignette dépendant d’un GLB généré dans le workspace, modifications des anciens GLB gérés ignorées, renommages et suppression absents, sélections perdues après fermeture et choix du principal avant chargement de sa configuration. La revue et le parcours desktop ont ajouté les cas d’édition hors application, de principal supprimé, d’ancêtre partagé appartenant à une variante supprimée, de préférences de cache anciennes et de normalisation des réglages d’import.
+
+`cargo test --workspace --locked` réussit : **156 tests Rust**, aucun échec, 31 cas ignorés par la commande ordinaire. Les helpers d’arrêt brutal sont exécutés par leurs tests parents ; les scénarios Blender et le benchmark restent opt-in. Les tests de variantes couvrent les ancêtres partagés, les noms réutilisables, la dernière variante, les jetons périmés, les objets communs entre assets, les verrous Windows, l’annulation, trois frontières d’interruption et les journaux antérieurs. Les compteurs publics des archives excluent les propriétaires internes supprimés et les versions déjà supprimées, tout en conservant leurs cibles de nettoyage. Les migrations représentatives 4→6 et 5→6 vérifient la sauvegarde du catalogue et la conservation des configurations, manifestes et fichiers.
+
+Les **169 tests frontend** passent dans 19 fichiers. Ils couvrent notamment les dialogues, le renommage d’une version consultée, la bascule après suppression, la mémorisation par variante/version, les écritures avant navigation, les sources disparues et les réponses obsolètes. Les **cinq tests Node des fixtures** passent, dont une création et sauvegarde réelles avec Blender 5.1.1.
+
+Les **24 intégrations Blender 5.1.1** passent : 17 scénarios du worker, quatre du cache d’aperçu, deux des interfaces Rust historiques de synchronisation et un scénario desktop de création puis vignette depuis le `.blend`. Ce dernier vérifie l’absence de GLB dans le workspace, le hash de la source et la réutilisation du cache. Les interfaces historiques restent testées pour compatibilité ; leurs générations ne sont plus appelées par les flux automatiques de l’application. Les journaux sont `.test-data/optimizations-blender-tests.log` et `.test-data/optimizations-blender-app-test.log`.
+
+ESLint, TypeScript, Prettier, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` et `git diff --check` passent. Les avertissements de hardlinks du cache incrémental Windows utilisent une copie de repli et n’affectent pas les résultats. Les commandes Rust sont exécutées sur des fixtures jetables sous `.test-data/optimizations-temp`, hors des restrictions du sandbox empêchant certains renommages.
+
+### Construction vérifiée
+
+Les builds Vite et Tauri debug sans bundle réussissent. Le binaire inspecté `target/debug/edge-lock.exe` est PE **x64 (`0x8664`)**, produit **Edge Lock**, version fichier et produit **0.3.0**, **25 903 104 octets**, SHA-256 **`99E3ED304D2AADDCFF559E1FA59D48E3E4301E27CAB02A652CEDA140CA887118`**. Son inspection est enregistrée dans `.test-data/optimizations-binary.json`.
+
+Les journaux locaux sont `.test-data/optimizations-rust-tests.log`, `.test-data/optimizations-clippy.log` et `.test-data/optimizations-build.log`. Aucun installateur n’est produit ; installation et mise à niveau en VM ne sont pas exécutées. Aucune bibliothèque personnelle ni installation existante n’est utilisée comme fixture.
+
+### Parcours Windows sur le binaire final
+
+Le rapport `.test-data/desktop-RS7Y6k/report.json` est **`passed` pour 20 groupes de vérifications**, et son empreinte correspond au binaire inspecté ci-dessus. Le parcours utilise la véritable WebView2, Blender 5.1.1, une bibliothèque, des réglages et un profil navigateur jetables. Les GLB des fixtures sont fournis explicitement par le harness ; une sauvegarde réelle du `.blend` actualise l’aperçu en cache sans modifier le GLB utilisateur.
+
+Le nouveau scénario vérifie un asset contenant seulement un `.blend` : vignette de bibliothèque, aperçu, trois versions et une variante, sans GLB écrit dans les workspaces. Les sources historiques restent complètes. Il renomme une version partagée et une variante, vérifie les choix distincts courant/historique après fermeture réelle puis redémarrage, annule une suppression puis la confirme et vérifie la protection de la dernière variante. Les parcours existants de textures, animation, navigation, export exact, restauration, optimisation du stockage et suppression des archives passent également.
+
+Les captures `manual-glb-management.png` et `storage-history.png` ont été inspectées ; le contrôle automatique ne détecte pas de débordement à 1440, 1024 et 860 px. Le sélecteur d’aperçu reste à 30 px de haut. Les dix cycles de navigation conservent au maximum un contexte WebGL dans la fiche, zéro dans la galerie et aucune URL blob active.
+
+Le harness attend maintenant les boutons activés de la modale ouverte et la disponibilité de la commande d’animation après changement de source. Ces corrections évitent de cliquer sur les actions d’arrière-plan ou avant le retour du job. Les passages intermédiaires en échec sont conservés localement ; seul le rapport final ci-dessus porte sur le résultat complet.
+
+Le benchmark séparé de 50 imports est explicitement omis avec `EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1`. Les fixtures personnelles optionnelles, le stress GPU de plus de 512 Mio et le test opt-in de junction Windows ne sont pas activés. Aucun comparatif de performance avant/après sur des modèles réels n’est revendiqué.
 
 ## Suppression non bloquante, annulation et aperçu agrandi — 4 novembre 2026
 

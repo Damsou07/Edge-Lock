@@ -20,12 +20,17 @@ mod history;
 pub use history::StorageAction;
 #[path = "archives.rs"]
 mod archives;
-pub use archives::{ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport};
+pub use archives::{
+    ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, VariantDeletionPlan,
+};
+#[path = "file_selections.rs"]
+mod file_selections;
+pub use file_selections::{FileSelectionKind, FileSelections};
 #[path = "discard.rs"]
 mod discard;
 pub use discard::WorkspaceDiscardReport;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = r#"
 CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES categories(id));
 CREATE TABLE games(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
@@ -50,6 +55,12 @@ pub struct Library {
     mutation: Mutex<()>,
     _lock: File,
     recovery_notices: Vec<String>,
+}
+
+/// A stable scan of working files, independent of Blender and disposable previews.
+pub struct WorkspaceCheck {
+    pub changes: ChangeSet,
+    pub fingerprint: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -147,7 +158,7 @@ impl Library {
             )));
         }
         let foreign_key_error = connection.prepare("PRAGMA foreign_key_check")?.exists([])?;
-        let invalid_head: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots s ON s.id=v.head_snapshot_id LEFT JOIN snapshots b ON b.id=v.backup_snapshot_id LEFT JOIN variants bv ON bv.id=b.variant_id WHERE s.id IS NULL OR s.variant_id<>v.id OR s.storage_kind<>'full' OR (v.backup_snapshot_id IS NOT NULL AND (b.id IS NULL OR b.storage_kind<>'full' OR bv.asset_id<>v.asset_id)))", [], |row| row.get(0))?;
+        let invalid_head: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots s ON s.id=v.head_snapshot_id LEFT JOIN snapshots b ON b.id=v.backup_snapshot_id LEFT JOIN variants bv ON bv.id=b.variant_id WHERE v.deleted_name IS NULL AND (s.id IS NULL OR s.variant_id<>v.id OR s.storage_kind<>'full' OR (v.backup_snapshot_id IS NOT NULL AND (b.id IS NULL OR b.storage_kind<>'full' OR bv.asset_id<>v.asset_id))))", [], |row| row.get(0))?;
         if foreign_key_error || invalid_head {
             return Err(CoreError::Inconsistent("Le catalogue contient des références manquantes. Restaurez une sauvegarde de la bibliothèque.".into()));
         }
@@ -277,7 +288,7 @@ impl Library {
             ],
             |row| sql_u64(row, 0),
         )?;
-        let mut statement = db.prepare(&format!("SELECT a.id, (SELECT COALESCE(SUM(working_bytes),0) FROM variants WHERE asset_id=a.id) AS working_bytes, (SELECT triangles FROM variants WHERE asset_id=a.id AND triangles IS NOT NULL ORDER BY created_at LIMIT 1) AS triangles FROM assets a WHERE {condition} ORDER BY {sort},a.id LIMIT ?6 OFFSET ?7"))?;
+        let mut statement = db.prepare(&format!("SELECT a.id, (SELECT COALESCE(SUM(working_bytes),0) FROM variants WHERE asset_id=a.id AND deleted_name IS NULL) AS working_bytes, (SELECT triangles FROM variants WHERE asset_id=a.id AND deleted_name IS NULL AND triangles IS NOT NULL ORDER BY created_at LIMIT 1) AS triangles FROM assets a WHERE {condition} ORDER BY {sort},a.id LIMIT ?6 OFFSET ?7"))?;
         let ids = statement
             .query_map(
                 params![
@@ -303,7 +314,7 @@ impl Library {
         let db = self.db()?;
         let asset = read_asset(&db, id)?;
         let mut statement =
-            db.prepare("SELECT id FROM variants WHERE asset_id=?1 ORDER BY created_at,id")?;
+            db.prepare("SELECT id FROM variants WHERE asset_id=?1 AND deleted_name IS NULL ORDER BY created_at,id")?;
         let ids = statement
             .query_map([id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -347,6 +358,23 @@ impl Library {
         Ok(PathBuf::from(
             read_variant(&*self.db()?, &self.root, variant_id)?.workspace_path,
         ))
+    }
+
+    /// Returns the historical owner's logical path, which may no longer exist.
+    /// A surviving variant can still consult its retained shared ancestors.
+    pub fn snapshot_workspace(&self, variant_id: &str, snapshot_id: &str) -> Result<PathBuf> {
+        let db = self.db()?;
+        require_history_snapshot(&db, variant_id, snapshot_id)?;
+        let (workspace, owner, asset): (String, String, String) = db.query_row(
+            "SELECT v.workspace,v.id,v.asset_id FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE s.id=?1",
+            [snapshot_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if workspace != format!("workspaces/{asset}/{owner}") {
+            return Err(CoreError::Inconsistent(
+                "Workspace historique incohérent.".into(),
+            ));
+        }
+        Ok(self.root.join(safe_relative(&workspace)?))
     }
 
     pub fn import_folder(
@@ -614,14 +642,19 @@ impl Library {
         config: ExportConfig,
         ctx: &OperationContext,
     ) -> Result<Variant> {
-        let source = read_variant(&*self.db()?, &self.root, &base.variant_id)?;
+        // A retained ancestor can still belong to an internally deleted variant.
+        let source_asset: String = self.db()?.query_row(
+            "SELECT asset_id FROM variants WHERE id=?1",
+            [&base.variant_id],
+            |row| row.get(0),
+        )?;
         let variant_id = new_id();
-        let workspace = format!("workspaces/{}/{variant_id}", source.asset_id);
+        let workspace = format!("workspaces/{source_asset}/{variant_id}");
         {
             let db = self.db()?;
             let duplicate: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM variants WHERE asset_id=?1 AND name=?2)",
-                params![source.asset_id, name],
+                params![source_asset, name],
                 |row| row.get(0),
             )?;
             if duplicate {
@@ -643,11 +676,11 @@ impl Library {
         ctx.check_cancelled()?;
         let mut db = self.db()?;
         let transaction = db.transaction()?;
-        transaction.execute("INSERT INTO variants(id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![variant_id,source.asset_id,name,workspace,snapshot.id,serde_json::to_string(&snapshot.config)?,sql_size(snapshot.logical_bytes)?,snapshot.created_at])?;
+        transaction.execute("INSERT INTO variants(id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![variant_id,source_asset,name,workspace,snapshot.id,serde_json::to_string(&snapshot.config)?,sql_size(snapshot.logical_bytes)?,snapshot.created_at])?;
         insert_snapshot(&transaction, &snapshot)?;
         transaction.execute(
             "UPDATE assets SET updated_at=?1 WHERE id=?2",
-            params![snapshot.created_at, source.asset_id],
+            params![snapshot.created_at, source_asset],
         )?;
         transaction.commit()?;
         cleanup_journal(&journal);
@@ -655,7 +688,33 @@ impl Library {
     }
 
     pub fn changes(&self, variant_id: &str, ctx: &OperationContext) -> Result<ChangeSet> {
+        Ok(self.check_workspace(variant_id, ctx)?.changes)
+    }
+
+    pub fn check_workspace(
+        &self,
+        variant_id: &str,
+        ctx: &OperationContext,
+    ) -> Result<WorkspaceCheck> {
         self.changes_inner(variant_id, None, ctx)
+    }
+
+    /// Invalidate catalog-derived data after a changed workspace scan.
+    pub fn mark_workspace_changed(&self, variant_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut db = self.db()?;
+        let transaction = db.transaction()?;
+        let variant = read_variant(&transaction, &self.root, variant_id)?;
+        transaction.execute(
+            "UPDATE variants SET triangles=NULL WHERE id=?1",
+            [variant_id],
+        )?;
+        transaction.execute(
+            "UPDATE assets SET updated_at=?1 WHERE id=?2",
+            params![now(), variant.asset_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn changes_checked(
@@ -664,7 +723,7 @@ impl Library {
         receipt: &crate::sync::SyncReceipt,
         ctx: &OperationContext,
     ) -> Result<ChangeSet> {
-        self.changes_inner(variant_id, Some(receipt), ctx)
+        Ok(self.changes_inner(variant_id, Some(receipt), ctx)?.changes)
     }
 
     fn changes_inner(
@@ -672,7 +731,7 @@ impl Library {
         variant_id: &str,
         receipt: Option<&crate::sync::SyncReceipt>,
         ctx: &OperationContext,
-    ) -> Result<ChangeSet> {
+    ) -> Result<WorkspaceCheck> {
         let _guard = self.write_guard()?;
         let variant = read_variant(&*self.db()?, &self.root, variant_id)?;
         let previous = self.get_snapshot(&variant.head_snapshot_id)?;
@@ -696,23 +755,13 @@ impl Library {
                 ctx,
             )?;
         }
-        let source = |entry: &&ManifestEntry| {
-            entry.kind != "file"
-                || ![
-                    previous.config.generated_glb_file.as_deref(),
-                    current_config.generated_glb_file.as_deref(),
-                ]
-                .contains(&Some(entry.path.as_str()))
-        };
         let old = previous
             .entries
             .iter()
-            .filter(source)
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let new = current
             .iter()
-            .filter(source)
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let mut result = ChangeSet {
@@ -734,11 +783,28 @@ impl Library {
                 result.deleted.push((*path).clone());
             }
         }
-        self.db()?.execute(
-            "UPDATE variants SET working_bytes=?1 WHERE id=?2",
-            params![sql_size(result.working_bytes)?, variant_id],
-        )?;
-        Ok(result)
+        if receipt.is_none() && current_config != variant.config {
+            self.db()?.execute(
+                "UPDATE variants SET working_bytes=?1,config=?2,triangles=NULL WHERE id=?3",
+                params![
+                    sql_size(result.working_bytes)?,
+                    serde_json::to_string(&current_config)?,
+                    variant_id
+                ],
+            )?;
+        } else {
+            self.db()?.execute(
+                "UPDATE variants SET working_bytes=?1 WHERE id=?2",
+                params![sql_size(result.working_bytes)?, variant_id],
+            )?;
+        }
+        let fingerprint = blake3::hash(&serde_json::to_vec(&(&current_config, &current))?)
+            .to_hex()
+            .to_string();
+        Ok(WorkspaceCheck {
+            changes: result,
+            fingerprint,
+        })
     }
 
     pub(crate) fn workspace_manifest(
@@ -920,7 +986,7 @@ impl Library {
             .map_err(|_| CoreError::Invalid("Nombre de triangles trop grand.".into()))?;
         let _guard = self.write_guard()?;
         let count = self.db()?.execute(
-            "UPDATE variants SET triangles=?1 WHERE id=?2",
+            "UPDATE variants SET triangles=?1 WHERE id=?2 AND deleted_name IS NULL",
             params![triangles, variant_id],
         )?;
         if count == 0 {
@@ -1009,6 +1075,51 @@ impl Library {
         Ok(Game { id: key, name })
     }
 
+    /// Renaming a version changes its shared label, never its immutable contents.
+    pub fn rename_snapshot(&self, id: &str, message: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let message = checked_name(message)?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let snapshot = read_snapshot(&tx, id)?;
+        if snapshot.storage.kind == "deleted" {
+            return Err(CoreError::Invalid("Cette version a été supprimée.".into()));
+        }
+        tx.execute(
+            "UPDATE snapshots SET message=?2 WHERE id=?1",
+            params![id, message],
+        )?;
+        tx.execute(
+            "UPDATE assets SET updated_at=?2 WHERE id=(SELECT asset_id FROM variants WHERE id=?1)",
+            params![snapshot.variant_id, now()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn rename_variant(&self, id: &str, name: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let name = checked_name(name)?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let variant = read_variant(&tx, &self.root, id)?;
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM variants WHERE asset_id=?1 AND name=?2 AND id<>?3)",
+            params![variant.asset_id, name, id],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            return Err(CoreError::Invalid("Une variante porte déjà ce nom.".into()));
+        }
+        tx.execute("UPDATE variants SET name=?2 WHERE id=?1", params![id, name])?;
+        tx.execute(
+            "UPDATE assets SET updated_at=?2 WHERE id=?1",
+            params![variant.asset_id, now()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_asset(
         &self,
@@ -1057,6 +1168,30 @@ impl Library {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn require_history_snapshot(db: &Connection, variant_id: &str, snapshot_id: &str) -> Result<()> {
+    require_active_variant(db, variant_id)?;
+    let reachable: bool = db.query_row("WITH RECURSIVE history(id,parent_id) AS (
+        SELECT s.id,s.parent_id FROM snapshots s JOIN variants v ON v.head_snapshot_id=s.id WHERE v.id=?1
+        UNION SELECT s.id,s.parent_id FROM snapshots s JOIN history h ON s.id=h.parent_id
+    ) SELECT EXISTS(SELECT 1 FROM history h JOIN snapshots s ON s.id=h.id JOIN variants owner ON owner.id=s.variant_id JOIN variants active ON active.id=?1 WHERE s.id=?2 AND s.storage_kind<>'deleted' AND owner.asset_id=active.asset_id)", params![variant_id, snapshot_id], |row| row.get(0))?;
+    if !reachable {
+        return Err(CoreError::NotFound(snapshot_id.into()));
+    }
+    Ok(())
+}
+
+fn require_active_variant(db: &Connection, id: &str) -> Result<()> {
+    let active: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM variants WHERE id=?1 AND deleted_name IS NULL)",
+        [id],
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Err(CoreError::NotFound(id.into()));
+    }
+    Ok(())
 }
 
 fn require_id(db: &Connection, table: &str, id: &str) -> Result<()> {
@@ -1128,6 +1263,9 @@ fn apply_migrations(
     }
     if version < 5 {
         transaction.execute_batch("CREATE TABLE workspace_discards(id TEXT PRIMARY KEY,journal_hash TEXT NOT NULL); PRAGMA user_version=5;")?;
+    }
+    if version < 6 {
+        transaction.execute_batch("ALTER TABLE variants ADD COLUMN deleted_name TEXT; CREATE TABLE file_selections(variant_id TEXT NOT NULL REFERENCES variants(id),context_key TEXT NOT NULL,preview_file TEXT,export_file TEXT,PRIMARY KEY(variant_id,context_key)); PRAGMA user_version=6;")?;
     }
     transaction.commit()?;
     Ok(())
@@ -1223,7 +1361,7 @@ fn resolve_config(
 fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
     let row = db
         .query_row(
-            "SELECT id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,triangles,backup_snapshot_id FROM variants WHERE id=?1",
+            "SELECT id,asset_id,name,workspace,head_snapshot_id,config,working_bytes,triangles,backup_snapshot_id FROM variants WHERE id=?1 AND deleted_name IS NULL",
             [id],
             |row| {
                 Ok((
@@ -1267,7 +1405,7 @@ fn read_variant(db: &Connection, root: &Path, id: &str) -> Result<Variant> {
 }
 
 fn read_snapshot_summary(db: &Connection, id: &str) -> Result<Snapshot> {
-    let mut snapshot = db.query_row("SELECT id,variant_id,parent_id,created_at,message,logical_bytes,config,storage_kind,preview_path,restored_from,legacy,EXISTS(SELECT 1 FROM variants WHERE head_snapshot_id=snapshots.id OR backup_snapshot_id=snapshots.id),preview_trusted FROM snapshots WHERE id=?1", [id], |row| Ok((Snapshot { id:row.get(0)?,variant_id:row.get(1)?,parent_id:row.get(2)?,created_at:row.get(3)?,message:row.get(4)?,logical_bytes:sql_u64(row,5)?,config:ExportConfig::default(),entries:Vec::new(), storage: SnapshotStorage { kind:row.get(7)?,preview_path:row.get(8)?,restored_from:row.get(9)?,legacy:row.get(10)?,protected:row.get(11)?,preview_trusted:row.get(12)? } },row.get::<_,String>(6)?))).optional()?.ok_or_else(|| CoreError::NotFound(id.into()))?;
+    let mut snapshot = db.query_row("SELECT id,variant_id,parent_id,created_at,message,logical_bytes,config,storage_kind,preview_path,restored_from,legacy,EXISTS(SELECT 1 FROM variants WHERE deleted_name IS NULL AND (head_snapshot_id=snapshots.id OR backup_snapshot_id=snapshots.id)),preview_trusted FROM snapshots WHERE id=?1", [id], |row| Ok((Snapshot { id:row.get(0)?,variant_id:row.get(1)?,parent_id:row.get(2)?,created_at:row.get(3)?,message:row.get(4)?,logical_bytes:sql_u64(row,5)?,config:ExportConfig::default(),entries:Vec::new(), storage: SnapshotStorage { kind:row.get(7)?,preview_path:row.get(8)?,restored_from:row.get(9)?,legacy:row.get(10)?,protected:row.get(11)?,preview_trusted:row.get(12)? } },row.get::<_,String>(6)?))).optional()?.ok_or_else(|| CoreError::NotFound(id.into()))?;
     snapshot.0.config = serde_json::from_str(&snapshot.1)?;
     Ok(snapshot.0)
 }
@@ -1296,7 +1434,7 @@ fn read_snapshot_page(
     offset: u32,
     limit: u32,
 ) -> Result<SnapshotPage> {
-    require_id(db, "variants", variant_id)?;
+    require_active_variant(db, variant_id)?;
     // UNION (rather than UNION ALL) also terminates if a damaged catalog contains
     // a parent cycle. Snapshot manifests are not loaded for a history list.
     let chain = "WITH RECURSIVE history(id,parent_id) AS (SELECT s.id,s.parent_id FROM snapshots s JOIN variants v ON v.head_snapshot_id=s.id WHERE v.id=?1 UNION SELECT s.id,s.parent_id FROM snapshots s JOIN history h ON s.id=h.parent_id)";
@@ -1389,11 +1527,11 @@ fn read_asset(db: &Connection, id: &str) -> Result<Asset> {
         .query_map([id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     (asset.working_bytes, asset.variant_count) = db.query_row(
-        "SELECT COALESCE(SUM(working_bytes),0),COUNT(*) FROM variants WHERE asset_id=?1",
+        "SELECT COALESCE(SUM(working_bytes),0),COUNT(*) FROM variants WHERE asset_id=?1 AND deleted_name IS NULL",
         [id],
         |row| Ok((sql_u64(row, 0)?, sql_u64(row, 1)?)),
     )?;
-    asset.triangles = db.query_row("SELECT triangles FROM variants WHERE asset_id=?1 AND triangles IS NOT NULL ORDER BY created_at LIMIT 1", [id], |row| sql_u64(row,0)).optional()?;
+    asset.triangles = db.query_row("SELECT triangles FROM variants WHERE asset_id=?1 AND deleted_name IS NULL AND triangles IS NOT NULL ORDER BY created_at LIMIT 1", [id], |row| sql_u64(row,0)).optional()?;
     asset.history_bytes = db.query_row("SELECT COALESCE(SUM(size),0) FROM (SELECT e.hash,MAX(e.size) AS size FROM snapshot_entries e JOIN snapshots s ON s.id=e.snapshot_id JOIN variants v ON v.id=s.variant_id WHERE v.asset_id=?1 AND e.kind='file' GROUP BY e.hash)", [id], |row| sql_u64(row,0))?;
     Ok(asset)
 }

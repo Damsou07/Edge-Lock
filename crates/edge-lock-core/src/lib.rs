@@ -10,6 +10,7 @@ pub mod sync;
 
 pub use domain::*;
 pub use library::{
-    ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, Library, StorageAction,
+    ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, FileSelectionKind,
+    FileSelections, Library, StorageAction, VariantDeletionPlan, WorkspaceCheck,
     WorkspaceDiscardReport,
 };

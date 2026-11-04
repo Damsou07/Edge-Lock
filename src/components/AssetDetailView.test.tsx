@@ -33,6 +33,10 @@ vi.mock("../api", () => ({
     requestWorkspaceSync: vi.fn(),
     chooseExportPath: vi.fn(),
     updateConfig: vi.fn(),
+    renameSnapshot: vi.fn(),
+    renameVariant: vi.fn(),
+    getFileSelections: vi.fn(),
+    setFileSelection: vi.fn(),
     openWorkspace: vi.fn(),
     openBlender: vi.fn(),
     copyText: vi.fn(),
@@ -132,6 +136,11 @@ beforeEach(() => {
   vi.mocked(api.chooseExportPath).mockResolvedValue("C:\\Export\\drone.glb");
   vi.mocked(api.openBlender).mockResolvedValue(undefined);
   vi.mocked(api.updateConfig).mockResolvedValue(undefined);
+  vi.mocked(api.getFileSelections).mockResolvedValue({
+    previewFile: null,
+    exportFile: null,
+  });
+  vi.mocked(api.setFileSelection).mockResolvedValue(undefined);
   vi.mocked(api.releasePreviewResources).mockResolvedValue(undefined);
   run.mockImplementation(async (request: JobRequest) =>
     request.kind === "changes" ? changes : generatedPreview,
@@ -163,6 +172,264 @@ function renderDetail() {
 }
 
 describe("versions, aperçu et dépendances", () => {
+  it("bascule sur une variante restante après suppression confirmée", async () => {
+    const second = { ...detail.variants[0]!, id: "variant-2", name: "Désert" };
+    let removed = false;
+    vi.mocked(api.getAsset).mockImplementation(async () => ({
+      ...detail,
+      variants: removed ? [second] : [...detail.variants, second],
+    }));
+    vi.mocked(api.getVariant).mockImplementation(async (id) => ({
+      ...variant,
+      variant: id === second.id ? second : variant.variant,
+    }));
+    run.mockImplementation(async (request) => {
+      if (request.kind === "variantDeletionPlan")
+        return {
+          planToken: "safe",
+          variantId: "variant-1",
+          variantName: "Principale",
+          snapshotCount: 0,
+          retainedSnapshotCount: 1,
+          workspaceBytes: 15,
+          workspaceBytesComplete: true,
+          warnings: [],
+        };
+      if (request.kind === "variantDeletionApply") {
+        removed = true;
+        return {
+          deletedAssetIds: [],
+          deletedVariantIds: ["variant-1"],
+          releasedBytes: 15,
+          cleanupPending: false,
+          warnings: [],
+        };
+      }
+      return request.kind === "changes" ? changes : generatedPreview;
+    });
+    renderDetail();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Supprimer la variante" }),
+      ).toBeEnabled(),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Supprimer la variante" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Supprimer définitivement" }),
+      ).toBeEnabled(),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Supprimer définitivement" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Variante" })).toHaveValue(
+        "variant-2",
+      ),
+    );
+    expect(
+      screen.queryByRole("option", { name: "Principale" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Supprimer la variante" }),
+    ).toBeDisabled();
+    expect(
+      within(screen.getByRole("dialog")).getByRole("status"),
+    ).toHaveTextContent("Variante supprimée.");
+  });
+
+  it("protège la dernière variante et permet de renommer une version consultée", async () => {
+    vi.mocked(api.renameSnapshot).mockResolvedValue();
+    renderDetail();
+    await screen.findByRole("heading", { name: "Drone" });
+    expect(
+      screen.getByRole("button", { name: "Supprimer la variante" }),
+    ).toBeDisabled();
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Consulter" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Renommer la version" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Nom de la version" });
+    await userEvent.clear(input);
+    await userEvent.type(input, "Nouvelle étape");
+    await userEvent.click(screen.getByRole("button", { name: "Enregistrer" }));
+    await waitFor(() =>
+      expect(api.renameSnapshot).toHaveBeenCalledWith(
+        "snapshot-1",
+        "Nouvelle étape",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(screen.getAllByText("Nouvelle étape")).toHaveLength(2);
+  });
+
+  it("renomme la variante sans changer sa sélection", async () => {
+    vi.mocked(api.renameVariant).mockResolvedValue();
+    renderDetail();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Renommer la variante" }),
+      ).toBeEnabled(),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Renommer la variante" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Nom de la variante" });
+    await userEvent.clear(input);
+    await userEvent.type(input, "Désert");
+    await userEvent.click(screen.getByRole("button", { name: "Enregistrer" }));
+    await waitFor(() =>
+      expect(api.renameVariant).toHaveBeenCalledWith("variant-1", "Désert"),
+    );
+    expect(screen.getByRole("combobox", { name: "Variante" })).toHaveValue(
+      "variant-1",
+    );
+    expect(screen.getByRole("option", { name: "Désert" })).toBeInTheDocument();
+  });
+
+  it("retrouve les sources enregistrées après fermeture de la fiche", async () => {
+    vi.mocked(api.getVariant).mockResolvedValue({
+      ...variant,
+      files: [
+        ...variant.files,
+        { path: "alternate.blend", kind: "file", hash: "blend2", size: 20 },
+        { path: "other.glb", kind: "file", hash: "glb2", size: 30 },
+      ],
+    });
+    const saved = {
+      previewFile: null as string | null,
+      exportFile: null as string | null,
+    };
+    vi.mocked(api.getFileSelections).mockImplementation(async () => ({
+      ...saved,
+    }));
+    vi.mocked(api.setFileSelection).mockImplementation(
+      async (_variant, _snapshot, kind, file) => {
+        if (kind === "preview") saved.previewFile = file;
+        else saved.exportFile = file;
+      },
+    );
+    const first = renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByLabelText("Source de l’aperçu"),
+      "alternate.blend",
+    );
+    await userEvent.selectOptions(
+      screen.getByLabelText("Source de l’export"),
+      "other.glb",
+    );
+    await waitFor(() => expect(api.setFileSelection).toHaveBeenCalledTimes(2));
+    first.unmount();
+    renderDetail();
+    await waitFor(() =>
+      expect(screen.getByLabelText("Source de l’aperçu")).toHaveValue(
+        "alternate.blend",
+      ),
+    );
+    expect(screen.getByLabelText("Source de l’export")).toHaveValue(
+      "other.glb",
+    );
+    expect(api.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("attend les choix mémorisés avant de lancer l’aperçu automatique", async () => {
+    let finish!: (value: {
+      previewFile: string | null;
+      exportFile: string | null;
+    }) => void;
+    vi.mocked(api.getFileSelections).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderDetail();
+    await screen.findByLabelText("Fichier principal");
+    expect(run.mock.calls.some(([request]) => request.kind === "preview")).toBe(
+      false,
+    );
+    await act(async () =>
+      finish({ previewFile: "drone.blend", exportFile: null }),
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "preview",
+          previewFile: "drone.blend",
+        }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(api.setFileSelection).not.toHaveBeenCalled();
+  });
+
+  it("termine la sauvegarde du choix avant le retour à la bibliothèque", async () => {
+    let finish!: () => void;
+    vi.mocked(api.setFileSelection).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const back = vi.fn();
+    render(
+      <AssetDetailView
+        id="asset-1"
+        taxonomy={{ categories: [], games: [], tags: [] }}
+        generation={0}
+        onBack={back}
+        onChanged={vi.fn()}
+        onError={onError}
+        runJob={run as RunJob}
+      />,
+    );
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByLabelText("Source de l’export"),
+      "drone.blend",
+    );
+    expect(screen.getByLabelText("Source de l’export")).toBeDisabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Retour à la bibliothèque" }),
+    );
+    expect(back).not.toHaveBeenCalled();
+    await act(async () => finish());
+    await waitFor(() => expect(back).toHaveBeenCalledOnce());
+    expect(api.setFileSelection).toHaveBeenCalledWith(
+      "variant-1",
+      null,
+      "export",
+      "drone.blend",
+    );
+  });
+
+  it("signale un fichier mémorisé absent et bloque son export", async () => {
+    vi.mocked(api.getFileSelections).mockResolvedValue({
+      previewFile: "missing.blend",
+      exportFile: "missing.glb",
+    });
+    renderDetail();
+    await screen.findByText(/Une source mémorisée n’est plus disponible/);
+    expect(
+      screen.getByRole("button", { name: "Exporter .glb" }),
+    ).toBeDisabled();
+    expect(screen.getByLabelText("Source de l’aperçu")).toHaveValue(
+      "missing.blend",
+    );
+    expect(screen.getByLabelText("Source de l’export")).toHaveValue(
+      "missing.glb",
+    );
+    expect(run.mock.calls.some(([request]) => request.kind === "preview")).toBe(
+      false,
+    );
+    expect(api.setFileSelection).not.toHaveBeenCalled();
+  });
   it("garde le sélecteur dans la barre d’aperçu avant de résoudre une source ambiguë", async () => {
     vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
       variantId: "variant-1",
@@ -368,6 +635,25 @@ describe("versions, aperçu et dépendances", () => {
         expect.objectContaining({ primaryFile: null, generatedGlbFile: null }),
       ),
     );
+  });
+
+  it("attend la configuration de la variante avant de modifier son principal", async () => {
+    let finish!: (value: VariantDetail) => void;
+    vi.mocked(api.getVariant).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderDetail();
+    const detect = await screen.findByRole("button", {
+      name: "Re-détecter automatiquement",
+    });
+    expect(detect).toBeDisabled();
+    expect(screen.getByLabelText("Fichier principal")).toBeDisabled();
+    await userEvent.click(detect);
+    expect(api.updateConfig).not.toHaveBeenCalled();
+    await act(async () => finish(variant));
+    await waitFor(() => expect(detect).toBeEnabled());
   });
   it("conserve les filtres au rafraîchissement et les réinitialise pour une autre version", async () => {
     const props = {

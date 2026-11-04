@@ -221,27 +221,13 @@ pub fn source_changed_with_config(
     current: &[ManifestEntry],
     current_config: &ExportConfig,
 ) -> bool {
-    fn source<'a>(
-        entries: &'a [ManifestEntry],
-        previous_config: &ExportConfig,
-        current_config: &ExportConfig,
-    ) -> std::collections::BTreeMap<&'a str, &'a ManifestEntry> {
+    fn files(entries: &[ManifestEntry]) -> std::collections::BTreeMap<&str, &ManifestEntry> {
         entries
             .iter()
-            .filter(|entry| {
-                entry.kind != "file"
-                    || ![
-                        previous_config.generated_glb_file.as_deref(),
-                        current_config.generated_glb_file.as_deref(),
-                    ]
-                    .contains(&Some(entry.path.as_str()))
-            })
             .map(|entry| (entry.path.as_str(), entry))
             .collect()
     }
-    source(previous, previous_config, current_config)
-        != source(current, previous_config, current_config)
-        || previous_config.primary_file != current_config.primary_file
+    files(previous) != files(current) || previous_config.primary_file != current_config.primary_file
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -787,6 +773,30 @@ fn synchronize_once(
     )
 }
 
+/// Import editable sources as supplied, without generating a workspace GLB.
+pub fn import_source(
+    library: &Library,
+    source: &Path,
+    name: &str,
+    mut config: ExportConfig,
+    ctx: &OperationContext,
+) -> Result<AssetDetail> {
+    ensure_real_directory(source)?;
+    let source = fs::canonicalize(source)?;
+    if source.starts_with(library.root()) || library.root().starts_with(&source) {
+        return Err(CoreError::Invalid(
+            "Le dossier importé doit être extérieur à la bibliothèque et ne pas la contenir."
+                .into(),
+        ));
+    }
+    resolve_project_named(&source, &list_files(&source)?, &config, Some(name))?;
+    config.generated_glb_file = None;
+    config.scene = None;
+    config.collection = None;
+    config.apply_modifiers = true;
+    library.import_folder(&source, name, config, ctx)
+}
+
 pub fn import_project(
     library: &Library,
     source: &Path,
@@ -987,7 +997,7 @@ mod tests {
         ));
         after[2] = before[2].clone();
         after[1].size += 1;
-        assert!(!source_changed_with_config(
+        assert!(source_changed_with_config(
             &before, &config, &after, &config
         ));
     }
@@ -1058,7 +1068,7 @@ mod tests {
         );
     }
     #[test]
-    fn derived_output_is_excluded_but_all_other_saved_content_is_compared() {
+    fn former_derived_outputs_are_compared_like_all_saved_content() {
         let previous = vec![entry("main.blend"), entry("old.glb")];
         let mut current = vec![entry("main.blend"), entry("new.GLB")];
         let previous_config = ExportConfig {
@@ -1069,7 +1079,7 @@ mod tests {
             generated_glb_file: Some("new.GLB".into()),
             ..Default::default()
         };
-        assert!(!source_changed_with_config(
+        assert!(source_changed_with_config(
             &previous,
             &previous_config,
             &current,
@@ -1300,7 +1310,7 @@ mod tests {
         assert_eq!(fs::read(&artifact.path).unwrap(), original);
         assert!(synchronize_variant(&library, &variant_id, None, &ctx).is_err());
         assert!(
-            !library
+            library
                 .changes(&variant_id, &ctx)
                 .unwrap()
                 .has_source_changes()

@@ -283,7 +283,7 @@ impl Library {
         }
         let db = self.db()?;
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-        let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots h ON h.id=v.head_snapshot_id LEFT JOIN snapshots b ON b.id=v.backup_snapshot_id WHERE h.id IS NULL OR h.storage_kind<>'full' OR h.variant_id<>v.id OR (v.backup_snapshot_id IS NOT NULL AND (b.id IS NULL OR b.storage_kind<>'full')))", [], |r| r.get(0))?;
+        let invalid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM variants v LEFT JOIN snapshots h ON h.id=v.head_snapshot_id LEFT JOIN snapshots b ON b.id=v.backup_snapshot_id WHERE v.deleted_name IS NULL AND (h.id IS NULL OR h.storage_kind<>'full' OR h.variant_id<>v.id OR (v.backup_snapshot_id IS NOT NULL AND (b.id IS NULL OR b.storage_kind<>'full'))))", [], |r| r.get(0))?;
         if check != "ok" || invalid || db.prepare("PRAGMA foreign_key_check")?.exists([])? {
             return Err(CoreError::Inconsistent(
                 "Catalogue incohérent : aucune purge effectuée.".into(),
@@ -400,7 +400,7 @@ impl Library {
                     }
                 }
             };
-            let other_protection: bool = self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM variants WHERE head_snapshot_id=?1 OR (backup_snapshot_id=?1 AND id<>?2))", params![id,variant_id], |r|r.get(0))?;
+            let other_protection: bool = self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM variants WHERE deleted_name IS NULL AND (head_snapshot_id=?1 OR (backup_snapshot_id=?1 AND id<>?2)))", params![id,variant_id], |r|r.get(0))?;
             if other_protection {
                 report.warnings.push(format!(
                     "{} : contenu conservé car protégé par une autre variante.",
@@ -587,6 +587,10 @@ impl Library {
                 let mut db = self.db()?;
                 let tx = db.transaction()?;
                 tx.execute("INSERT OR IGNORE INTO garbage_candidates(hash,size) SELECT hash,size FROM snapshot_entries WHERE snapshot_id=?1 AND kind='file'", [&version.id])?;
+                tx.execute(
+                    "DELETE FROM file_selections WHERE context_key=?1",
+                    [&version.id],
+                )?;
                 tx.execute(
                     "DELETE FROM snapshot_entries WHERE snapshot_id=?1",
                     [&version.id],
@@ -1015,7 +1019,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 }

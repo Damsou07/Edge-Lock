@@ -467,6 +467,53 @@ pub fn prepare_preview(
     request: PreviewRequest<'_>,
     ctx: &OperationContext,
 ) -> Result<PreviewOutcome> {
+    prepare_preview_inner(library, request, ctx, true)
+}
+
+/// Desktop selections are stored by the application, independently from legacy cache choices.
+pub fn prepare_view_preview(
+    library: &Library,
+    request: PreviewRequest<'_>,
+    ctx: &OperationContext,
+) -> Result<PreviewOutcome> {
+    prepare_preview_inner(library, request, ctx, false)
+}
+
+/// Gallery previews are deterministic and never overwrite the detail view's selection.
+pub fn prepare_library_preview(
+    library: &Library,
+    variant_id: &str,
+    blender_path: Option<&Path>,
+    ctx: &OperationContext,
+) -> Result<Box<PreviewArtifact>> {
+    let variant = library.get_variant(variant_id)?;
+    let selected = choose_glb(&variant.files, &variant.variant.config, None)?
+        .into_iter()
+        .next();
+    match prepare_preview_inner(
+        library,
+        PreviewRequest {
+            variant_id,
+            snapshot_id: None,
+            preview_file: selected.as_deref(),
+            blender_path,
+        },
+        ctx,
+        false,
+    )? {
+        PreviewOutcome::Ready(artifact) => Ok(artifact),
+        PreviewOutcome::Choose(_) => Err(CoreError::Inconsistent(
+            "La source de la vignette a changé pendant sa préparation.".into(),
+        )),
+    }
+}
+
+fn prepare_preview_inner(
+    library: &Library,
+    request: PreviewRequest<'_>,
+    ctx: &OperationContext,
+    remember_selection: bool,
+) -> Result<PreviewOutcome> {
     ctx.check_cancelled()?;
     let variant = library.get_variant(request.variant_id)?;
     let snapshot = request
@@ -477,14 +524,8 @@ pub fn prepare_preview(
         if snapshot.storage.kind == "deleted" || !snapshot.storage.preview_trusted {
             return Err(CoreError::Invalid("Cette capture ne dispose pas d’un aperçu historique certifié. Son dossier complet reste restaurable.".into()));
         }
-        let owner = library.get_variant(&snapshot.variant_id)?;
-        if owner.variant.asset_id != variant.variant.asset_id {
-            return Err(CoreError::Invalid(
-                "Cette version appartient à un autre asset.".into(),
-            ));
-        }
         (
-            PathBuf::from(&owner.variant.workspace_path),
+            library.snapshot_workspace(request.variant_id, &snapshot.id)?,
             snapshot.entries.clone(),
             snapshot.config.clone(),
         )
@@ -496,7 +537,7 @@ pub fn prepare_preview(
         )
     };
     let logical_root = dunce::simplified(&logical_root).to_path_buf();
-    let remembered = if request.preview_file.is_none() {
+    let remembered = if remember_selection && request.preview_file.is_none() {
         remembered_choice(
             library.root(),
             request.variant_id,
@@ -581,7 +622,7 @@ pub fn prepare_preview(
     let cache = managed_cache(library.root())?;
     cleanup_temporary(library.root())?;
     let remember_choice = || {
-        if request.preview_file.is_some() {
+        if remember_selection && request.preview_file.is_some() {
             // This is disposable UI preference data; failure must not hide a valid preview.
             let _ = atomic_json(
                 &preference_path(&cache, request.variant_id, request.snapshot_id),

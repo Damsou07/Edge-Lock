@@ -4,7 +4,7 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
   return (
     <Modal
       title="Aide et mode d’emploi"
-      subtitle="Les repères pour créer, synchroniser et retrouver vos assets."
+      subtitle="Les repères pour créer, versionner et retrouver vos assets."
       onClose={onClose}
       wide
     >
@@ -30,17 +30,18 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             changez-le avec Fichier principal ou Re-détecter automatiquement.
           </p>
           <p>
-            Le principal est synchronisé automatiquement. Les sélecteurs Source
-            de l’aperçu et Source de l’export permettent de choisir
-            indépendamment un .blend ou un .glb. Les autres projets Blender sont
-            préparés à la demande. L’import conserve le dossier original et les
-            GLB utilisateur.
+            Aucun GLB n’est généré automatiquement dans le workspace : vous
+            gérez ces fichiers. Sans GLB existant, la vignette de bibliothèque
+            utilise le .blend principal via le cache interne. Les sélecteurs
+            Source de l’aperçu et Source de l’export choisissent indépendamment
+            un .blend ou un .glb. Ces choix sont sauvegardés automatiquement par
+            variante et version, même après redémarrage.
           </p>
           <p>
             Les sauvegardes .blend1, textures et références sont autorisées.
-            Chaque variante garde son dossier indépendant. Une régénération du
-            seul GLB géré ne crée pas de changement à versionner ; un GLB
-            utilisateur ajouté ou modifié compte bien comme un changement.
+            Chaque variante garde son dossier indépendant. Tous les fichiers du
+            workspace sont versionnables, y compris les anciens GLB gérés.
+            L’import conserve le dossier original.
           </p>
           <p>
             L’aperçu n’impose plus de plafond de taille GLB, de géométrie ou de
@@ -94,21 +95,21 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             </li>
             <li>
               Importez un dossier conforme ou utilisez Nouveau projet. L’import
-              crée la première version après une génération GLB réussie.
+              copie les fichiers et crée la première version sans conversion GLB
+              ni installation Blender obligatoire.
             </li>
             <li>
               Depuis la fiche de l’asset, ouvrez le workspace ou le projet dans
               Blender. Modifiez le projet puis enregistrez le .blend.
             </li>
             <li>
-              Gardez Edge Lock ouvert : il détecte la sauvegarde et synchronise
-              le GLB de la scène active enregistrée, avec ses modificateurs
-              actifs. Le worker ne réenregistre pas votre .blend.
+              Gardez Edge Lock ouvert : il détecte les sauvegardes. Les aperçus
+              sont préparés dans le cache interne, sans modifier votre .blend ni
+              vos GLB de travail.
             </li>
             <li>
-              Après synchronisation, créez une version pour conserver
-              volontairement cet état. Modifier seulement le GLB géré ne crée
-              pas de changement source à versionner.
+              Après détection des modifications, créez une version pour
+              conserver volontairement cet état, même si l’aperçu échoue.
             </li>
           </ol>
           <p>
@@ -125,10 +126,20 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             une version complète produit un nouveau workspace indépendant.
           </p>
           <p>
+            Renommer la version change son libellé dans tous les historiques qui
+            la partagent, sans changer sa date ni ses fichiers. Renommer la
+            variante conserve son chemin de travail. Supprimer la variante
+            demande confirmation et retire son workspace et ses versions
+            exclusives ; les données partagées restent disponibles. La dernière
+            variante est protégée. Un nettoyage différé des fichiers verrouillés
+            est repris à la réouverture.
+          </p>
+          <p>
             Le courant et son backup sont normalement conservés complets ; les
             versions plus anciennes peuvent ne conserver que tous leurs GLB de
             consultation, au choix. Ces versions ne permettent plus de reprendre
-            l’édition Blender.
+            l’édition Blender. Sans GLB enregistré valide, les sources complètes
+            sont conservées.
           </p>
           <p>
             Pour restaurer un backup, enregistrez et fermez le projet dans
@@ -168,14 +179,14 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             dossiers. Réinitialiser les filtres retrouve la liste complète.
           </p>
           <p>
-            Si la synchronisation échoue, lisez le diagnostic dans la fiche,
-            vérifiez le fichier principal et les textures ou dépendances
-            utilisées, puis relancez la synchronisation. Une erreur ne remplace
-            pas le dernier GLB valide et laisse le .blend accessible.
+            Si l’aperçu échoue, vérifiez le fichier principal et les textures ou
+            dépendances utilisées, puis actualisez l’aperçu. Une erreur laisse
+            les fichiers et le versionnement accessibles.
           </p>
           <p>
-            Une erreur de génération conserve le dernier GLB valide. Vous pouvez
-            choisir une autre source d’aperçu ou exporter un GLB existant. Les
+            Une erreur de conversion conserve le dernier aperçu. Vous pouvez
+            choisir une autre source d’aperçu ou exporter un GLB existant. Si
+            une source mémorisée a disparu, sélectionnez un autre fichier. Les
             versions complètes conservent les sources ; les versions allégées
             proposent uniquement les GLB enregistrés.
           </p>

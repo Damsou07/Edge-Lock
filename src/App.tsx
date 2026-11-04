@@ -309,6 +309,7 @@ export default function App() {
             "snapshot",
             "restore",
             "storageApply",
+            "variantDeletionApply",
           ].includes(request.kind)
         ) {
           try {

@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 #[path = "deletion_evidence.rs"]
 mod evidence;
 use evidence::WorkspaceEvidence;
+#[path = "variant_deletion.rs"]
+mod variants;
+pub use variants::VariantDeletionPlan;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,11 +43,23 @@ pub struct ArchiveDeletionReport {
 #[derive(Debug, Serialize, Deserialize)]
 struct Target {
     asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    variant_id: Option<String>,
     workspace: String,
     variant_ids: Vec<String>,
     backup_hashes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_evidence: Option<WorkspaceEvidence>,
+}
+
+impl Target {
+    fn variant_workspace(&self, variant: &str) -> PathBuf {
+        if self.variant_id.is_some() {
+            PathBuf::from(&self.workspace)
+        } else {
+            Path::new(&self.workspace).join(variant)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +134,16 @@ fn known_hash(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_asset_history_scope(db: &Connection, id: &str) -> Result<()> {
+    let foreign: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE v.asset_id<>?1 AND (s.parent_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1) OR s.restored_from IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1))) OR EXISTS(SELECT 1 FROM variants v WHERE v.asset_id<>?1 AND (v.head_snapshot_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1) OR v.backup_snapshot_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1)))", [id], |row| row.get(0))?;
+    if foreign {
+        return Err(CoreError::Inconsistent(
+            "Une version est référencée par un autre asset ; aucun fichier supprimé.".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_no_deletion(root: &Path, db: &Connection) -> Result<()> {
     for entry in fs::read_dir(root.join("staging"))? {
         let entry = entry?;
@@ -143,7 +168,7 @@ impl Library {
         known_hash(hash)?;
         let _guard = self.write_guard()?;
         let db = self.db()?;
-        require_id(&db, "variants", variant_id)?;
+        require_active_variant(&db, variant_id)?;
         db.execute(
             "INSERT OR IGNORE INTO glb_backup_owners(variant_id,hash) VALUES(?1,?2)",
             params![variant_id, hash],
@@ -254,13 +279,7 @@ impl Library {
                     ));
                 }
             }
-            let foreign: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE v.asset_id<>?1 AND (s.parent_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1) OR s.restored_from IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1))) OR EXISTS(SELECT 1 FROM variants v WHERE v.asset_id<>?1 AND (v.head_snapshot_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1) OR v.backup_snapshot_id IN (SELECT x.id FROM snapshots x JOIN variants a ON a.id=x.variant_id WHERE a.asset_id=?1)))", [&id], |r|r.get(0))?;
-            if foreign {
-                return Err(CoreError::Inconsistent(
-                    "Une version est référencée par un autre asset ; aucun fichier supprimé."
-                        .into(),
-                ));
-            }
+            ensure_asset_history_scope(&db, &id)?;
             let snapshot_ids: Vec<String> = db.prepare("SELECT s.id FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE v.asset_id=?1 ORDER BY s.id")?
                 .query_map([&id], |r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
             let mut snapshots = Vec::new();
@@ -287,7 +306,15 @@ impl Library {
                 snapshots,
                 backup_hashes
             ]));
-            plan.snapshot_count += snapshots.len() as u64;
+            plan.snapshot_count += snapshots
+                .iter()
+                .filter(|snapshot| snapshot.storage.kind != "deleted")
+                .count() as u64;
+            plan.variant_count += db.query_row(
+                "SELECT COUNT(*) FROM variants WHERE asset_id=?1 AND deleted_name IS NULL",
+                [&id],
+                |row| sql_u64(row, 0),
+            )?;
             let variant_ids: Vec<String> = variants.into_iter().map(|v| v.0).collect();
             plan.variant_ids.extend(variant_ids.clone());
             plan.asset_ids.push(id.clone());
@@ -297,6 +324,7 @@ impl Library {
             });
             targets.push(Target {
                 asset_id: id,
+                variant_id: None,
                 workspace,
                 variant_ids,
                 backup_hashes,
@@ -324,7 +352,6 @@ impl Library {
             }
         }
         plan.asset_count = targets.len() as u64;
-        plan.variant_count = plan.variant_ids.len() as u64;
         plan.plan_token = blake3::hash(&serde_json::to_vec(&(
             self.root.to_string_lossy(),
             asset_id,
@@ -355,7 +382,7 @@ impl Library {
                     .into(),
             ));
         }
-        let mut report = ArchiveDeletionReport {
+        let report = ArchiveDeletionReport {
             deleted_asset_ids: prepared.plan.asset_ids,
             deleted_variant_ids: prepared.plan.variant_ids,
             released_bytes: 0,
@@ -365,17 +392,41 @@ impl Library {
         if prepared.targets.is_empty() {
             return Ok(report);
         }
-        let id = new_id();
-        let directory = self.store.staging.join(format!("delete-{id}"));
-        let preparing = tempfile::Builder::new()
-            .prefix(".delete-preparing-")
-            .tempdir_in(&self.store.staging)?;
         let journal = DeletionJournal {
             version: 2,
-            id,
+            id: new_id(),
             targets: prepared.targets,
             candidates: prepared.candidates,
         };
+        self.publish_deletion(journal, report, ctx, |tx, journal| {
+            for target in &journal.targets {
+                tx.execute("UPDATE variants SET backup_snapshot_id=NULL WHERE asset_id=?1", [&target.asset_id])?;
+                tx.execute("UPDATE snapshots SET parent_id=NULL,restored_from=NULL WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
+                tx.execute("DELETE FROM file_selections WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)", [&target.asset_id])?;
+                tx.execute("DELETE FROM snapshot_entries WHERE snapshot_id IN (SELECT s.id FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE v.asset_id=?1)",[&target.asset_id])?;
+                tx.execute("DELETE FROM snapshots WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
+                tx.execute("DELETE FROM glb_backup_owners WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
+                tx.execute("DELETE FROM variants WHERE asset_id=?1", [&target.asset_id])?;
+                tx.execute("DELETE FROM asset_tags WHERE asset_id=?1", [&target.asset_id])?;
+                tx.execute("DELETE FROM asset_games WHERE asset_id=?1", [&target.asset_id])?;
+                tx.execute("DELETE FROM assets WHERE id=?1", [&target.asset_id])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Both asset and variant deletion use the same recoverable publication protocol.
+    fn publish_deletion(
+        &self,
+        journal: DeletionJournal,
+        mut report: ArchiveDeletionReport,
+        ctx: &OperationContext,
+        apply: impl FnOnce(&Transaction<'_>, &DeletionJournal) -> Result<()>,
+    ) -> Result<ArchiveDeletionReport> {
+        let directory = self.store.staging.join(format!("delete-{}", journal.id));
+        let preparing = tempfile::Builder::new()
+            .prefix(".delete-preparing-")
+            .tempdir_in(&self.store.staging)?;
         let journal_bytes = serde_json::to_vec(&journal)?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -399,26 +450,7 @@ impl Library {
                     params![hash, sql_size(*size)?],
                 )?;
             }
-            for target in &journal.targets {
-                tx.execute(
-                    "UPDATE variants SET backup_snapshot_id=NULL WHERE asset_id=?1",
-                    [&target.asset_id],
-                )?;
-                tx.execute("UPDATE snapshots SET parent_id=NULL,restored_from=NULL WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
-                tx.execute("DELETE FROM snapshot_entries WHERE snapshot_id IN (SELECT s.id FROM snapshots s JOIN variants v ON v.id=s.variant_id WHERE v.asset_id=?1)",[&target.asset_id])?;
-                tx.execute("DELETE FROM snapshots WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
-                tx.execute("DELETE FROM glb_backup_owners WHERE variant_id IN (SELECT id FROM variants WHERE asset_id=?1)",[&target.asset_id])?;
-                tx.execute("DELETE FROM variants WHERE asset_id=?1", [&target.asset_id])?;
-                tx.execute(
-                    "DELETE FROM asset_tags WHERE asset_id=?1",
-                    [&target.asset_id],
-                )?;
-                tx.execute(
-                    "DELETE FROM asset_games WHERE asset_id=?1",
-                    [&target.asset_id],
-                )?;
-                tx.execute("DELETE FROM assets WHERE id=?1", [&target.asset_id])?;
-            }
+            apply(&tx, &journal)?;
             tx.execute(
                 "INSERT INTO archive_deletions(id,journal_hash) VALUES(?1,?2)",
                 params![
@@ -443,7 +475,7 @@ impl Library {
             Err(error) => {
                 report.cleanup_pending = true;
                 report.warnings.push(format!(
-                    "Assets supprimés ; nettoyage à reprendre à la réouverture : {error}"
+                    "Suppression enregistrée ; nettoyage à reprendre à la réouverture : {error}"
                 ));
             }
         }
@@ -470,7 +502,7 @@ fn read_journal(root: &Path, directory: &Path) -> Result<(DeletionJournal, Strin
     }
     let bytes = fs::read(path)?;
     let journal: DeletionJournal = serde_json::from_slice(&bytes)?;
-    if !matches!(journal.version, 1 | 2)
+    if !matches!(journal.version, 1..=3)
         || directory.file_name().and_then(|n| n.to_str()) != Some(&format!("delete-{}", journal.id))
         || directory.parent() != Some(root.join("staging").as_path())
         || journal.targets.is_empty()
@@ -481,13 +513,33 @@ fn read_journal(root: &Path, directory: &Path) -> Result<(DeletionJournal, Strin
     }
     let mut ids = BTreeSet::new();
     for target in &journal.targets {
+        let expected_workspace = if let Some(variant) = &target.variant_id {
+            if journal.version < 3
+                || safe_relative(variant)?.components().count() != 1
+                || target.variant_ids != [variant.clone()]
+            {
+                return Err(CoreError::Inconsistent(
+                    "Variante de suppression invalide.".into(),
+                ));
+            }
+            format!("workspaces/{}/{}", target.asset_id, variant)
+        } else {
+            format!("workspaces/{}", target.asset_id)
+        };
         if safe_relative(&target.asset_id)?.components().count() != 1
-            || target.workspace != format!("workspaces/{}", target.asset_id)
+            || target.workspace != expected_workspace
             || !ids.insert(&target.asset_id)
         {
             return Err(CoreError::Inconsistent(
                 "Propriétaire de suppression invalide.".into(),
             ));
+        }
+        for variant in &target.variant_ids {
+            if safe_relative(variant)?.components().count() != 1 {
+                return Err(CoreError::Inconsistent(
+                    "Identifiant de variante invalide.".into(),
+                ));
+            }
         }
         for hash in &target.backup_hashes {
             known_hash(hash)?;
@@ -519,11 +571,20 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<Cle
     let (journal, digest) = read_journal(root, directory)?;
     let mut present = 0;
     for target in &journal.targets {
-        if db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
-            [&target.asset_id],
-            |r| r.get::<_, bool>(0),
-        )? {
+        let active: bool = if let Some(variant) = &target.variant_id {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM variants WHERE id=?1 AND deleted_name IS NULL)",
+                [variant],
+                |row| row.get(0),
+            )?
+        } else {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1)",
+                [&target.asset_id],
+                |row| row.get(0),
+            )?
+        };
+        if active {
             present += 1;
         }
     }
@@ -553,6 +614,15 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<Cle
             ));
         }
         for target in &journal.targets {
+            if let Some(variant) = &target.variant_id {
+                let matches: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM variants WHERE id=?1 AND asset_id=?2 AND workspace=?3 AND deleted_name IS NULL)", params![variant, target.asset_id, target.workspace], |row| row.get(0))?;
+                if !matches {
+                    return Err(CoreError::Inconsistent(
+                        "Le journal ne correspond plus à la variante.".into(),
+                    ));
+                }
+                continue;
+            }
             let variants: Vec<(String, String)> = db
                 .prepare("SELECT id,workspace FROM variants WHERE asset_id=?1 ORDER BY id")?
                 .query_map([&target.asset_id], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -569,7 +639,7 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<Cle
             }
         }
     }
-    if journal.version == 2 {
+    if journal.version >= 2 {
         return recover_v2(root, db, directory, &journal, present == 0);
     }
     let mut released = 0;
@@ -675,6 +745,10 @@ fn cleanup_v2_workspace(
     outcome: &mut CleanupOutcome,
 ) -> Result<()> {
     ensure_real_directory(&root.join("workspaces"))?;
+    if target.variant_id.is_some() && path_present(&root.join("workspaces").join(&target.asset_id))?
+    {
+        ensure_real_directory(&root.join("workspaces").join(&target.asset_id))?;
+    }
     let original = root.join(safe_relative(&target.workspace)?);
     let staged = directory.join(&target.asset_id);
     if path_present(&staged)? && path_present(&original)? {
@@ -935,7 +1009,7 @@ fn cleanup_caches(
                 };
                 let owned = targets.iter().any(|t| {
                     t.variant_ids.iter().any(|v| {
-                        let primary = root.join(&t.workspace).join(v).join(source);
+                        let primary = root.join(t.variant_workspace(v)).join(source);
                         record["sources"].as_array().is_some_and(|sources| {
                             sources.iter().any(|s| {
                                 s["path"].as_str().is_some_and(|p| {

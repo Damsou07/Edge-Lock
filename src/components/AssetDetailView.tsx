@@ -13,6 +13,7 @@ import type {
   AppError,
   AssetDetail,
   ChangeSet,
+  FileSelections,
   PreviewResult,
   Snapshot,
   StorageAction,
@@ -36,6 +37,8 @@ import { Modal } from "./Modal";
 import { HistoryStorageModal, RestoreBackupModal } from "./HistoryStorageModal";
 import { AssetFilesPanel } from "./AssetFilesPanel";
 import { WorkspaceDiscardModal } from "./WorkspaceDiscardModal";
+import { RenameModal, VariantDeletionModal } from "./AssetManagementModals";
+import type { RenameTarget } from "./AssetManagementModals";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
@@ -182,8 +185,14 @@ export function AssetDetailView({
   const [previewCandidates, setPreviewCandidates] = useState<string[]>([]);
   const [previewFile, setPreviewFile] = useState("");
   const previewChoice = useRef("");
-  const previewChoices = useRef(new Map<string, string>());
   const [exportFile, setExportFile] = useState("");
+  const [fileSelections, setFileSelections] = useState<FileSelections>({
+    previewFile: null,
+    exportFile: null,
+  });
+  const [preferencesFor, setPreferencesFor] = useState("");
+  const [selectionSaving, setSelectionSaving] = useState(false);
+  const pendingSelectionWrite = useRef<Promise<boolean> | null>(null);
   const [configBusy, setConfigBusy] = useState(false);
   const [localRefresh, setLocalRefresh] = useState(0);
   const [tab, setTab] = useState<"files" | "history" | "changes">("files");
@@ -201,6 +210,8 @@ export function AssetDetailView({
   const [discardTarget, setDiscardTarget] = useState<Variant | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleted, setDeleted] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [deleteVariantId, setDeleteVariantId] = useState<string | null>(null);
   const selection = [id, variantId, snapshotId ?? "current"].join(":");
   const currentSelection = useRef(selection);
   currentSelection.current = selection;
@@ -315,6 +326,7 @@ export function AssetDetailView({
     };
   }, [snapshotId, onError]);
   useEffect(() => {
+    let active = true;
     previewRequest.current += 1;
     previewAbort.current?.abort();
     autoPreviewAttempt.current = "";
@@ -323,11 +335,32 @@ export function AssetDetailView({
     setPreviewBusy(false);
     setPreviewError("");
     setPreviewCandidates([]);
-    const remembered = previewChoices.current.get(selection) ?? "";
-    setPreviewFile(remembered);
-    previewChoice.current = remembered;
+    setPreferencesFor("");
+    setFileSelections({ previewFile: null, exportFile: null });
+    setPreviewFile("");
+    previewChoice.current = "";
     setExportFile("");
-  }, [selection]);
+    if (variantId) {
+      void api
+        .getFileSelections(variantId, snapshotId)
+        .then((value) => {
+          if (!active || currentSelection.current !== selection) return;
+          setFileSelections(value);
+          setPreviewFile(value.previewFile ?? "");
+          previewChoice.current = value.previewFile ?? "";
+          setExportFile(value.exportFile ?? "");
+          setPreferencesFor(selection);
+        })
+        .catch((reason) => {
+          if (!active || currentSelection.current !== selection) return;
+          onError(errorMessage(reason));
+          setPreferencesFor(selection);
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [selection, variantId, snapshotId, onError]);
   useEffect(() => {
     if (!variantId) return;
     let active = true;
@@ -380,11 +413,26 @@ export function AssetDetailView({
     .map((file) => file.path)
     .sort();
   const blendFiles = modelFiles.filter((file) => /\.blend$/i.test(file));
+  const filesReady = snapshotId
+    ? selectedSnapshot?.id === snapshotId && !!snapshotDetail
+    : variantDetail?.variant.id === variantId;
+  const preferencesReady = preferencesFor === selection;
+  const previewUnavailable = !!(
+    filesReady &&
+    fileSelections.previewFile &&
+    !modelFiles.includes(fileSelections.previewFile)
+  );
+  const exportUnavailable = !!(
+    filesReady &&
+    exportFile &&
+    !modelFiles.includes(exportFile)
+  );
   const sourceChoices = [
     ...new Set([
       ...modelFiles,
       ...previewCandidates,
       ...(preview?.sourceFile ? [preview.sourceFile] : []),
+      ...(fileSelections.previewFile ? [fileSelections.previewFile] : []),
     ]),
   ];
   const pendingCount = changes
@@ -436,7 +484,6 @@ export function AssetDetailView({
       setPreviewError("");
       setPreviewFile(selectedFile);
       previewChoice.current = selectedFile;
-      if (selectedFile) previewChoices.current.set(target, selectedFile);
       try {
         const result = await runJob<PreviewResult>(
           {
@@ -498,13 +545,54 @@ export function AssetDetailView({
   useEffect(() => {
     if (
       !variantDetail ||
+      !preferencesReady ||
+      !filesReady ||
+      previewUnavailable ||
       !autoPreviewKey ||
       autoPreviewAttempt.current === autoPreviewKey
     )
       return;
     autoPreviewAttempt.current = autoPreviewKey;
     void generatePreview(previewChoice.current);
-  }, [variantDetail, autoPreviewKey, generatePreview]);
+  }, [
+    variantDetail,
+    preferencesReady,
+    filesReady,
+    previewUnavailable,
+    autoPreviewKey,
+    generatePreview,
+  ]);
+  const saveFileSelection = (kind: "preview" | "export", file: string) => {
+    if (!preferencesReady || pendingSelectionWrite.current) return;
+    const target = selection;
+    setSelectionSaving(true);
+    const operation = api
+      .setFileSelection(variantId, snapshotId, kind, file || null)
+      .then(() => {
+        if (alive.current && currentSelection.current === target) {
+          setFileSelections((previous) => ({
+            ...previous,
+            [kind === "preview" ? "previewFile" : "exportFile"]: file || null,
+          }));
+          if (kind === "preview") void generatePreview(file);
+          else setExportFile(file);
+        }
+        return true;
+      })
+      .catch((reason) => {
+        if (alive.current) onError(errorMessage(reason));
+        return false;
+      })
+      .finally(() => {
+        pendingSelectionWrite.current = null;
+        if (alive.current) setSelectionSaving(false);
+      });
+    pendingSelectionWrite.current = operation;
+  };
+  const afterSelectionSaved = async (action: () => void) => {
+    if ((await pendingSelectionWrite.current) !== false && alive.current)
+      action();
+  };
   const refreshChanges = async () => {
     setLocalRefresh((value) => value + 1);
     if (!snapshotId) await workspace.retry();
@@ -540,11 +628,13 @@ export function AssetDetailView({
     }
   };
   const choosePrimary = async (primaryFile: string | null) => {
+    if (snapshotId || variantDetail?.variant.id !== variantId || configBusy)
+      return;
     const target = selection;
     setConfigBusy(true);
     try {
       await api.updateConfig(variantId, {
-        ...activeConfig,
+        ...variantDetail.variant.config,
         primaryFile,
         generatedGlbFile: null,
       });
@@ -608,7 +698,10 @@ export function AssetDetailView({
 
   return (
     <section className="detail-content">
-      <button className="back-link" onClick={onBack}>
+      <button
+        className="back-link"
+        onClick={() => void afterSelectionSaved(onBack)}
+      >
         <Icon name="back" size={16} />
         Retour à la bibliothèque
       </button>
@@ -662,6 +755,9 @@ export function AssetDetailView({
             disabled={
               !variant ||
               exportBusy ||
+              !preferencesReady ||
+              selectionSaving ||
+              exportUnavailable ||
               (!snapshotId && !exportFile && status?.state !== "ready")
             }
             onClick={() => void exportGlb()}
@@ -682,10 +778,13 @@ export function AssetDetailView({
             id="variant-select"
             value={variantId}
             onChange={(event) => {
-              setVariantId(event.target.value);
-              setSnapshotId(null);
-              setVariantDetail(null);
-              setSnapshots([]);
+              const nextVariant = event.target.value;
+              void afterSelectionSaved(() => {
+                setVariantId(nextVariant);
+                setSnapshotId(null);
+                setVariantDetail(null);
+                setSnapshots([]);
+              });
             }}
           >
             {detail.variants.map((item) => (
@@ -695,6 +794,46 @@ export function AssetDetailView({
             ))}
           </select>
         </div>
+        <button
+          className="text-button"
+          aria-label="Renommer la variante"
+          disabled={!variant || exportBusy || configBusy || selectionSaving}
+          onClick={() => {
+            if (variant)
+              void afterSelectionSaved(() =>
+                setRenameTarget({
+                  kind: "variant",
+                  id: variant.id,
+                  name: variant.name,
+                }),
+              );
+          }}
+        >
+          Renommer
+        </button>
+        <button
+          className="text-button"
+          aria-label="Supprimer la variante"
+          title={
+            detail.variants.length < 2
+              ? "La dernière variante ne peut pas être supprimée."
+              : "Supprimer la variante"
+          }
+          disabled={
+            !variant ||
+            detail.variants.length < 2 ||
+            exportBusy ||
+            configBusy ||
+            selectionSaving
+          }
+          onClick={() => {
+            if (variant)
+              void afterSelectionSaved(() => setDeleteVariantId(variant.id));
+          }}
+        >
+          <Icon name="trash" size={15} />
+          Supprimer
+        </button>
         <button
           className="text-button"
           disabled={!variant || selectedSnapshot?.storage?.kind === "preview"}
@@ -710,12 +849,12 @@ export function AssetDetailView({
             ? "Version enregistrée"
             : syncBusy || changesBusy
               ? status?.state === "syncing"
-                ? "Synchronisation…"
+                ? "Vérification…"
                 : "Vérification…"
               : status?.state === "nonconforming"
                 ? "Projet non conforme"
                 : status?.state === "failed"
-                  ? "Synchronisation interrompue"
+                  ? "Vérification interrompue"
                   : dirty
                     ? "Modifications non versionnées"
                     : "À jour"}
@@ -732,7 +871,7 @@ export function AssetDetailView({
           </div>
           <button
             className="button secondary small-button"
-            onClick={() => setSnapshotId(null)}
+            onClick={() => void afterSelectionSaved(() => setSnapshotId(null))}
           >
             Revenir au travail en cours
           </button>
@@ -806,8 +945,9 @@ export function AssetDetailView({
                     aria-label="Source de l’aperçu"
                     title={previewFile || "Source de l’aperçu"}
                     value={previewFile}
+                    disabled={!preferencesReady || selectionSaving}
                     onChange={(event) =>
-                      void generatePreview(event.target.value)
+                      saveFileSelection("preview", event.target.value)
                     }
                   >
                     <option value="" disabled>
@@ -816,6 +956,10 @@ export function AssetDetailView({
                     {sourceChoices.map((candidate) => (
                       <option key={candidate} value={candidate}>
                         {candidate}
+                        {previewUnavailable &&
+                        fileSelections.previewFile === candidate
+                          ? " (indisponible)"
+                          : ""}
                       </option>
                     ))}
                   </select>
@@ -971,7 +1115,7 @@ export function AssetDetailView({
               Fichier principal
               <select
                 value={activeConfig.primaryFile ?? ""}
-                disabled={!!snapshotId || configBusy}
+                disabled={!!snapshotId || configBusy || !filesReady}
                 onChange={(event) =>
                   void choosePrimary(event.target.value || null)
                 }
@@ -987,7 +1131,7 @@ export function AssetDetailView({
             {!snapshotId && (
               <button
                 className="text-button"
-                disabled={configBusy}
+                disabled={configBusy || !filesReady}
                 onClick={() => void choosePrimary(null)}
               >
                 Re-détecter automatiquement
@@ -997,10 +1141,17 @@ export function AssetDetailView({
               Source de l’export
               <select
                 value={exportFile}
-                disabled={exportBusy}
-                onChange={(event) => setExportFile(event.target.value)}
+                disabled={exportBusy || !preferencesReady || selectionSaving}
+                onChange={(event) =>
+                  saveFileSelection("export", event.target.value)
+                }
               >
-                <option value="">GLB principal</option>
+                <option value="">Détection automatique</option>
+                {exportUnavailable && (
+                  <option value={exportFile}>
+                    {exportFile} (indisponible)
+                  </option>
+                )}
                 {modelFiles.map((file) => (
                   <option key={file} value={file}>
                     {file}
@@ -1008,11 +1159,22 @@ export function AssetDetailView({
                 ))}
               </select>
             </label>
+            {(previewUnavailable || exportUnavailable) && (
+              <p className="field-help" role="status">
+                Une source mémorisée n’est plus disponible. Choisissez un autre
+                fichier.
+              </p>
+            )}
+            {selectionSaving && (
+              <p className="field-help" role="status">
+                Enregistrement des choix…
+              </p>
+            )}
           </div>
           {!snapshotId && syncBusy && (
             <p className="field-help" role="status">
               {status?.state === "syncing"
-                ? "Mise à jour du GLB et de l’aperçu…"
+                ? "Vérification des modifications…"
                 : "Vérification des fichiers…"}
             </p>
           )}
@@ -1025,7 +1187,7 @@ export function AssetDetailView({
                   className="text-button"
                   onClick={() => void workspace.retry()}
                 >
-                  Réessayer la synchronisation
+                  Réessayer la vérification
                 </button>
               )}
             </div>
@@ -1036,8 +1198,8 @@ export function AssetDetailView({
             <div>
               <strong>Gardez une trace de vos avancées.</strong>
               <p>
-                Enregistrez dans Blender : le GLB et l’aperçu se mettent à jour
-                automatiquement.
+                Enregistrez dans Blender puis créez une version. Vous gérez les
+                GLB du workspace ; les aperçus sont préparés dans le cache.
               </p>
             </div>
           </div>
@@ -1228,8 +1390,25 @@ export function AssetDetailView({
                   </div>
                   <button
                     className="button secondary small-button"
+                    aria-label="Renommer la version"
+                    onClick={() =>
+                      void afterSelectionSaved(() =>
+                        setRenameTarget({
+                          kind: "snapshot",
+                          id: snapshot.id,
+                          name: snapshot.message,
+                        }),
+                      )
+                    }
+                  >
+                    Renommer
+                  </button>
+                  <button
+                    className="button secondary small-button"
                     disabled={snapshot.storage?.previewTrusted === false}
-                    onClick={() => openSnapshot(snapshot)}
+                    onClick={() =>
+                      void afterSelectionSaved(() => openSnapshot(snapshot))
+                    }
                   >
                     Consulter
                     <Icon name="chevron" size={13} />
@@ -1338,6 +1517,67 @@ export function AssetDetailView({
           onSaved={onChanged}
         />
       )}
+      {renameTarget && (
+        <RenameModal
+          key={`${renameTarget.kind}:${renameTarget.id}`}
+          target={renameTarget}
+          onClose={() => setRenameTarget(null)}
+          onSaved={(name) => {
+            if (renameTarget.kind === "snapshot") {
+              setSnapshots((previous) =>
+                previous.map((item) =>
+                  item.id === renameTarget.id
+                    ? { ...item, message: name }
+                    : item,
+                ),
+              );
+              setSnapshotDetail((previous) =>
+                previous?.id === renameTarget.id
+                  ? { ...previous, message: name }
+                  : previous,
+              );
+            } else {
+              setDetail((previous) =>
+                previous
+                  ? {
+                      ...previous,
+                      variants: previous.variants.map((item) =>
+                        item.id === renameTarget.id ? { ...item, name } : item,
+                      ),
+                    }
+                  : previous,
+              );
+              setVariantDetail((previous) =>
+                previous?.variant.id === renameTarget.id
+                  ? { ...previous, variant: { ...previous.variant, name } }
+                  : previous,
+              );
+            }
+            setRenameTarget(null);
+            onChanged();
+          }}
+        />
+      )}
+      {deleteVariantId && (
+        <VariantDeletionModal
+          key={deleteVariantId}
+          variantId={deleteVariantId}
+          runJob={runJob}
+          onClose={() => setDeleteVariantId(null)}
+          onDeleted={(report) => {
+            const remaining = detail.variants.filter(
+              (item) => !report.deletedVariantIds.includes(item.id),
+            );
+            setSnapshotId(null);
+            setVariantDetail(null);
+            setSnapshots([]);
+            setVariantId(remaining[0]?.id ?? "");
+            setDetail({ ...detail, variants: remaining });
+            setLocalRefresh((value) => value + 1);
+            onChanged();
+          }}
+        />
+      )}
       {deleteOpen && (
         <ArchiveDeletionModal
           assetId={id}
@@ -1389,11 +1629,9 @@ export function AssetDetailView({
             previewRequest.current += 1;
             previewAbort.current?.abort();
             autoPreviewAttempt.current = "";
-            previewChoices.current.delete(`${id}:${discardTarget.id}:current`);
-            previewChoice.current = "";
-            setPreviewFile("");
+            previewChoice.current = fileSelections.previewFile ?? "";
+            setPreviewFile(fileSelections.previewFile ?? "");
             setPreviewCandidates([]);
-            setExportFile("");
             setPreview(null);
             displayedPreview.current = null;
             setPreviewError("");
