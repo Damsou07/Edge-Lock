@@ -28,6 +28,7 @@ impl ProjectLayout {
     pub fn config(&self) -> ExportConfig {
         ExportConfig {
             primary_file: Some(self.blend_file.clone()),
+            generated_glb_file: Some(self.glb_file.clone()),
             scene: None,
             collection: None,
             apply_modifiers: true,
@@ -45,48 +46,202 @@ fn has_extension(path: &str, extension: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
-/// The limit applies recursively to real model files; .blend1 remains an ordinary backup.
+/// Compatibility entry point when no source directory or saved selection is available.
 pub fn validate_project(entries: &[ManifestEntry]) -> Result<ProjectLayout> {
-    let files = |extension: &str| {
-        entries
-            .iter()
-            .filter(|entry| entry.kind == "file" && has_extension(&entry.path, extension))
-            .collect::<Vec<_>>()
-    };
-    let blends = files("blend");
-    let glbs = files("glb");
-    if blends.len() != 1 || glbs.len() > 1 {
-        return Err(CoreError::Invalid(format!(
-            "Projet non conforme : exactement un .blend et au plus un .glb sont requis ({} .blend, {} .glb). Les fichiers ont été conservés.",
-            blends.len(),
-            glbs.len()
-        )));
+    resolve_project(Path::new(""), entries, &ExportConfig::default())
+}
+
+/// Infer once from original metadata, then keep a valid saved choice stable.
+pub fn resolve_project(
+    root: &Path,
+    entries: &[ManifestEntry],
+    config: &ExportConfig,
+) -> Result<ProjectLayout> {
+    resolve_project_named(root, entries, config, None)
+}
+
+/// Asset names only affect fresh inference; saved selections remain authoritative.
+pub fn resolve_project_named(
+    root: &Path,
+    entries: &[ManifestEntry],
+    config: &ExportConfig,
+    asset_name: Option<&str>,
+) -> Result<ProjectLayout> {
+    let blends: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.kind == "file" && has_extension(&entry.path, "blend"))
+        .collect();
+    if blends.is_empty() {
+        return Err(CoreError::Invalid(
+            "Aucun fichier .blend dans ce workspace. Les fichiers ont été conservés.".into(),
+        ));
     }
-    safe_relative(&blends[0].path)?;
-    let glb_file = match glbs.first() {
-        Some(entry) => entry.path.clone(),
-        None => Path::new(&blends[0].path)
+    for blend in &blends {
+        safe_relative(&blend.path)?;
+    }
+    let saved = config
+        .primary_file
+        .as_deref()
+        .and_then(|path| blends.iter().find(|entry| entry.path == path).copied());
+    let selected = saved.unwrap_or_else(|| {
+        let modified: Vec<_> = blends
+            .iter()
+            .map(|entry| {
+                (!root.as_os_str().is_empty())
+                    .then(|| {
+                        fs::symlink_metadata(root.join(&entry.path))
+                            .ok()
+                            .filter(|meta| meta.is_file() && !meta.file_type().is_symlink())
+                            .and_then(|meta| meta.modified().ok())
+                    })
+                    .flatten()
+            })
+            .collect();
+        let rank = |smaller: usize, weight: u64| {
+            if blends.len() > 1 {
+                weight * smaller as u64 / (blends.len() - 1) as u64
+            } else {
+                weight
+            }
+        };
+        blends
+            .iter()
+            .enumerate()
+            .max_by(|(a_index, a), (b_index, b)| {
+                let score = |index: usize, entry: &ManifestEntry| {
+                    let size = rank(
+                        blends
+                            .iter()
+                            .filter(|other| other.size < entry.size)
+                            .count(),
+                        40,
+                    );
+                    let recent = rank(
+                        modified
+                            .iter()
+                            .filter(|other| **other < modified[index])
+                            .count(),
+                        30,
+                    );
+                    let stem = Path::new(&entry.path)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let normalized = |value: &str| {
+                        value
+                            .chars()
+                            .filter(|character| character.is_alphanumeric())
+                            .flat_map(char::to_lowercase)
+                            .collect::<String>()
+                    };
+                    let name = if matches!(stem.as_str(), "main" | "principal" | "asset")
+                        || asset_name.is_some_and(|name| normalized(name) == normalized(&stem))
+                    {
+                        20
+                    } else {
+                        0
+                    };
+                    let depth = Path::new(&entry.path)
+                        .components()
+                        .count()
+                        .saturating_sub(1) as u64;
+                    size + recent + name + 10 / (depth + 1)
+                };
+                score(*a_index, a)
+                    .cmp(&score(*b_index, b))
+                    .then_with(|| b.path.cmp(&a.path))
+            })
+            .map(|(_, entry)| *entry)
+            .unwrap()
+    });
+    let blend_file = selected.path.clone();
+    let glb_file = if let Some(path) = config
+        .generated_glb_file
+        .as_ref()
+        .filter(|_| saved.is_some())
+    {
+        safe_relative(path)?;
+        if !is_glb(path) {
+            return Err(CoreError::Invalid(
+                "Le fichier généré doit porter l’extension .glb.".into(),
+            ));
+        }
+        path.clone()
+    } else {
+        let base = Path::new(&blend_file)
             .with_extension("glb")
             .to_string_lossy()
-            .replace('\\', "/"),
+            .replace('\\', "/");
+        let occupied = |path: &str| {
+            entries
+                .iter()
+                .any(|entry| entry.path.eq_ignore_ascii_case(path))
+        };
+        if !occupied(&base) {
+            base
+        } else {
+            let mut index = 1u64;
+            loop {
+                let extension = if index == 1 {
+                    "edge-lock.glb".into()
+                } else {
+                    format!("edge-lock-{index}.glb")
+                };
+                let candidate = Path::new(&blend_file)
+                    .with_extension(extension)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !occupied(&candidate) {
+                    break candidate;
+                }
+                index += 1;
+            }
+        }
     };
-    safe_relative(&glb_file)?;
     Ok(ProjectLayout {
-        blend_file: blends[0].path.clone(),
+        blend_file,
         glb_file,
     })
 }
 
-/// Generated output and obsolete export settings never constitute a source edit.
+/// With no ownership configuration every file, including GLBs, is a source.
 pub fn source_changed(previous: &[ManifestEntry], current: &[ManifestEntry]) -> bool {
-    fn source(entries: &[ManifestEntry]) -> std::collections::BTreeMap<&str, &ManifestEntry> {
+    source_changed_with_config(
+        previous,
+        &ExportConfig::default(),
+        current,
+        &ExportConfig::default(),
+    )
+}
+
+pub fn source_changed_with_config(
+    previous: &[ManifestEntry],
+    previous_config: &ExportConfig,
+    current: &[ManifestEntry],
+    current_config: &ExportConfig,
+) -> bool {
+    fn source<'a>(
+        entries: &'a [ManifestEntry],
+        previous_config: &ExportConfig,
+        current_config: &ExportConfig,
+    ) -> std::collections::BTreeMap<&'a str, &'a ManifestEntry> {
         entries
             .iter()
-            .filter(|entry| entry.kind != "file" || !is_glb(&entry.path))
+            .filter(|entry| {
+                entry.kind != "file"
+                    || ![
+                        previous_config.generated_glb_file.as_deref(),
+                        current_config.generated_glb_file.as_deref(),
+                    ]
+                    .contains(&Some(entry.path.as_str()))
+            })
             .map(|entry| (entry.path.as_str(), entry))
             .collect()
     }
-    source(previous) != source(current)
+    source(previous, previous_config, current_config)
+        != source(current, previous_config, current_config)
+        || previous_config.primary_file != current_config.primary_file
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +401,14 @@ fn ensure_artifact(
 }
 
 impl SyncReceipt {
+    pub(crate) fn config(&self) -> ExportConfig {
+        ProjectLayout {
+            blend_file: self.blend_file.clone(),
+            glb_file: self.glb_file.clone(),
+        }
+        .config()
+    }
+
     fn paths(&self) -> Vec<String> {
         self.sources
             .iter()
@@ -264,13 +427,31 @@ impl SyncReceipt {
         })
     }
 
+    /// A legacy receipt may establish output ownership even when its source has since changed.
+    fn owns_output(&self, root: &Path, ctx: &OperationContext) -> Result<bool> {
+        if self.version != RECEIPT_VERSION
+            || self.worker != worker_identity()
+            || !self.tracks_blend(root)
+            || !is_glb(&self.glb_file)
+        {
+            return Ok(false);
+        }
+        let Ok(path) = workspace_destination(root, &self.glb_file) else {
+            return Ok(false);
+        };
+        if !is_regular_file(&path) {
+            return Ok(false);
+        }
+        Ok(hash_file(&path, ctx)?.as_deref() == Some(self.artifact_hash.as_str()))
+    }
+
     pub(crate) fn validate_capture(
         &self,
         root: &Path,
         entries: &[ManifestEntry],
         ctx: &OperationContext,
     ) -> Result<()> {
-        let layout = validate_project(entries)?;
+        let layout = resolve_project(root, entries, &self.config())?;
         let output_hash = entries
             .iter()
             .find(|entry| entry.path == layout.glb_file && entry.kind == "file")
@@ -329,16 +510,27 @@ fn matches_capture(
         })
 }
 
+struct GenerationSource<'a> {
+    material: &'a Path,
+    logical_root: &'a Path,
+    entries: &'a [ManifestEntry],
+    historical: bool,
+}
+
 fn generate(
     runner: &BlenderRunner,
-    material: &Path,
-    logical_root: &Path,
-    entries: &[ManifestEntry],
-    historical: bool,
+    source: GenerationSource<'_>,
+    config: &ExportConfig,
     output: &Path,
     ctx: &OperationContext,
 ) -> Result<SyncReceipt> {
-    let layout = validate_project(entries)?;
+    let GenerationSource {
+        material,
+        logical_root,
+        entries,
+        historical,
+    } = source;
+    let layout = resolve_project(logical_root, entries, config)?;
     let config = layout.config();
     let discovery = runner.inspect_preview(material, logical_root, &config, ctx)?;
     let paths = source_paths(&logical_root.join(&layout.blend_file), &discovery);
@@ -424,6 +616,7 @@ fn backup_unversioned_glb(
     if hash_file(&backup, ctx)?.as_deref() != Some(hash) {
         atomic_copy(source, &backup, hash, ctx)?;
     }
+    library.register_glb_backup(variant_id, hash)?;
     Ok(())
 }
 
@@ -444,12 +637,7 @@ fn finish_artifact(
     )?;
     library.record_synchronized(
         variant_id,
-        &ExportConfig {
-            primary_file: Some(receipt.blend_file.clone()),
-            scene: None,
-            collection: None,
-            apply_modifiers: true,
-        },
+        &receipt.config(),
         receipt.inspection.geometry.triangles,
         changed,
     )?;
@@ -487,7 +675,6 @@ fn synchronize_once(
     ctx: &OperationContext,
 ) -> Result<SyncArtifact> {
     let variant = library.get_variant(variant_id)?;
-    let layout = validate_project(&variant.files)?;
     let workspace = dunce::simplified(Path::new(&variant.variant.workspace_path)).to_path_buf();
     if !fs::canonicalize(&workspace)?.starts_with(fs::canonicalize(library.root())?) {
         return Err(CoreError::Invalid(
@@ -495,6 +682,22 @@ fn synchronize_once(
         ));
     }
     let previous_receipt = read_receipt(library.root(), variant_id)?;
+    let mut selected_config = variant.variant.config.clone();
+    // Existing certified projects retain their managed destination across the upgrade.
+    if selected_config.generated_glb_file.is_none()
+        && let Some(receipt) = previous_receipt.as_ref()
+        && selected_config.primary_file.as_deref() == Some(&receipt.blend_file)
+        && receipt.owns_output(&workspace, ctx)?
+    {
+        selected_config.generated_glb_file = Some(receipt.glb_file.clone());
+    }
+    let asset_name = library.get_asset(&variant.variant.asset_id)?.asset.name;
+    let layout = resolve_project_named(
+        &workspace,
+        &variant.files,
+        &selected_config,
+        Some(&asset_name),
+    )?;
     if let Some(receipt) = previous_receipt.as_ref()
         && receipt.version == RECEIPT_VERSION
         && receipt.worker == worker_identity()
@@ -521,16 +724,19 @@ fn synchronize_once(
     let output = temporary.path().join("generated.glb");
     let receipt = generate(
         runner,
-        &material,
-        &workspace,
-        &captured.entries,
-        false,
+        GenerationSource {
+            material: &material,
+            logical_root: &workspace,
+            entries: &captured.entries,
+            historical: false,
+        },
+        &layout.config(),
         &output,
         ctx,
     )?;
-    // A second capture also rejects structural edits (for example an extra .blend) during conversion.
+    // Sources used by conversion must still match; independent models may coexist.
     let current = library.workspace_manifest(variant_id, ctx)?;
-    validate_project(&current)?;
+    resolve_project(&workspace, &current, &layout.config())?;
     if !matches_capture(&receipt.sources, &workspace, &current)
         || fingerprints(&receipt.paths(), &workspace, None, ctx)? != receipt.sources
     {
@@ -540,6 +746,9 @@ fn synchronize_once(
     }
     let destination = workspace_destination(&workspace, &receipt.glb_file)?;
     let previous_hash = hash_file(&destination, ctx)?;
+    if previous_hash.is_some() && selected_config.generated_glb_file.is_none() {
+        return Err(CoreError::Inconsistent("Un fichier utilisateur est apparu à la destination du GLB ; son contenu a été conservé.".into()));
+    }
     let previously_generated = previous_receipt.as_ref().is_some_and(|previous| {
         previous.version == RECEIPT_VERSION
             && previous.glb_file == layout.glb_file
@@ -593,7 +802,12 @@ pub fn import_project(
                 .into(),
         ));
     }
-    validate_project(&list_files(&source)?)?;
+    let layout = resolve_project_named(
+        &source,
+        &list_files(&source)?,
+        &ExportConfig::default(),
+        Some(name),
+    )?;
     for attempt in 0..2 {
         let result = (|| {
             let temporary = tempfile::Builder::new()
@@ -601,16 +815,35 @@ pub fn import_project(
                 .tempdir_in(library.root().join("staging"))?;
             let material = temporary.path().join("source");
             let entries = copy_source(&source, &material, temporary.path(), ctx)?;
+            if entries
+                .iter()
+                .any(|entry| entry.path.eq_ignore_ascii_case(&layout.glb_file))
+            {
+                return Err(CoreError::Inconsistent(
+                    "Un fichier utilisateur est apparu à la destination du GLB pendant l’import."
+                        .into(),
+                ));
+            }
             let logical = dunce::simplified(&source);
             let output = temporary.path().join("generated.glb");
-            let mut receipt = generate(runner, &material, logical, &entries, false, &output, ctx)?;
+            let mut receipt = generate(
+                runner,
+                GenerationSource {
+                    material: &material,
+                    logical_root: logical,
+                    entries: &entries,
+                    historical: false,
+                },
+                &layout.config(),
+                &output,
+                ctx,
+            )?;
             atomic_copy(
                 &output,
                 &material.join(&receipt.glb_file),
                 &receipt.artifact_hash,
                 ctx,
             )?;
-            let layout = validate_project(&entries)?;
             let asset = library.import_prepared(&material, name, layout.config(), ctx)?;
             let variant = &asset.variants[0];
             receipt.rebase(logical, Path::new(&variant.workspace_path));
@@ -652,8 +885,8 @@ pub fn create_variant(
     ctx: &OperationContext,
 ) -> Result<Variant> {
     let snapshot = library.get_snapshot(snapshot_id)?;
-    let layout = validate_project(&snapshot.entries)?;
     let owner = library.workspace_path(&snapshot.variant_id)?;
+    let layout = resolve_project(&owner, &snapshot.entries, &snapshot.config)?;
     let logical = dunce::simplified(&owner);
     let temporary = tempfile::Builder::new()
         .prefix("variant-")
@@ -663,10 +896,13 @@ pub fn create_variant(
     let output = temporary.path().join("generated.glb");
     let mut receipt = generate(
         runner,
-        &material,
-        logical,
-        &snapshot.entries,
-        true,
+        GenerationSource {
+            material: &material,
+            logical_root: logical,
+            entries: &snapshot.entries,
+            historical: true,
+        },
+        &layout.config(),
         &output,
         ctx,
     )?;
@@ -687,6 +923,119 @@ pub fn create_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_models_choose_a_stable_principal_and_preserve_user_glbs() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("nested")).unwrap();
+        fs::write(temporary.path().join("main.blend"), b"main").unwrap();
+        fs::write(temporary.path().join("nested/part.blend"), b"part").unwrap();
+        for path in ["main.blend", "nested/part.blend"] {
+            fs::File::options()
+                .write(true)
+                .open(temporary.path().join(path))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                .unwrap();
+        }
+        fs::write(temporary.path().join("main.glb"), b"user model").unwrap();
+        fs::write(temporary.path().join("other.glb"), b"other user model").unwrap();
+        let entries = list_files(temporary.path()).unwrap();
+        let layout = resolve_project(temporary.path(), &entries, &ExportConfig::default()).unwrap();
+        assert_eq!(layout.blend_file, "main.blend");
+        assert_ne!(layout.glb_file, "main.glb");
+        assert_ne!(layout.glb_file, "other.glb");
+        let saved = layout.config();
+        fs::write(temporary.path().join("nested/part.blend"), vec![0; 100_000]).unwrap();
+        let entries = list_files(temporary.path()).unwrap();
+        assert_eq!(
+            resolve_project(temporary.path(), &entries, &saved).unwrap(),
+            layout
+        );
+        let manual = ExportConfig {
+            primary_file: Some("nested/part.blend".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_project(temporary.path(), &entries, &manual)
+                .unwrap()
+                .blend_file,
+            "nested/part.blend"
+        );
+        assert_eq!(
+            fs::read(temporary.path().join("main.glb")).unwrap(),
+            b"user model"
+        );
+    }
+
+    #[test]
+    fn secondary_glb_edits_are_source_changes() {
+        let before = vec![
+            entry("main.blend"),
+            entry("main.glb"),
+            entry("secondary.glb"),
+        ];
+        let mut after = before.clone();
+        after[2].size += 1;
+        let config = ExportConfig {
+            primary_file: Some("main.blend".into()),
+            generated_glb_file: Some("main.glb".into()),
+            ..Default::default()
+        };
+        assert!(source_changed_with_config(
+            &before, &config, &after, &config
+        ));
+        after[2] = before[2].clone();
+        after[1].size += 1;
+        assert!(!source_changed_with_config(
+            &before, &config, &after, &config
+        ));
+    }
+
+    #[test]
+    fn principal_inference_combines_size_and_original_modification_dates() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("main.blend"), b"small").unwrap();
+        fs::write(temporary.path().join("large.blend"), vec![1; 100]).unwrap();
+        for (path, age) in [("main.blend", 10), ("large.blend", 20)] {
+            fs::File::options()
+                .write(true)
+                .open(temporary.path().join(path))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age),
+                ))
+                .unwrap();
+        }
+        let entries = list_files(temporary.path()).unwrap();
+        assert_eq!(
+            resolve_project(temporary.path(), &entries, &ExportConfig::default())
+                .unwrap()
+                .blend_file,
+            "large.blend"
+        );
+        let pinned = ExportConfig {
+            primary_file: Some("main.blend".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_project(temporary.path(), &entries, &pinned)
+                .unwrap()
+                .blend_file,
+            "main.blend"
+        );
+        fs::remove_file(temporary.path().join("main.blend")).unwrap();
+        assert_eq!(
+            resolve_project(
+                temporary.path(),
+                &list_files(temporary.path()).unwrap(),
+                &pinned
+            )
+            .unwrap()
+            .blend_file,
+            "large.blend"
+        );
+    }
     fn entry(path: &str) -> ManifestEntry {
         ManifestEntry {
             path: path.into(),
@@ -703,16 +1052,29 @@ mod tests {
         assert!(layout.config().apply_modifiers);
         assert!(layout.config().scene.is_none());
         assert!(validate_project(&[entry("only.glb")]).is_err());
-        assert!(validate_project(&[entry("a.blend"), entry("nested/b.BLEND")]).is_err());
+        assert!(validate_project(&[entry("a.blend"), entry("nested/b.BLEND")]).is_ok());
         assert!(
-            validate_project(&[entry("a.blend"), entry("a.glb"), entry("nested/b.GLB")]).is_err()
+            validate_project(&[entry("a.blend"), entry("a.glb"), entry("nested/b.GLB")]).is_ok()
         );
     }
     #[test]
     fn derived_output_is_excluded_but_all_other_saved_content_is_compared() {
         let previous = vec![entry("main.blend"), entry("old.glb")];
         let mut current = vec![entry("main.blend"), entry("new.GLB")];
-        assert!(!source_changed(&previous, &current));
+        let previous_config = ExportConfig {
+            generated_glb_file: Some("old.glb".into()),
+            ..Default::default()
+        };
+        let current_config = ExportConfig {
+            generated_glb_file: Some("new.GLB".into()),
+            ..Default::default()
+        };
+        assert!(!source_changed_with_config(
+            &previous,
+            &previous_config,
+            &current,
+            &current_config
+        ));
         current[0].hash = Some("b".repeat(64));
         assert!(source_changed(&previous, &current));
         current = previous.clone();
@@ -818,6 +1180,64 @@ mod tests {
     }
 
     #[test]
+    fn redetecting_the_same_principal_keeps_generated_ownership_after_receipt_loss() {
+        let (_temporary, library, variant_id, _receipt) = cached_project();
+        synchronize_variant(&library, &variant_id, None, &OperationContext::default()).unwrap();
+        fs::remove_file(receipt_path(library.root(), &variant_id).unwrap()).unwrap();
+        let original = library.get_variant(&variant_id).unwrap().variant.config;
+        assert_eq!(original.generated_glb_file.as_deref(), Some("main.glb"));
+        library
+            .update_config(
+                &variant_id,
+                ExportConfig {
+                    primary_file: None,
+                    generated_glb_file: None,
+                    ..original.clone()
+                },
+            )
+            .unwrap();
+        let detail = library.get_variant(&variant_id).unwrap();
+        assert_eq!(
+            detail.variant.config.generated_glb_file,
+            original.generated_glb_file
+        );
+        assert_eq!(
+            resolve_project(
+                Path::new(&detail.variant.workspace_path),
+                &detail.files,
+                &detail.variant.config
+            )
+            .unwrap()
+            .glb_file,
+            "main.glb"
+        );
+    }
+
+    #[test]
+    fn legacy_receipt_ownership_requires_its_certified_output_but_allows_a_source_edit() {
+        let (_temporary, library, variant_id, receipt) = cached_project();
+        let workspace = library.workspace_path(&variant_id).unwrap();
+        let workspace = dunce::simplified(&workspace);
+        let ctx = OperationContext::default();
+        assert!(receipt.owns_output(workspace, &ctx).unwrap());
+        fs::write(
+            workspace.join("main.blend"),
+            b"source changed since last generation",
+        )
+        .unwrap();
+        assert!(receipt.owns_output(workspace, &ctx).unwrap());
+        fs::write(workspace.join("valuable.glb"), b"unrelated user model").unwrap();
+        let mut corrupt = receipt.clone();
+        corrupt.glb_file = "valuable.glb".into();
+        assert!(!corrupt.owns_output(workspace, &ctx).unwrap());
+        corrupt.glb_file = "../outside.glb".into();
+        assert!(!corrupt.owns_output(workspace, &ctx).unwrap());
+        corrupt = receipt;
+        corrupt.version += 1;
+        assert!(!corrupt.owns_output(workspace, &ctx).unwrap());
+    }
+
+    #[test]
     fn same_size_same_timestamp_edit_invalidates_receipt_and_cannot_publish_stale_snapshot() {
         let (_temporary, library, variant_id, receipt) = cached_project();
         let variant = library.get_variant(&variant_id).unwrap().variant;
@@ -889,12 +1309,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_imports_fail_before_blender_or_publication_and_legacy_data_remains_accessible() {
+    fn additional_models_keep_certified_principal_available_and_failed_imports_do_not_publish() {
         let (_temporary, library, variant_id, _receipt) = cached_project();
         let workspace = library.workspace_path(&variant_id).unwrap();
         fs::write(workspace.join("second.BLEND"), b"second source").unwrap();
         assert!(
-            synchronize_variant(&library, &variant_id, None, &OperationContext::default()).is_err()
+            synchronize_variant(&library, &variant_id, None, &OperationContext::default())
+                .unwrap()
+                .source_changed
         );
         let runner = BlenderRunner::new("missing-blender".into());
         let source = workspace
@@ -966,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_blend_added_during_final_validation_never_returns_ready() {
+    fn an_independent_blend_added_during_validation_remains_versionable() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -984,7 +1406,11 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert!(finish_artifact(&library, &variant_id, receipt, false, &ctx).is_err());
+        assert!(
+            finish_artifact(&library, &variant_id, receipt, false, &ctx)
+                .unwrap()
+                .source_changed
+        );
         assert!(changed.load(Ordering::SeqCst));
         assert_eq!(
             fs::read(workspace.join("second.blend")).unwrap(),

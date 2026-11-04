@@ -63,6 +63,9 @@ impl OperationContext {
 #[serde(rename_all = "camelCase")]
 pub struct ExportConfig {
     pub primary_file: Option<String>,
+    /// The exact output owned by Edge Lock; other GLBs remain ordinary versioned sources.
+    #[serde(default)]
+    pub generated_glb_file: Option<String>,
     pub scene: Option<String>,
     pub collection: Option<String>,
     #[serde(default)]
@@ -232,7 +235,10 @@ pub struct ChangeSet {
 }
 impl ChangeSet {
     pub fn has_source_changes(&self) -> bool {
-        !self.added.is_empty() || !self.modified.is_empty() || !self.deleted.is_empty()
+        self.config_changed
+            || !self.added.is_empty()
+            || !self.modified.is_empty()
+            || !self.deleted.is_empty()
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

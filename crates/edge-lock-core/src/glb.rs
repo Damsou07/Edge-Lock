@@ -9,10 +9,6 @@ use std::{
     path::Path,
 };
 
-pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
-pub const MAX_TEXTURE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_IMAGE_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_EDGE_WORKING_BYTES: u64 = 64 * 1024 * 1024;
 const INDEX_READER_BYTES: usize = 8 * 1024;
 
@@ -43,7 +39,6 @@ struct View {
 }
 struct Accessor {
     count: u64,
-    element_bytes: u64,
     component: u64,
     kind: String,
 }
@@ -100,6 +95,28 @@ fn read_u32(file: &mut File) -> Result<u32> {
     file.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
+
+fn validate_image_base64(uri: &str) -> Result<()> {
+    let encoded = uri
+        .split_once(',')
+        .ok_or_else(|| invalid("GLB : URI image invalide"))?
+        .1;
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return Err(invalid("GLB : image base64 invalide"));
+    }
+    // Validate the complete URI with fixed working memory, independently of image size.
+    let mut chunks = encoded.as_bytes().chunks(16 * 1024).peekable();
+    let mut decoded = [0; 12 * 1024];
+    while let Some(chunk) = chunks.next() {
+        if chunks.peek().is_some() && chunk.contains(&b'=') {
+            return Err(invalid("GLB : image base64 invalide"));
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode_slice(chunk, &mut decoded)
+            .map_err(|_| invalid("GLB : image base64 invalide"))?;
+    }
+    Ok(())
+}
 fn view_range(view: View, offset: u64, count: u64, size: u64, stride: u64) -> Result<()> {
     if stride < size {
         return Err(invalid("GLB : stride inférieur à la taille d'un élément"));
@@ -130,13 +147,16 @@ fn read_document(path: &Path) -> Result<Document> {
     let json_length = read_u32(&mut file)? as u64;
     if read_u32(&mut file)? != 0x4e4f534a
         || json_length == 0
-        || json_length > MAX_JSON_BYTES
         || !json_length.is_multiple_of(4)
         || checked_add(20, json_length)? > bytes
     {
-        return Err(invalid("GLB : bloc JSON invalide ou supérieur à 16 Mio"));
+        return Err(invalid("GLB : bloc JSON invalide"));
     }
-    let mut json_bytes = vec![0; json_length as usize];
+    let mut json_bytes = Vec::new();
+    json_bytes
+        .try_reserve_exact(json_length as usize)
+        .map_err(|_| invalid("Mémoire insuffisante pour lire les métadonnées GLB"))?;
+    json_bytes.resize(json_length as usize, 0);
     file.read_exact(&mut json_bytes)?;
     let json: Value = serde_json::from_slice(&json_bytes)?;
     if json.pointer("/asset/version").and_then(Value::as_str) != Some("2.0") {
@@ -288,7 +308,6 @@ fn read_document(path: &Path) -> Result<Document> {
         }
         accessors.push(Accessor {
             count,
-            element_bytes,
             component,
             kind: kind.to_owned(),
         });
@@ -314,6 +333,7 @@ fn read_document(path: &Path) -> Result<Document> {
             if image.get("bufferView").is_some() {
                 return Err(invalid("GLB : image ambiguë"));
             }
+            validate_image_base64(uri)?;
         } else {
             index(&image["bufferView"], views.len(), "image.bufferView")?;
             if image.get("mimeType").and_then(Value::as_str).is_none() {
@@ -848,14 +868,21 @@ fn count_scene_edges(path: &Path, document: &Document) -> Result<Option<u64>> {
     Ok(Some(total))
 }
 
-/// Additional resource limits for the embedded viewer. Export itself has no preview size cap.
+/// Validate viewer capabilities without imposing file, geometry or decoded texture quotas.
 pub fn guard_preview(path: &Path) -> Result<GlbStats> {
-    if std::fs::metadata(path)?.len() > MAX_PREVIEW_BYTES {
-        return Err(invalid(
-            "Aperçu limité à 256 Mio ; le fichier reste exportable",
-        ));
-    }
     let document = read_document(path)?;
+    for image in array(&document.json, "images")? {
+        if let Some(mime) = image.get("mimeType")
+            && !matches!(
+                mime.as_str(),
+                Some("image/png" | "image/jpeg" | "image/webp")
+            )
+        {
+            return Err(invalid(
+                "GLB : format d’image non pris en charge par l’aperçu",
+            ));
+        }
+    }
     for extension in array(&document.json, "extensionsRequired")? {
         let name = extension
             .as_str()
@@ -873,115 +900,5 @@ pub fn guard_preview(path: &Path) -> Result<GlbStats> {
             )));
         }
     }
-    let stats = statistics(&document)?;
-    let expanded = document.accessors.iter().try_fold(0, |sum, a| {
-        checked_add(sum, checked_mul(a.count, a.element_bytes)?)
-    })?;
-    if expanded > MAX_TEXTURE_BYTES {
-        return Err(invalid("Géométrie trop volumineuse pour l'aperçu"));
-    }
-    let mut file = File::open(path)?;
-    let mut texture_bytes = 0;
-    for image in array(&document.json, "images")? {
-        let bytes = if let Some(uri) = image.get("uri").and_then(Value::as_str) {
-            let (_, encoded) = uri
-                .split_once(',')
-                .ok_or_else(|| invalid("URI image invalide"))?;
-            let header_length = encoded.len().min((MAX_IMAGE_HEADER_BYTES as usize / 3) * 4);
-            base64::engine::general_purpose::STANDARD
-                .decode(&encoded.as_bytes()[..header_length])
-                .map_err(|_| invalid("GLB : image base64 invalide"))?
-        } else {
-            let view = document.views[index(&image["bufferView"], document.views.len(), "image")?];
-            file.seek(SeekFrom::Start(checked_add(
-                document.bin_offset,
-                view.offset,
-            )?))?;
-            let mut bytes = vec![0; view.length.min(MAX_IMAGE_HEADER_BYTES) as usize];
-            file.read_exact(&mut bytes)?;
-            bytes
-        };
-        let (width, height) = image_dimensions(&bytes)?;
-        if width == 0 || height == 0 {
-            return Err(invalid("GLB : dimensions d'image nulles"));
-        }
-        texture_bytes = checked_add(texture_bytes, checked_mul(checked_mul(width, height)?, 4)?)?;
-        if texture_bytes > MAX_TEXTURE_BYTES {
-            return Err(invalid("Aperçu limité à 512 Mio de textures décompressées"));
-        }
-    }
-    Ok(stats)
-}
-
-fn image_dimensions(bytes: &[u8]) -> Result<(u64, u64)> {
-    if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
-        return Ok((
-            u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as u64,
-            u32::from_be_bytes(bytes[20..24].try_into().unwrap()) as u64,
-        ));
-    }
-    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        let read24 =
-            |i: usize| bytes[i] as u64 | (bytes[i + 1] as u64) << 8 | (bytes[i + 2] as u64) << 16;
-        if &bytes[12..16] == b"VP8X" {
-            return Ok((read24(24) + 1, read24(27) + 1));
-        }
-        if &bytes[12..16] == b"VP8L" && bytes[20] == 0x2f {
-            let bits = u32::from_le_bytes(bytes[21..25].try_into().unwrap());
-            return Ok((
-                (bits & 0x3fff) as u64 + 1,
-                ((bits >> 14) & 0x3fff) as u64 + 1,
-            ));
-        }
-        if &bytes[12..16] == b"VP8 " && &bytes[23..26] == b"\x9d\x01\x2a" {
-            return Ok((
-                (u16::from_le_bytes(bytes[26..28].try_into().unwrap()) & 0x3fff) as u64,
-                (u16::from_le_bytes(bytes[28..30].try_into().unwrap()) & 0x3fff) as u64,
-            ));
-        }
-    }
-    if bytes.starts_with(b"\xff\xd8") {
-        let mut offset = 2;
-        while offset + 4 <= bytes.len() {
-            if bytes[offset] != 0xff {
-                break;
-            }
-            while offset < bytes.len() && bytes[offset] == 0xff {
-                offset += 1;
-            }
-            if offset >= bytes.len() {
-                break;
-            }
-            let marker = bytes[offset];
-            offset += 1;
-            if marker == 0xda || marker == 0xd9 {
-                break;
-            }
-            if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
-                continue;
-            }
-            if offset + 2 > bytes.len() {
-                break;
-            }
-            let length = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
-            if length < 2 || offset + length > bytes.len() {
-                break;
-            }
-            if [
-                0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
-            ]
-            .contains(&marker)
-                && length >= 7
-            {
-                return Ok((
-                    u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().unwrap()) as u64,
-                    u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().unwrap()) as u64,
-                ));
-            }
-            offset += length;
-        }
-    }
-    Err(invalid(
-        "Aperçu : image PNG/JPEG/WebP non reconnue ou en-tête trop grand",
-    ))
+    statistics(&document)
 }

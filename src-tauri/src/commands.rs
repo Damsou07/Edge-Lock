@@ -205,6 +205,44 @@ pub async fn save_game(
     .await
 }
 #[tauri::command]
+pub async fn delete_category(id: String, state: State<'_, ManagedState>) -> AppResult<u64> {
+    let state = state.0.clone();
+    let pending = state.register_config_write()?;
+    let library = state.library()?;
+    blocking(move || {
+        let _pending = pending;
+        let _gate = lock(&state.operation_gate)?;
+        state.ensure_running()?;
+        if !Arc::ptr_eq(&library, &state.library()?) {
+            return Err(AppError::new(
+                "library_changed",
+                "La bibliothèque a changé.",
+            ));
+        }
+        Ok(library.delete_category(&id)?)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn delete_game(id: String, state: State<'_, ManagedState>) -> AppResult<u64> {
+    let state = state.0.clone();
+    let pending = state.register_config_write()?;
+    let library = state.library()?;
+    blocking(move || {
+        let _pending = pending;
+        let _gate = lock(&state.operation_gate)?;
+        state.ensure_running()?;
+        if !Arc::ptr_eq(&library, &state.library()?) {
+            return Err(AppError::new(
+                "library_changed",
+                "La bibliothèque a changé.",
+            ));
+        }
+        Ok(library.delete_game(&id)?)
+    })
+    .await
+}
+#[tauri::command]
 pub async fn update_config(
     variant_id: String,
     config: ExportConfig,
@@ -345,9 +383,13 @@ pub async fn open_blender(variant_id: String, state: State<'_, ManagedState>) ->
     let library = state.library()?;
     blocking(move || {
         let detail = library.get_variant(&variant_id)?;
-        let path = edge_lock_core::sync::validate_project(&detail.files)
-            .map(|layout| layout.blend_file)
-            .or_else(|error| detail.variant.config.primary_file.clone().ok_or(error))?;
+        let path = edge_lock_core::sync::resolve_project(
+            std::path::Path::new(&detail.variant.workspace_path),
+            &detail.files,
+            &detail.variant.config,
+        )
+        .map(|layout| layout.blend_file)
+        .or_else(|error| detail.variant.config.primary_file.clone().ok_or(error))?;
         let variant = detail.variant;
         let workspace = std::fs::canonicalize(variant.workspace_path)?;
         let primary = std::fs::canonicalize(workspace.join(path))?;
@@ -418,6 +460,8 @@ pub async fn get_asset_thumbnails(
     let state = state.0.clone();
     let library = state.library()?;
     blocking(move || {
+        // Serialize the cache read and token publication with permanent deletion.
+        let _gate = lock(&state.operation_gate)?;
         let resources = preview_resources::cached_asset_resources(&library, &asset_ids)?;
         preview_resources::register_batch(&state, &library, resources)
     })

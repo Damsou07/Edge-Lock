@@ -41,7 +41,9 @@ beforeEach(() => {
   vi.mocked(api.invalidateThumbnail).mockResolvedValue(undefined);
   run.mockImplementation(
     async (request: JobRequest) =>
-      ready("assetId" in request ? request.assetId : "unknown") as never,
+      ready(
+        "assetId" in request ? (request.assetId ?? "unknown") : "unknown",
+      ) as never,
   );
 });
 

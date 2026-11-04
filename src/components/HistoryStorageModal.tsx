@@ -89,9 +89,10 @@ export function HistoryStorageModal({
         )}
         {action === "compact" && (
           <p>
-            Les versions listées conserveront leur GLB texturé et leurs
-            métadonnées. Leurs dossiers Blender ne seront plus restaurables. Les
-            versions courantes et les backups restent protégés.
+            Les versions listées conserveront tous leurs GLB enregistrés et
+            leurs métadonnées. Leurs dossiers Blender ne seront plus
+            restaurables. Les versions courantes et les backups restent
+            protégés.
           </p>
         )}
         {action === "releaseBackup" && (

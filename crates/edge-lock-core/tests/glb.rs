@@ -249,6 +249,16 @@ fn rejects_external_images_and_buffers() {
 }
 
 #[test]
+fn preview_rejects_embedded_svg_images_without_decoding_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.glb");
+    let mut document = triangle();
+    document["images"] = json!([{"bufferView":0,"mimeType":"image/svg+xml"}]);
+    write_glb(&path, document, &[0; 36]);
+    assert!(guard_preview(&path).is_err());
+}
+
+#[test]
 fn rejects_truncation_out_of_bounds_and_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.glb");
@@ -269,7 +279,7 @@ fn rejects_truncation_out_of_bounds_and_cycles() {
 }
 
 #[test]
-fn refuses_texture_bomb_before_decoding_image() {
+fn preview_accepts_large_texture_metadata_without_decoding_image() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.glb");
     let mut binary = vec![0; 36];
@@ -290,9 +300,50 @@ fn refuses_texture_bomb_before_decoding_image() {
         "large textures remain exportable"
     );
     assert!(
-        guard_preview(&path).is_err(),
-        "preview must refuse decoded texture memory >512MiB"
+        guard_preview(&path).is_ok(),
+        "preview must not impose a decoded texture quota"
     );
+}
+
+#[test]
+fn preview_accepts_large_geometry_and_json_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.glb");
+    let mut document = triangle();
+    document["accessors"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("bufferView");
+    document["accessors"][0]["count"] = json!(48_000_000);
+    document["extras"] = json!({"notes":"x".repeat(16 * 1024 * 1024)});
+    write_glb(&path, document, &[0; 36]);
+    assert!(guard_preview(&path).is_ok());
+}
+
+#[test]
+fn preview_accepts_a_glb_file_above_256_mib_without_loading_its_buffer() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.glb");
+    let binary_length = 257 * 1024 * 1024u32;
+    let mut document = triangle();
+    document["buffers"][0]["byteLength"] = json!(binary_length);
+    write_glb(&path, document, &[0; 36]);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let original_length = file.metadata().unwrap().len();
+    let total_length = original_length - 36 + u64::from(binary_length);
+    file.set_len(total_length).unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    file.write_all(&(total_length as u32).to_le_bytes())
+        .unwrap();
+    file.seek(SeekFrom::Start(original_length - 44)).unwrap();
+    file.write_all(&binary_length.to_le_bytes()).unwrap();
+    drop(file);
+    assert!(guard_preview(&path).is_ok());
 }
 
 #[test]

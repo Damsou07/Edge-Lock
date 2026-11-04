@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
@@ -108,4 +108,30 @@ it("affiche normalement la géométrie et recharge le modèle quand l’URL chan
   await screen.findByText(/Glisser pour tourner/);
   expect(loadPreviewModel).toHaveBeenCalledTimes(2);
   expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+});
+
+it("conserve le diagnostic de perte du contexte même si le chargement finit ensuite", async () => {
+  let complete!: (model: GLTF) => void;
+  vi.mocked(loadPreviewModel).mockReturnValue(
+    new Promise((resolve) => {
+      complete = resolve;
+    }),
+  );
+  const rendered = render(
+    <ModelViewer url="large.glb" label="DOSSIER DE TRAVAIL" />,
+  );
+  const canvas = screen.getByLabelText("Aperçu 3D interactif");
+  fireEvent(canvas, new Event("webglcontextlost", { cancelable: true }));
+  expect(
+    await screen.findByText(/Le contexte graphique a été perdu/),
+  ).toBeInTheDocument();
+  const scene = new THREE.Group();
+  await act(async () => {
+    complete({ scene, scenes: [scene], animations: [] } as unknown as GLTF);
+  });
+  expect(
+    screen.getByText(/Le contexte graphique a été perdu/),
+  ).toBeInTheDocument();
+  expect(releaseModel).toHaveBeenCalledWith(scene, scene);
+  rendered.unmount();
 });

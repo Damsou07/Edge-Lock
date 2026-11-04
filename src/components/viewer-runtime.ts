@@ -1,11 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-import {
-  inspectGlb,
-  isEmbeddedImageUri,
-  MAX_PREVIEW_BYTES,
-} from "./viewer-utils";
+import { inspectGlb, isEmbeddedImageUri } from "./viewer-utils";
 
 export function createPreviewRenderer({
   pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5),
@@ -67,11 +63,20 @@ export function createPreviewStage(renderer: THREE.WebGLRenderer) {
 export async function loadPreviewModel(url: string, signal?: AbortSignal) {
   signal?.throwIfAborted();
   const response = await fetch(url, { signal });
+  if (response.status === 507)
+    throw new Error("Mémoire insuffisante pour charger cet aperçu.");
   if (!response.ok)
     throw new Error("Impossible de charger le fichier d’aperçu.");
-  if (Number(response.headers.get("content-length")) > MAX_PREVIEW_BYTES)
-    throw new Error("Cet aperçu dépasse 256 Mo. Ouvrez l’asset dans Blender.");
-  const bytes = await response.arrayBuffer();
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await response.arrayBuffer();
+  } catch (reason) {
+    if (reason instanceof RangeError)
+      throw new Error("Mémoire insuffisante pour charger cet aperçu.", {
+        cause: reason,
+      });
+    throw reason;
+  }
   inspectGlb(bytes);
   signal?.throwIfAborted();
   const manager = new THREE.LoadingManager();

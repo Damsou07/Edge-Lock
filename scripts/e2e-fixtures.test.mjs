@@ -9,7 +9,87 @@ import {
   prepareBlendFixture,
   saveMirrorFixture,
   runFixtureBlender,
+  prepareTextureStressFixture,
 } from "./e2e-fixtures.mjs";
+
+test("texture stress fixture contains 33 visible independent PNG textures exceeding 512 MiB decoded", async () => {
+  await mkdir(resolve(".test-data"), { recursive: true });
+  const root = await mkdtemp(resolve(".test-data", "texture-fixture-"));
+  const path = join(root, "stress.glb");
+  const metadata = await prepareTextureStressFixture(path);
+  const glb = await readFile(path);
+  assert.equal(glb.subarray(0, 4).toString(), "glTF");
+  assert.equal(glb.readUInt32LE(4), 2);
+  assert.equal(glb.readUInt32LE(8), glb.length);
+  const jsonLength = glb.readUInt32LE(12);
+  const document = JSON.parse(glb.subarray(20, 20 + jsonLength).toString());
+  const binaryOffset = 28 + jsonLength;
+  assert.equal(
+    glb.readUInt32LE(20 + jsonLength),
+    document.buffers[0].byteLength,
+  );
+  assert.equal(binaryOffset + document.buffers[0].byteLength, glb.length);
+  assert.equal(document.images.length, 33);
+  assert.equal(document.scenes[0].nodes.length, 33);
+  const usedImages = new Set();
+  const pixelSignatures = new Set();
+  let decodedBytes = 0;
+  for (const nodeIndex of document.scenes[0].nodes) {
+    const node = document.nodes[nodeIndex];
+    const primitive = document.meshes[node.mesh].primitives[0];
+    assert.equal(document.accessors[primitive.attributes.POSITION].count, 3);
+    assert.equal(document.accessors[primitive.attributes.TEXCOORD_0].count, 3);
+    const material =
+      document.materials[primitive.material].pbrMetallicRoughness;
+    const texture = document.textures[material.baseColorTexture.index];
+    assert.equal(document.samplers[texture.sampler].minFilter, 9728);
+    usedImages.add(texture.source);
+  }
+  for (const image of document.images) {
+    assert.equal(image.uri, undefined);
+    assert.equal(image.mimeType, "image/png");
+    const view = document.bufferViews[image.bufferView];
+    assert.equal(view.byteOffset % 4, 0);
+    assert.ok(
+      view.byteOffset + view.byteLength <= document.buffers[0].byteLength,
+    );
+    const png = glb.subarray(
+      binaryOffset + view.byteOffset,
+      binaryOffset + view.byteOffset + view.byteLength,
+    );
+    assert.deepEqual(
+      [...png.subarray(0, 8)],
+      [137, 80, 78, 71, 13, 10, 26, 10],
+    );
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    assert.equal(width, 2048);
+    assert.equal(height, 2048);
+    assert.equal(png[24], 8);
+    assert.equal(png[25], 6);
+    decodedBytes += width * height * 4;
+    let position = 8;
+    const compressed = [];
+    while (position < png.length) {
+      const length = png.readUInt32BE(position);
+      assert.ok(position + length + 12 <= png.length);
+      if (png.subarray(position + 4, position + 8).toString() === "IDAT")
+        compressed.push(png.subarray(position + 8, position + 8 + length));
+      position += length + 12;
+    }
+    assert.equal(position, png.length);
+    const pixels = inflateSync(Buffer.concat(compressed));
+    assert.equal(pixels.length, height * (1 + width * 4));
+    assert.equal(pixels[0], 0);
+    assert.equal(pixels[4], 255);
+    pixelSignatures.add(pixels.subarray(1, 5).toString("hex"));
+  }
+  assert.equal(usedImages.size, 33);
+  assert.equal(pixelSignatures.size, 33);
+  assert.ok(decodedBytes > 512 * 1024 * 1024);
+  assert.equal(metadata.decodedTextureBytes, decodedBytes);
+  assert.equal(metadata.path, path);
+});
 
 test("studio regression fixture keeps two textured volumes and its oversized blue floor", () => {
   const glb = texturedStudioScene();

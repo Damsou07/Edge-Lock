@@ -74,20 +74,26 @@ struct CacheRecord {
 #[serde(rename_all = "camelCase")]
 struct PreviewPreference {
     version: u32,
+    #[serde(default)]
+    variant_id: Option<String>,
+    #[serde(default)]
+    snapshot_id: Option<String>,
     config: ExportConfig,
     source_file: String,
 }
 
-fn preference_path(cache: &Path, variant_id: &str) -> PathBuf {
-    cache.join(format!(
-        "choice-{}.json",
-        blake3::hash(variant_id.as_bytes()).to_hex()
-    ))
+fn preference_path(cache: &Path, variant_id: &str, snapshot_id: Option<&str>) -> PathBuf {
+    let variant = blake3::hash(variant_id.as_bytes()).to_hex();
+    let context = snapshot_id
+        .map(|snapshot| format!("-{}", blake3::hash(snapshot.as_bytes()).to_hex()))
+        .unwrap_or_default();
+    cache.join(format!("choice-{variant}{context}.json"))
 }
 
 fn remembered_choice(
     root: &Path,
     variant_id: &str,
+    snapshot_id: Option<&str>,
     config: &ExportConfig,
     entries: &[ManifestEntry],
 ) -> Option<String> {
@@ -95,15 +101,20 @@ fn remembered_choice(
     ensure_real_directory(&cache).ok()?;
     let cache = cache.join("previews");
     ensure_real_directory(&cache).ok()?;
-    let path = preference_path(&cache, variant_id);
+    let path = preference_path(&cache, variant_id, snapshot_id);
     let meta = fs::symlink_metadata(&path).ok()?;
     if !meta.is_file() || is_link(&meta) || meta.len() > 4096 {
         return None;
     }
     let choice: PreviewPreference = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     (choice.version == 1
+        && choice
+            .variant_id
+            .as_deref()
+            .is_none_or(|owner| owner == variant_id)
+        && choice.snapshot_id.as_deref() == snapshot_id
         && choice.config == *config
-        && extension(&choice.source_file, "glb")
+        && (extension(&choice.source_file, "glb") || extension(&choice.source_file, "blend"))
         && safe_relative(&choice.source_file).is_ok()
         && entries
             .iter()
@@ -130,12 +141,23 @@ fn choose_glb(
     files.sort();
     if let Some(selected) = selected {
         safe_relative(selected)?;
-        if !files.iter().any(|p| p == selected) {
+        if !(extension(selected, "glb") || extension(selected, "blend"))
+            || !entries
+                .iter()
+                .any(|entry| entry.kind == "file" && entry.path == selected)
+        {
             return Err(CoreError::Invalid(
-                "Le GLB choisi doit appartenir au dossier de l’asset.".into(),
+                "Le fichier .blend ou .glb choisi doit appartenir au dossier de l’asset.".into(),
             ));
         }
         return Ok(vec![selected.into()]);
+    }
+    if let Some(generated) = config
+        .generated_glb_file
+        .as_ref()
+        .filter(|path| files.contains(path))
+    {
+        return Ok(vec![generated.clone()]);
     }
     if let Some(primary) = config.primary_file.as_ref() {
         safe_relative(primary)?;
@@ -474,11 +496,18 @@ pub fn prepare_preview(
         )
     };
     let logical_root = dunce::simplified(&logical_root).to_path_buf();
-    let remembered = if request.snapshot_id.is_none() && request.preview_file.is_none() {
-        remembered_choice(library.root(), request.variant_id, &config, &entries)
+    let remembered = if request.preview_file.is_none() {
+        remembered_choice(
+            library.root(),
+            request.variant_id,
+            request.snapshot_id,
+            &config,
+            &entries,
+        )
     } else {
         None
     };
+    let preference_config = config.clone();
     let candidates = choose_glb(
         &entries,
         &config,
@@ -487,11 +516,21 @@ pub fn prepare_preview(
     if candidates.len() > 1 {
         return Ok(PreviewOutcome::Choose(candidates));
     }
-    let kind = if candidates.is_empty() {
+    let kind = if candidates
+        .first()
+        .is_none_or(|file| extension(file, "blend"))
+    {
         PreviewKind::GeneratedGlb
     } else {
         PreviewKind::AssetGlb
     };
+    if let Some(selected) = candidates.first().filter(|file| extension(file, "blend")) {
+        if config.primary_file.as_ref() != Some(selected) {
+            config.scene = None;
+            config.collection = None;
+        }
+        config.primary_file = Some(selected.clone());
+    }
     if kind == PreviewKind::GeneratedGlb
         && !config.primary_file.as_ref().is_some_and(|primary| {
             extension(primary, "blend")
@@ -500,18 +539,8 @@ pub fn prepare_preview(
                     .any(|e| e.kind == "file" && &e.path == primary)
         })
     {
-        let blends: Vec<_> = entries
-            .iter()
-            .filter(|e| e.kind == "file" && extension(&e.path, "blend"))
-            .collect();
-        config.primary_file = match blends.as_slice() {
-            [blend] => Some(blend.path.clone()),
-            _ => {
-                return Err(CoreError::Invalid(
-                    "Choisissez le fichier principal .blend pour générer cet aperçu.".into(),
-                ));
-            }
-        };
+        config.primary_file =
+            Some(crate::sync::resolve_project(&logical_root, &entries, &config)?.blend_file);
     }
     let source_file = candidates
         .first()
@@ -523,8 +552,8 @@ pub fn prepare_preview(
             )
         })?;
     safe_relative(&source_file)?;
-    let updates_geometry =
-        kind == PreviewKind::GeneratedGlb || config.primary_file.as_deref() == Some(&source_file);
+    let updates_geometry = preference_config.primary_file.as_deref() == Some(&source_file)
+        || (kind == PreviewKind::GeneratedGlb && preference_config.primary_file.is_none());
     let primary = logical_root.join(&source_file);
     let converter = if kind == PreviewKind::GeneratedGlb {
         converter_identity(request.blender_path)
@@ -552,16 +581,15 @@ pub fn prepare_preview(
     let cache = managed_cache(library.root())?;
     cleanup_temporary(library.root())?;
     let remember_choice = || {
-        if request.snapshot_id.is_none()
-            && request.preview_file.is_some()
-            && kind == PreviewKind::AssetGlb
-        {
+        if request.preview_file.is_some() {
             // This is disposable UI preference data; failure must not hide a valid preview.
             let _ = atomic_json(
-                &preference_path(&cache, request.variant_id),
+                &preference_path(&cache, request.variant_id, request.snapshot_id),
                 &PreviewPreference {
                     version: 1,
-                    config: config.clone(),
+                    variant_id: Some(request.variant_id.into()),
+                    snapshot_id: request.snapshot_id.map(str::to_string),
+                    config: preference_config.clone(),
                     source_file: source_file.clone(),
                 },
                 &cache,

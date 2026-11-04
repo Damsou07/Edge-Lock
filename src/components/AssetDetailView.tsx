@@ -20,6 +20,7 @@ import type {
   VariantDetail,
 } from "../contracts";
 import { defaultExportConfig } from "../contracts";
+import { ArchiveDeletionModal } from "./ArchiveDeletionModal";
 import { useWorkspaceStatus } from "../lib/useWorkspaceStatus";
 import {
   errorMessage,
@@ -147,6 +148,7 @@ export function AssetDetailView({
   onBack,
   onChanged,
   onError,
+  onDeleteRequested,
   runJob,
 }: {
   id: string;
@@ -155,6 +157,7 @@ export function AssetDetailView({
   onBack: () => void;
   onChanged: () => void;
   onError: (message: string) => void;
+  onDeleteRequested?: () => void;
   runJob: RunJob;
 }) {
   const [detail, setDetail] = useState<AssetDetail | null>(null);
@@ -171,10 +174,15 @@ export function AssetDetailView({
   const [comparedKey, setComparedKey] = useState("");
   const [changesBusy, setChangesBusy] = useState(false);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const displayedPreview = useRef<PreviewResult | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [previewCandidates, setPreviewCandidates] = useState<string[]>([]);
   const [previewFile, setPreviewFile] = useState("");
+  const previewChoice = useRef("");
+  const previewChoices = useRef(new Map<string, string>());
+  const [exportFile, setExportFile] = useState("");
+  const [configBusy, setConfigBusy] = useState(false);
   const [localRefresh, setLocalRefresh] = useState(0);
   const [tab, setTab] = useState<"files" | "history" | "changes">("files");
   const [modal, setModal] = useState<
@@ -188,11 +196,14 @@ export function AssetDetailView({
     snapshotId?: string;
   } | null>(null);
   const [restoreOpen, setRestoreOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleted, setDeleted] = useState(false);
   const selection = [id, variantId, snapshotId ?? "current"].join(":");
   const currentSelection = useRef(selection);
   currentSelection.current = selection;
   const alive = useRef(true);
   const previewRequest = useRef(0);
+  const previewAbort = useRef<AbortController | null>(null);
   const changesRequest = useRef(0);
   const autoPreviewAttempt = useRef("");
   const workspace = useWorkspaceStatus(variantId);
@@ -215,6 +226,7 @@ export function AssetDetailView({
     return () => {
       alive.current = false;
       previewRequest.current += 1;
+      previewAbort.current?.abort();
       changesRequest.current += 1;
     };
   }, []);
@@ -225,6 +237,7 @@ export function AssetDetailView({
     };
   }, [preview?.url]);
   useEffect(() => {
+    if (deleted) return;
     let active = true;
     void api
       .getAsset(id)
@@ -244,9 +257,9 @@ export function AssetDetailView({
     return () => {
       active = false;
     };
-  }, [id, generation, localRefresh, onError]);
+  }, [id, generation, localRefresh, onError, deleted]);
   useEffect(() => {
-    if (!variantId) return;
+    if (!variantId || deleted) return;
     let active = true;
     void api
       .getVariant(variantId)
@@ -259,9 +272,9 @@ export function AssetDetailView({
     return () => {
       active = false;
     };
-  }, [variantId, generation, localRefresh, settledRevision, onError]);
+  }, [variantId, generation, localRefresh, settledRevision, onError, deleted]);
   useEffect(() => {
-    if (!variantId) return;
+    if (!variantId || deleted) return;
     let active = true;
     setHistoryBusy(true);
     void api
@@ -281,7 +294,7 @@ export function AssetDetailView({
     return () => {
       active = false;
     };
-  }, [variantId, generation, localRefresh, onError]);
+  }, [variantId, generation, localRefresh, onError, deleted]);
   useEffect(() => {
     setSnapshotDetail(null);
     if (!snapshotId) return;
@@ -300,12 +313,17 @@ export function AssetDetailView({
   }, [snapshotId, onError]);
   useEffect(() => {
     previewRequest.current += 1;
+    previewAbort.current?.abort();
     autoPreviewAttempt.current = "";
     setPreview(null);
+    displayedPreview.current = null;
     setPreviewBusy(false);
     setPreviewError("");
     setPreviewCandidates([]);
-    setPreviewFile("");
+    const remembered = previewChoices.current.get(selection) ?? "";
+    setPreviewFile(remembered);
+    previewChoice.current = remembered;
+    setExportFile("");
   }, [selection]);
   useEffect(() => {
     if (!variantId) return;
@@ -354,6 +372,18 @@ export function AssetDetailView({
     selectedSnapshot?.config ??
     variantDetail?.variant.config ??
     defaultExportConfig;
+  const modelFiles = files
+    .filter((file) => file.kind === "file" && /\.(blend|glb)$/i.test(file.path))
+    .map((file) => file.path)
+    .sort();
+  const blendFiles = modelFiles.filter((file) => /\.blend$/i.test(file));
+  const sourceChoices = [
+    ...new Set([
+      ...modelFiles,
+      ...previewCandidates,
+      ...(preview?.sourceFile ? [preview.sourceFile] : []),
+    ]),
+  ];
   const pendingCount = changes
     ? changes.added.length +
       changes.modified.length +
@@ -390,6 +420,9 @@ export function AssetDetailView({
         ? null
         : currentWorkspaceStatus.current?.artifactKey;
       const request = ++previewRequest.current;
+      previewAbort.current?.abort();
+      const controller = new AbortController();
+      previewAbort.current = controller;
       const isCurrent = () =>
         alive.current &&
         currentSelection.current === target &&
@@ -399,15 +432,35 @@ export function AssetDetailView({
       setPreviewBusy(true);
       setPreviewError("");
       setPreviewFile(selectedFile);
+      previewChoice.current = selectedFile;
+      if (selectedFile) previewChoices.current.set(target, selectedFile);
       try {
-        const result = await runJob<PreviewResult>({
-          kind: "preview",
-          variantId,
-          snapshotId,
-          ...(snapshotId && selectedFile ? { previewFile: selectedFile } : {}),
-        });
+        const result = await runJob<PreviewResult>(
+          {
+            kind: "preview",
+            variantId,
+            snapshotId,
+            ...(selectedFile ? { previewFile: selectedFile } : {}),
+          },
+          { signal: controller.signal },
+        );
         if (isCurrent()) {
-          setPreview(result);
+          const previous = displayedPreview.current;
+          if (
+            result.artifactKey &&
+            result.artifactKey === previous?.artifactKey
+          ) {
+            if (result.url !== previous.url) releasePreview(result.url);
+            const next = { ...result, url: previous.url };
+            displayedPreview.current = next;
+            setPreview(next);
+          } else {
+            displayedPreview.current = result;
+            setPreview(result);
+          }
+          if (!selectedFile) {
+            setPreviewFile(result.sourceFile);
+          }
           setPreviewCandidates([]);
         } else releasePreview(result.url);
       } catch (reason) {
@@ -415,7 +468,6 @@ export function AssetDetailView({
         const error = reason as AppError | null;
         const candidates = error?.details?.candidates;
         if (
-          snapshotId &&
           error?.code === "preview_ambiguous" &&
           Array.isArray(candidates) &&
           candidates.length > 0 &&
@@ -438,7 +490,7 @@ export function AssetDetailView({
   const autoPreviewKey = snapshotId
     ? selection
     : status?.state === "ready" && status.artifactKey
-      ? [selection, status.artifactKey].join(":")
+      ? [selection, status.artifactKey, settledRevision].join(":")
       : "";
   useEffect(() => {
     if (
@@ -448,7 +500,7 @@ export function AssetDetailView({
     )
       return;
     autoPreviewAttempt.current = autoPreviewKey;
-    void generatePreview();
+    void generatePreview(previewChoice.current);
   }, [variantDetail, autoPreviewKey, generatePreview]);
   const refreshChanges = async () => {
     setLocalRefresh((value) => value + 1);
@@ -461,6 +513,7 @@ export function AssetDetailView({
         kind: "export",
         variantId,
         snapshotId,
+        ...(exportFile ? { sourceFile: exportFile } : {}),
         destination,
         overwrite,
       });
@@ -481,6 +534,25 @@ export function AssetDetailView({
       if (destination) await exportTo(destination, false);
     } catch (reason) {
       showFailure(reason);
+    }
+  };
+  const choosePrimary = async (primaryFile: string | null) => {
+    const target = selection;
+    setConfigBusy(true);
+    try {
+      await api.updateConfig(variantId, {
+        ...activeConfig,
+        primaryFile,
+        generatedGlbFile: null,
+      });
+      await workspace.retry();
+      if (currentSelection.current !== target) return;
+      setLocalRefresh((value) => value + 1);
+      onChanged();
+    } catch (reason) {
+      showFailure(reason);
+    } finally {
+      if (alive.current) setConfigBusy(false);
     }
   };
   const copyPath = async () => {
@@ -563,6 +635,18 @@ export function AssetDetailView({
           </div>
         </div>
         <div className="heading-actions">
+          {asset.archived && (
+            <button
+              className="button danger"
+              onClick={() => {
+                if (onDeleteRequested) onDeleteRequested();
+                else setDeleteOpen(true);
+              }}
+            >
+              <Icon name="trash" />
+              Supprimer définitivement
+            </button>
+          )}
           <button
             className="button secondary"
             onClick={() => setModal("metadata")}
@@ -575,7 +659,7 @@ export function AssetDetailView({
             disabled={
               !variant ||
               exportBusy ||
-              (!snapshotId && status?.state !== "ready")
+              (!snapshotId && !exportFile && status?.state !== "ready")
             }
             onClick={() => void exportGlb()}
           >
@@ -729,40 +813,25 @@ export function AssetDetailView({
               </div>
             )}
           </div>
-          {previewCandidates.length > 0 && (
-            <form
-              className="preview-source-choice"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void generatePreview(previewFile);
-              }}
-            >
+          {sourceChoices.length > 0 && (
+            <div className="preview-source-choice">
               <label>
-                GLB de prévisualisation
+                Source de l’aperçu
                 <select
                   value={previewFile}
-                  disabled={previewBusy}
-                  onChange={(event) => setPreviewFile(event.target.value)}
+                  onChange={(event) => void generatePreview(event.target.value)}
                 >
-                  <option value="">Choisir un fichier GLB</option>
-                  {previewCandidates.map((candidate) => (
+                  <option value="" disabled>
+                    Choisir une source
+                  </option>
+                  {sourceChoices.map((candidate) => (
                     <option key={candidate} value={candidate}>
                       {candidate}
                     </option>
                   ))}
                 </select>
               </label>
-              <button
-                className="button secondary small-button"
-                disabled={
-                  !previewFile ||
-                  previewBusy ||
-                  (!snapshotId && status?.state !== "ready")
-                }
-              >
-                Utiliser ce GLB
-              </button>
-            </form>
+            </div>
           )}
           {previewError && (
             <div className="inline-error preview-notice" role="alert">
@@ -891,6 +960,49 @@ export function AssetDetailView({
             </button>
           </div>
           <div className="panel-divider" />
+          <div className="config-form">
+            <label>
+              Fichier principal
+              <select
+                value={activeConfig.primaryFile ?? ""}
+                disabled={!!snapshotId || configBusy}
+                onChange={(event) =>
+                  void choosePrimary(event.target.value || null)
+                }
+              >
+                <option value="">Détection automatique</option>
+                {blendFiles.map((file) => (
+                  <option key={file} value={file}>
+                    {file}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {!snapshotId && (
+              <button
+                className="text-button"
+                disabled={configBusy}
+                onClick={() => void choosePrimary(null)}
+              >
+                Re-détecter automatiquement
+              </button>
+            )}
+            <label>
+              Source de l’export
+              <select
+                value={exportFile}
+                disabled={exportBusy}
+                onChange={(event) => setExportFile(event.target.value)}
+              >
+                <option value="">GLB principal</option>
+                {modelFiles.map((file) => (
+                  <option key={file} value={file}>
+                    {file}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           {!snapshotId && syncBusy && (
             <p className="field-help" role="status">
               {status?.state === "syncing"
@@ -1203,6 +1315,20 @@ export function AssetDetailView({
           taxonomy={taxonomy}
           onClose={() => setModal(null)}
           onSaved={onChanged}
+        />
+      )}
+      {deleteOpen && (
+        <ArchiveDeletionModal
+          assetId={id}
+          runJob={runJob}
+          onClose={() => {
+            setDeleteOpen(false);
+            if (deleted) onBack();
+          }}
+          onDeleted={() => {
+            setDeleted(true);
+            onChanged();
+          }}
         />
       )}
       {storageAction && variant && (

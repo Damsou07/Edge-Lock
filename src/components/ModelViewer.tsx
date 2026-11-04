@@ -75,9 +75,10 @@ export default function ModelViewer({
     };
     const contextLost = (event: Event) => {
       event.preventDefault();
+      abort.abort();
       fail(
         new Error(
-          "Le contexte graphique a été perdu. Fermez puis rouvrez l’aperçu.",
+          "Le contexte graphique a été perdu. Actualisez l’aperçu ou choisissez un autre fichier.",
         ),
       );
     };
@@ -112,7 +113,7 @@ export default function ModelViewer({
       resize.observe(container);
       void (async () => {
         const model = await loadPreviewModel(url, abort.signal);
-        if (disposed) {
+        if (disposed || abort.signal.aborted) {
           releaseModel(model.scene, ...model.scenes);
           return;
         }

@@ -24,14 +24,17 @@ pub struct ThumbnailSource {
 pub struct PreviewResource {
     pub path: PathBuf,
     pub thumbnail: Option<ThumbnailSource>,
+    owner_variant_id: Option<String>,
     is_thumbnail: bool,
 }
 
 impl PreviewResource {
     pub fn glb(path: PathBuf, thumbnail: Option<ThumbnailSource>) -> Self {
+        let owner_variant_id = thumbnail.as_ref().map(|source| source.variant_id.clone());
         Self {
             path,
             thumbnail,
+            owner_variant_id,
             is_thumbnail: false,
         }
     }
@@ -39,6 +42,7 @@ impl PreviewResource {
     pub fn png(path: PathBuf, thumbnail: ThumbnailSource) -> Self {
         Self {
             path,
+            owner_variant_id: Some(thumbnail.variant_id.clone()),
             thumbnail: Some(thumbnail),
             is_thumbnail: true,
         }
@@ -53,12 +57,15 @@ impl PreviewResource {
     }
 
     pub fn read(&self) -> AppResult<Vec<u8>> {
-        let limit = if self.is_thumbnail {
-            MAX_THUMBNAIL_BYTES as u64
-        } else {
-            edge_lock_core::glb::MAX_PREVIEW_BYTES
-        };
-        read_bounded(&self.path, limit)
+        read_resource(
+            &self.path,
+            self.is_thumbnail.then_some(MAX_THUMBNAIL_BYTES as u64),
+        )
+    }
+
+    pub fn with_owner(mut self, variant_id: &str) -> Self {
+        self.owner_variant_id = Some(variant_id.into());
+        self
     }
 
     pub fn is_thumbnail(&self) -> bool {
@@ -110,6 +117,14 @@ impl PreviewResources {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+    pub fn revoke_variants(&mut self, variant_ids: &[String]) {
+        self.entries.retain(|_, resource| {
+            resource
+                .owner_variant_id
+                .as_ref()
+                .is_none_or(|owner| !variant_ids.contains(owner))
+        });
     }
     pub fn paths(&self) -> Vec<PathBuf> {
         self.entries
@@ -269,16 +284,27 @@ fn cache_directory(root: &Path, create: bool) -> AppResult<Option<PathBuf>> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> AppResult<Vec<u8>> {
+    read_resource(path, Some(limit))
+}
+
+fn read_resource(path: &Path, limit: Option<u64>) -> AppResult<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() || is_link(&meta) || meta.len() > limit {
+    if !meta.is_file() || is_link(&meta) || limit.is_some_and(|limit| meta.len() > limit) {
         return Err(invalid("Ressource d’aperçu invalide ou trop volumineuse."));
     }
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    fs::File::open(path)?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(invalid("Ressource d’aperçu trop volumineuse."));
+    let capacity = usize::try_from(meta.len())
+        .map_err(|_| AppError::new("memory", "Mémoire insuffisante pour charger cet aperçu."))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| AppError::new("memory", "Mémoire insuffisante pour charger cet aperçu."))?;
+    bytes.resize(capacity, 0);
+    let mut file = fs::File::open(path)?;
+    file.read_exact(&mut bytes)?;
+    if file.read(&mut [0; 1])? != 0 {
+        return Err(invalid(
+            "La ressource d’aperçu a changé pendant sa lecture.",
+        ));
     }
     Ok(bytes)
 }
@@ -455,6 +481,20 @@ pub fn remove_thumbnail(root: &Path, source: &ThumbnailSource) -> AppResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_an_asset_revokes_only_its_owned_resources() {
+        let mut resources = PreviewResources::default();
+        let deleted = resources
+            .register(PreviewResource::glb("shared.glb".into(), None).with_owner("deleted"))
+            .unwrap();
+        let retained = resources
+            .register(PreviewResource::glb("shared.glb".into(), None).with_owner("retained"))
+            .unwrap();
+        resources.revoke_variants(&["deleted".into()]);
+        assert!(resources.get(&deleted.resource_token).is_none());
+        assert!(resources.get(&retained.resource_token).is_some());
+    }
 
     fn png() -> Vec<u8> {
         let mut output = Vec::new();

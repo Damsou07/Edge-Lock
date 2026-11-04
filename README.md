@@ -4,7 +4,7 @@ Edge Lock est une application desktop Windows pour centraliser des dossiers d’
 
 ## Installation Windows
 
-L’installateur **0.2.0 x64** est produit dans `target/release/bundle/nsis/Edge Lock_0.2.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque reste séparée de l’application. WebView2 est requis. Blender est nécessaire pour importer, créer et synchroniser les projets ; un aperçu déjà synchronisé peut être relu sans lancer Blender.
+L’installateur **0.3.0 x64** est produit dans `target/release/bundle/nsis/Edge Lock_0.3.0_x64-setup.exe`. Il installe Edge Lock pour l’utilisateur courant ; la bibliothèque reste séparée de l’application. WebView2 est requis. Blender est nécessaire pour importer, créer et synchroniser les projets ; un aperçu déjà synchronisé peut être relu sans lancer Blender.
 
 Pour générer un nouvel installateur à partir des fichiers locaux actuels, y compris les modifications non commitées, exécuter depuis PowerShell à la racine du projet :
 
@@ -16,11 +16,13 @@ Le script nécessite les prérequis de développement ci-dessous et les dépenda
 
 Les contrôles réellement exécutés et leurs limites sont détaillés dans [le bilan de validation](docs/validation.md). L’installation sur le poste personnel ne fait pas partie de ces contrôles.
 
+La mise à jour 0.3.0 migre le catalogue vers le schéma 4 après sauvegarde SQLite préalable, sans réécrire les versions ni leurs fichiers. Les anciennes applications refusent ce schéma. Pour revenir à une version antérieure, restaurer une sauvegarde complète de la bibliothèque dans un autre dossier ; la seule sauvegarde du catalogue ne contient pas les fichiers des assets.
+
 ## Utilisation
 
 1. Choisir un dossier vide pour créer une bibliothèque, ou ouvrir une bibliothèque Edge Lock existante. Utiliser un disque local ; une seule instance peut ouvrir une même bibliothèque.
 2. Dans les réglages, sélectionner `blender.exe`.
-3. **Importer un dossier** accepte exactement un `.blend` et au plus un `.glb`, sous-dossiers compris. Utiliser le sélecteur ou déposer un dossier, puis confirmer l’import. Edge Lock copie les fichiers, génère le GLB avec les modificateurs et publie la première version après réussite. Un GLB fourni est régénéré dans la copie ; le dossier d’origine reste intact. Les imports GLB seuls ne sont plus acceptés.
+3. **Importer un dossier** accepte plusieurs `.blend` et `.glb`, sous-dossiers compris, avec au moins un `.blend`. Utiliser le sélecteur ou déposer un dossier, puis confirmer l’import. Edge Lock copie les fichiers, détecte le principal, génère son GLB avec les modificateurs et publie la première version après réussite. Les GLB utilisateur et le dossier d’origine restent intacts.
 4. **Nouveau projet** crée `main.blend`, son GLB et des dossiers pour textures, références, rapports et captures. Une scène vide affiche un état adapté.
 5. Ouvrir le dossier ou le fichier Blender depuis la fiche. Enregistrer dans Blender : le GLB et l’aperçu se mettent à jour automatiquement. **Créer une version** devient disponible après détection d’un changement source et synchronisation réussie.
 6. Choisir une ancienne version pour l’inspecter ou exporter son GLB enregistré. **Créer une variante** reste disponible pour les versions complètes. Chaque variante possède son propre dossier stable.
@@ -30,19 +32,23 @@ Les contrôles réellement exécutés et leurs limites sont détaillés dans [le
 
 Les catégories peuvent contenir des sous-catégories. Un asset accepte plusieurs tags et plusieurs projets de jeu. Recherche, filtres, tri, archivage et historique paginé permettent de parcourir la bibliothèque. L’archivage conserve les fichiers et les versions.
 
-**Aide et mode d’emploi**, en bas de la barre latérale, reste disponible même sans bibliothèque ouverte. Le guide explique le parcours complet et rappelle en tête la règle stricte : **exactement un `.blend` et un `.glb` par workspace synchronisé de variante**. Lors d’un import ou d’une reprise après suppression du dérivé, le GLB peut manquer avant sa génération ; plusieurs `.blend` ou plusieurs `.glb` bloquent la synchronisation sans suppression automatique.
+**Aide et mode d’emploi**, en bas de la barre latérale, reste disponible même sans bibliothèque ouverte. Le guide explique les sources multiples, le principal automatique, les choix indépendants d’aperçu/export et les suppressions confirmées.
+
+Dans **Archives**, **Supprimer définitivement** retire un asset avec ses variantes, versions et fichiers attribuables. **Vider les archives** vise toutes les archives de la bibliothèque, indépendamment des filtres et de la pagination, après confirmation. Les objets partagés par d’autres assets restent conservés. Les anciennes sauvegardes GLB communes sans propriétaire identifiable sont conservées et signalées. Les sources importées originales, ressources externes et exports publiés restent hors de cette suppression. Enregistrer et fermer les fichiers concernés dans Blender avant confirmation. Un nettoyage incomplet est signalé et repris à la réouverture.
+
+Les boutons de suppression des catégories et projets de jeu se trouvent dans la barre latérale. Supprimer une catégorie retire toute sa branche et archive ses assets. Supprimer un projet archive tous ses assets, même liés à d’autres projets, en conservant leurs autres associations. Les fichiers et versions restent disponibles dans Archives.
 
 Dans la fiche d’un asset, l’onglet **Fichiers** filtre le workspace ou la version consultée par type (extension, dossier ou sans extension) et par taille minimum/maximum. Les bornes sont inclusives et facultatives, avec les unités o/Ko/Mo/Go en base 1024. Un filtre de taille exclut les dossiers ; une plage invalide est signalée. Les filtres se combinent avant la pagination et se réinitialisent au changement d’asset, variante ou version. **Réinitialiser** réaffiche toutes les entrées.
 
 ## Aperçu et export
 
-Chaque dossier de travail de variante contient un `.blend` source et un GLB dérivé. La règle s’applique récursivement ; `.blend1` reste une sauvegarde ordinaire. Les variantes, historiques, caches et sauvegardes sont indépendants de ce décompte. Les anciens dossiers non conformes sont conservés avec leur historique ; leur synchronisation et les nouvelles versions restent bloquées jusqu’à correction manuelle.
+Chaque dossier de variante accepte plusieurs `.blend` et `.glb`, récursivement et sans distinction de casse ; `.blend1` reste une sauvegarde ordinaire. Le principal est déduit avant copie à partir de la taille, de la date, du nom et de la profondeur du chemin. Le choix est mémorisé ; **Fichier principal** permet de le changer et **Re-détecter automatiquement** relance le classement. Un principal disparu est réévalué parmi les sources restantes.
 
-Le `.blend` est l’autorité. La scène active enregistrée est exportée entière, avec ses modificateurs actifs évalués. Le worker Blender ne réenregistre jamais un `.blend` existant et ne lui applique aucun modificateur. La création explicite écrit un nouveau `.blend` ; la restauration remplace les fichiers du dossier par les octets sauvegardés. Les sélecteurs de fichier principal, scène, collection et application des modificateurs ont disparu.
+Le `.blend` principal pilote la synchronisation automatique. **Source de l’aperçu** et **Source de l’export** choisissent indépendamment un `.blend` ou `.glb`. Les autres `.blend` sont préparés à la demande. La scène active enregistrée est exportée entière, avec ses modificateurs actifs évalués. Le worker ne réenregistre jamais un `.blend` existant. La création explicite écrit un nouveau `.blend` ; la restauration remplace les fichiers par les octets sauvegardés.
 
 La surveillance porte sur les workspaces de la bibliothèque active, même lorsque la fiche est fermée. Les événements sont regroupés pendant 500 ms après la dernière écriture, puis les contenus sont comparés par BLAKE3. Une sauvegarde pendant une conversion impose une nouvelle vérification. L’ouverture et le retour au premier plan réconcilient également l’état ; une défaillance de surveillance active une vérification périodique. Edge Lock doit être ouvert pour synchroniser.
 
-Le GLB unique existant conserve son chemin ; s’il manque, il est créé à côté du `.blend` avec le même nom. La génération vérifie une copie temporaire avant remplacement atomique. Le dernier aperçu reste affiché pendant le traitement ou en cas d’erreur. L’aperçu 3D et la vignette utilisent le même artefact immuable ; les résultats anciens sont ignorés. Une consultation historique ne change pas lorsque le travail courant est sauvegardé.
+Un dérivé géré déjà identifié conserve son chemin. Un nouveau dérivé prend le nom du `.blend`, ou un suffixe `.edge-lock` puis numérique en cas de collision avec un GLB utilisateur. La génération vérifie une copie temporaire avant remplacement atomique. Le dernier aperçu reste affiché pendant le traitement ou en cas d’erreur ; les résultats dépassés sont ignorés. La vignette représente le principal, indépendamment du choix local d’aperçu. Une consultation historique ne change pas lorsque le travail courant est sauvegardé.
 
 Les vignettes texturées sont fixes, sans rotation ni animation, et préparées une à la fois pour les cartes visibles. La première variante représente l’asset. L’aperçu 3D fournit navigation orbitale et lecture des animations GLB.
 
@@ -54,7 +60,7 @@ Les armatures restent représentées par les skins glTF et les animations compat
 
 Les statistiques affichent la géométrie du GLB effectivement généré : objets maillés, sommets, arêtes, faces et triangles. Elles incluent les effets des modificateurs. La triangulation et les séparations de sommets aux coutures UV peuvent différer des comptes de Blender. Un compte d’arêtes trop coûteux reste indisponible sans empêcher l’aperçu.
 
-Les versions restent manuelles. Une modification du seul GLB dérivé, sa suppression ou sa régénération ne permettent pas de créer une version. Les autres fichiers utilisateur, notamment le `.blend`, les textures, rapports et sauvegardes, restent comparés. La capture d’une version vérifie que ses sources correspondent au GLB synchronisé ; une sauvegarde concurrente entraîne une nouvelle tentative puis un refus si le projet reste instable.
+Les versions restent manuelles. Une modification du seul GLB géré, sa suppression ou sa régénération ne permettent pas de créer une version. Les autres fichiers, y compris les GLB utilisateur, et le choix du principal restent comparés. La capture vérifie que ses sources correspondent au GLB synchronisé ; une sauvegarde concurrente entraîne une nouvelle tentative puis un refus si le projet reste instable.
 
 Les limites de conversion de matériaux, simulations et fonctionnalités propres à Blender restent celles de son exporteur glTF.
 
@@ -66,7 +72,7 @@ La version 2 du rendu régénère automatiquement les anciennes vignettes visibl
 
 Un export explicite peut utiliser le travail enregistré sur disque ou une version immuable. L’export historique réutilise son GLB enregistré lorsqu’il existe ; il ne régénère pas ses sources. Les exports nécessitant Blender avec des dépendances externes ou absentes restent refusés et n’utilisent jamais un aperçu permissif du cache. Préférer des chemins relatifs à l’intérieur du dossier ou des ressources incorporées dans le `.blend`. Un dossier versionné ne capture pas les fichiers référencés à l’extérieur ; leur état actuel peut influencer une génération d’aperçu pour un ancien snapshot sans GLB enregistré.
 
-L’export explicite est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un aperçu est refusé au-delà de 256 Mio de GLB ou des budgets mémoire de géométrie/textures ; cela n’interdit pas de conserver et versionner un projet dont le GLB canonique est valide. Les GLB exigeant des ressources externes ou des extensions non prises en charge restent refusés.
+L’export explicite est écrit hors de la bibliothèque, avec confirmation avant remplacement d’un fichier existant. Un GLB choisi est copié exactement ; un `.blend` choisi est exporté dans un traitement isolé. L’aperçu n’impose plus de plafond artificiel de taille, géométrie, textures ou JSON : la mémoire RAM/GPU disponible et les contraintes du format restent déterminantes. Les GLB exigeant des ressources externes ou des extensions non prises en charge restent refusés.
 
 ## Stockage et limites du MVP
 
@@ -75,7 +81,7 @@ L’export explicite est écrit hors de la bibliothèque, avec confirmation avan
 - Tous les fichiers ordinaires du dossier sont conservés, y compris références, rapports, captures et sauvegardes `.blend1`. Les dossiers vides sont conservés. Les liens symboliques, junctions et fichiers spéciaux sont refusés.
 - Les snapshots sont manuels et portent sur les données déjà enregistrées sur disque. Les écritures concurrentes détectées font réessayer puis échouer la capture ; le MVP ne peut pas figer atomiquement un dossier modifié par un programme externe.
 - Une bibliothèque active à la fois, Windows comme plateforme validée, aucun serveur ni compte. Bibliothèques réseau et dossiers synchronisés à chaud non pris en charge.
-- Les nouvelles versions conservent normalement deux états complets par variante : version courante figée et backup précédent. Les plus anciennes deviennent des GLB de consultation après validation. Les anciennes données migrées et les captures sans GLB certifié restent complètes jusqu’à une conversion explicite ou une résolution du blocage ; ces exceptions sont affichées.
+- Les nouvelles versions conservent normalement deux états complets par variante : version courante figée et backup précédent. Les plus anciennes conservent tous leurs GLB enregistrés après validation de leur autonomie. Si cette validation échoue, la version reste complète. Les anciennes données migrées et les captures sans GLB certifié restent complètes jusqu’à une conversion explicite ou une résolution du blocage ; ces exceptions sont affichées.
 - Les versions courantes et backups actifs sont protégés contre la suppression ordinaire. La libération dédiée du backup conserve son GLB. Le ramasse-miettes libère seulement les objets internes devenus inutilisés après une conversion ou suppression, en tenant compte de toutes les variantes. L’historique local ne remplace pas une sauvegarde sur un autre support.
 - Le diagnostic mesure les tailles des fichiers et leurs références sans lire ni décompresser tous les contenus. Les catégories principales sont additives ; les détails peuvent se recouper. Les liens et junctions ne sont pas suivis. Une erreur d’accès rend le rapport partiel ; l’intégrité des contenus n’est pas vérifiée et les programmes externes peuvent encore modifier les fichiers pendant l’analyse.
 

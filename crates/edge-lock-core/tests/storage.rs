@@ -8,6 +8,64 @@ fn source(root: &Path) {
 }
 
 #[test]
+fn principal_uses_asset_name_and_supports_redetection_and_versioned_manual_choice() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("source");
+    source(&input);
+    fs::write(input.join("a.blend"), [0, 1, 2, 255]).unwrap();
+    for name in ["model.blend", "a.blend"] {
+        fs::File::options()
+            .write(true)
+            .open(input.join(name))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+    let library = Library::open(temp.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&input, "Model", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    assert_eq!(variant.config.primary_file.as_deref(), Some("model.blend"));
+    let work = Path::new(&variant.workspace_path);
+    fs::write(work.join("a.blend"), vec![2; 1000]).unwrap();
+    library
+        .update_config(
+            &variant.id,
+            ExportConfig {
+                primary_file: None,
+                ..variant.config.clone()
+            },
+        )
+        .unwrap();
+    let automatic = library.get_variant(&variant.id).unwrap().variant.config;
+    assert_eq!(automatic.primary_file.as_deref(), Some("a.blend"));
+    library
+        .create_snapshot(&variant.id, "Automatic detection", &ctx)
+        .unwrap();
+    library
+        .update_config(
+            &variant.id,
+            ExportConfig {
+                primary_file: Some("model.blend".into()),
+                ..automatic
+            },
+        )
+        .unwrap();
+    assert!(library.changes(&variant.id, &ctx).unwrap().config_changed);
+    let manual = library
+        .create_snapshot(&variant.id, "Manual principal", &ctx)
+        .unwrap();
+    assert_eq!(manual.config.primary_file.as_deref(), Some("model.blend"));
+    fs::remove_file(work.join("model.blend")).unwrap();
+    let capture = library
+        .capture_working(&variant.id, &temp.path().join("capture"), &ctx)
+        .unwrap();
+    assert_eq!(capture.config.primary_file.as_deref(), Some("a.blend"));
+}
+
+#[test]
 fn imported_snapshots_round_trip_without_mutating_the_source() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
@@ -96,7 +154,15 @@ fn a_derived_glb_change_alone_never_creates_a_version() {
     let library = Library::open(temp.path().join("library")).unwrap();
     let ctx = OperationContext::default();
     let asset = library
-        .import_folder(&input, "Derived", ExportConfig::default(), &ctx)
+        .import_folder(
+            &input,
+            "Derived",
+            ExportConfig {
+                generated_glb_file: Some("model.glb".into()),
+                ..Default::default()
+            },
+            &ctx,
+        )
         .unwrap();
     let variant = &asset.variants[0];
     let work = Path::new(&variant.workspace_path);
@@ -620,7 +686,7 @@ fn existing_schema_zero_is_backed_up_and_migrated_without_losing_records() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(preserved, "preserved");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let backup = fs::read_dir(root.join("backups"))
         .unwrap()
         .next()
@@ -670,7 +736,7 @@ fn interrupted_initialization_resumes_only_its_known_owned_state() {
 }
 
 #[test]
-fn primary_selection_prefers_a_unique_blend_and_keeps_ambiguity_explicit() {
+fn primary_selection_prefers_blend_and_resolves_multiple_sources_stably() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("source");
     source(&input);
@@ -693,7 +759,10 @@ fn primary_selection_prefers_a_unique_blend_and_keeps_ambiguity_explicit() {
     let ambiguous = library
         .import_folder(&input, "Ambiguous", ExportConfig::default(), &ctx)
         .unwrap();
-    assert!(ambiguous.variants[0].config.primary_file.is_none());
+    assert_eq!(
+        ambiguous.variants[0].config.primary_file.as_deref(),
+        Some("second.BLEND")
+    );
     let explicit = ExportConfig {
         primary_file: Some("model.glb".into()),
         ..Default::default()

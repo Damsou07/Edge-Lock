@@ -17,17 +17,19 @@ beforeEach(() => {
 });
 
 describe("mode d’emploi", () => {
-  it("met en évidence la règle du workspace et distingue l’import de la synchronisation", () => {
+  it("explique les sources multiples et les suppressions confirmées", () => {
     render(<HelpModal onClose={vi.fn()} />);
     const dialog = screen.getByRole("dialog", {
       name: "Aide et mode d’emploi",
     });
     expect(
       within(dialog).getByRole("heading", {
-        name: "La règle : 1 .blend + 1 .glb par workspace",
+        name: "Plusieurs modèles par workspace",
       }),
     ).toBeInTheDocument();
-    expect(dialog).toHaveTextContent("zéro ou un .glb");
+    expect(dialog).toHaveTextContent("au moins un .blend");
+    expect(dialog).toHaveTextContent("Vider les archives");
+    expect(dialog).toHaveTextContent("Re-détecter automatiquement");
     expect(dialog).toHaveTextContent("sous-dossiers compris");
     expect(dialog).toHaveTextContent(".blend1");
     expect(

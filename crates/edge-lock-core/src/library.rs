@@ -18,8 +18,11 @@ mod diagnostic;
 #[path = "history.rs"]
 mod history;
 pub use history::StorageAction;
+#[path = "archives.rs"]
+mod archives;
+pub use archives::{ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SCHEMA: &str = r#"
 CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES categories(id));
 CREATE TABLE games(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
@@ -146,6 +149,7 @@ impl Library {
             return Err(CoreError::Inconsistent("Le catalogue contient des références manquantes. Restaurez une sauvegarde de la bibliothèque.".into()));
         }
         let mut notices = history::recover_restores(&root, &mut connection)?;
+        notices.extend(archives::recover_deletions(&root, &mut connection)?);
         for entry in fs::read_dir(root.join("staging"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -215,6 +219,7 @@ impl Library {
             .lock()
             .map_err(|_| CoreError::Inconsistent("Verrou d’écriture indisponible.".into()))?;
         history::ensure_no_restore(&self.root)?;
+        archives::ensure_no_deletion(&self.root)?;
         Ok(guard)
     }
 
@@ -345,7 +350,7 @@ impl Library {
             ));
         }
         // Reject an invalid primary-file choice before reading and storing large inputs.
-        let config = resolve_config(config, &list_files(&source)?)?;
+        let config = resolve_config(config, &list_files(&source)?, &source, Some(&name))?;
         let entries = self.store.capture(&source, true, ctx)?;
         validate_config(&config, &entries)?;
         self.publish_asset(&name, config, entries, ctx)
@@ -383,7 +388,7 @@ impl Library {
         let _guard = self.write_guard()?;
         let name = checked_name(name)?;
         let entries = self.store.capture(source, true, ctx)?;
-        let layout = crate::sync::validate_project(&entries)?;
+        let layout = crate::sync::resolve_project(source, &entries, &config)?;
         if !entries
             .iter()
             .any(|entry| entry.kind == "file" && entry.path == layout.glb_file)
@@ -499,16 +504,26 @@ impl Library {
         let entries = self
             .store
             .capture(Path::new(&variant.workspace_path), true, ctx)?;
-        variant.config = resolve_config(variant.config, &entries)?;
+        variant.config = resolve_config(
+            variant.config,
+            &entries,
+            Path::new(&variant.workspace_path),
+            Some(&read_asset(&*self.db()?, &variant.asset_id)?.name),
+        )?;
         if let Some(receipt) = receipt {
             receipt.validate_capture(
                 dunce::simplified(Path::new(&variant.workspace_path)),
                 &entries,
                 ctx,
             )?;
-            variant.config = crate::sync::validate_project(&entries)?.config();
+            variant.config = receipt.config();
         }
-        if !crate::sync::source_changed(&previous.entries, &entries) {
+        if !crate::sync::source_changed_with_config(
+            &previous.entries,
+            &previous.config,
+            &entries,
+            &variant.config,
+        ) {
             return Err(CoreError::Invalid(
                 "Aucune modification à versionner.".into(),
             ));
@@ -569,7 +584,7 @@ impl Library {
         let base = self.get_snapshot(snapshot_id)?;
         history::require_full(&base)?;
         let entries = self.store.capture(source, true, ctx)?;
-        crate::sync::validate_project(&entries)?;
+        crate::sync::resolve_project(source, &entries, &config)?;
         validate_config(&config, &entries)?;
         self.publish_variant(base, &name, entries, config, ctx)
     }
@@ -647,6 +662,16 @@ impl Library {
         let current = self
             .store
             .capture(Path::new(&variant.workspace_path), false, ctx)?;
+        let current_config = if let Some(receipt) = receipt {
+            receipt.config()
+        } else {
+            resolve_config(
+                variant.config.clone(),
+                &current,
+                Path::new(&variant.workspace_path),
+                Some(&read_asset(&*self.db()?, &variant.asset_id)?.name),
+            )?
+        };
         if let Some(receipt) = receipt {
             receipt.validate_capture(
                 dunce::simplified(Path::new(&variant.workspace_path)),
@@ -654,22 +679,30 @@ impl Library {
                 ctx,
             )?;
         }
+        let source = |entry: &&ManifestEntry| {
+            entry.kind != "file"
+                || ![
+                    previous.config.generated_glb_file.as_deref(),
+                    current_config.generated_glb_file.as_deref(),
+                ]
+                .contains(&Some(entry.path.as_str()))
+        };
         let old = previous
             .entries
             .iter()
-            .filter(|entry| entry.kind != "file" || !crate::sync::is_glb(&entry.path))
+            .filter(source)
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let new = current
             .iter()
-            .filter(|entry| entry.kind != "file" || !crate::sync::is_glb(&entry.path))
+            .filter(source)
             .map(|entry| (&entry.path, entry))
             .collect::<BTreeMap<_, _>>();
         let mut result = ChangeSet {
             added: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
-            config_changed: false,
+            config_changed: previous.config.primary_file != current_config.primary_file,
             working_bytes: current.iter().map(|entry| entry.size).sum(),
         };
         for (path, entry) in &new {
@@ -733,7 +766,21 @@ impl Library {
     pub fn update_config(&self, variant_id: &str, config: ExportConfig) -> Result<()> {
         let _guard = self.write_guard()?;
         let variant = read_variant(&*self.db()?, &self.root, variant_id)?;
-        let config = resolve_config(config, &list_files(Path::new(&variant.workspace_path))?)?;
+        let mut config = config;
+        // A different principal gets its own managed destination. Clearing it explicitly re-detects.
+        if config.primary_file != variant.config.primary_file {
+            config.generated_glb_file = None;
+        }
+        let mut config = resolve_config(
+            config,
+            &list_files(Path::new(&variant.workspace_path))?,
+            Path::new(&variant.workspace_path),
+            Some(&read_asset(&*self.db()?, &variant.asset_id)?.name),
+        )?;
+        if config.primary_file == variant.config.primary_file {
+            // Re-detection or a UI update cannot revoke ownership of the same output.
+            config.generated_glb_file = variant.config.generated_glb_file.clone();
+        }
         if config == variant.config {
             return Ok(());
         }
@@ -800,7 +847,12 @@ impl Library {
         };
         let entries = ephemeral.capture(Path::new(&variant.workspace_path), true, ctx)?;
         let config = if update_config {
-            resolve_config(variant.config.clone(), &entries)?
+            resolve_config(
+                variant.config.clone(),
+                &entries,
+                Path::new(&variant.workspace_path),
+                Some(&read_asset(&*self.db()?, &variant.asset_id)?.name),
+            )?
         } else {
             variant.config.clone()
         };
@@ -1054,6 +1106,9 @@ fn apply_migrations(
             PRAGMA user_version=3;
         ")?;
     }
+    if version < 4 {
+        transaction.execute_batch("CREATE TABLE glb_backup_owners(variant_id TEXT NOT NULL REFERENCES variants(id),hash TEXT NOT NULL,PRIMARY KEY(variant_id,hash)); CREATE TABLE archive_deletions(id TEXT PRIMARY KEY,journal_hash TEXT NOT NULL); PRAGMA user_version=4;")?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1067,6 +1122,14 @@ fn cleanup_journal(path: &Path) {
 }
 
 fn validate_config(config: &ExportConfig, entries: &[ManifestEntry]) -> Result<()> {
+    if let Some(generated) = config.generated_glb_file.as_deref() {
+        safe_relative(generated)?;
+        if !crate::sync::is_glb(generated) {
+            return Err(CoreError::Invalid(
+                "Le fichier généré doit porter l’extension .glb.".into(),
+            ));
+        }
+    }
     if let Some(primary) = &config.primary_file {
         safe_relative(primary)?;
         if !entries
@@ -1093,7 +1156,22 @@ fn validate_config(config: &ExportConfig, entries: &[ManifestEntry]) -> Result<(
     Ok(())
 }
 
-fn resolve_config(mut config: ExportConfig, entries: &[ManifestEntry]) -> Result<ExportConfig> {
+fn resolve_config(
+    mut config: ExportConfig,
+    entries: &[ManifestEntry],
+    root: &Path,
+    asset_name: Option<&str>,
+) -> Result<ExportConfig> {
+    if let Some(primary) = config.primary_file.as_deref() {
+        safe_relative(primary)?;
+        if !entries
+            .iter()
+            .any(|entry| entry.kind == "file" && entry.path == primary)
+        {
+            config.primary_file = None;
+            config.generated_glb_file = None;
+        }
+    }
     if config.primary_file.is_none() {
         let candidates = |extension: &str| {
             entries
@@ -1107,8 +1185,10 @@ fn resolve_config(mut config: ExportConfig, entries: &[ManifestEntry]) -> Result
                 .collect::<Vec<_>>()
         };
         let blends = candidates("blend");
-        if blends.len() == 1 {
-            config.primary_file = Some(blends[0].path.clone());
+        if !blends.is_empty() {
+            config.primary_file = Some(
+                crate::sync::resolve_project_named(root, entries, &config, asset_name)?.blend_file,
+            );
         } else if blends.is_empty() {
             let glbs = candidates("glb");
             if glbs.len() == 1 {
@@ -1234,6 +1314,11 @@ fn insert_snapshot(transaction: &Transaction<'_>, snapshot: &Snapshot) -> Result
         .storage
         .preview_path
         .as_deref()
+        .or(snapshot
+            .config
+            .generated_glb_file
+            .as_deref()
+            .filter(|path| glbs.iter().any(|entry| entry.path == *path)))
         .or_else(|| (glbs.len() == 1).then(|| glbs[0].path.as_str()));
     transaction.execute("UPDATE snapshots SET storage_kind=?2,preview_path=?3,restored_from=?4,legacy=?5,preview_trusted=?6 WHERE id=?1", params![snapshot.id,snapshot.storage.kind,preview,snapshot.storage.restored_from,snapshot.storage.legacy,snapshot.storage.preview_trusted])?;
     let mut statement = transaction.prepare(

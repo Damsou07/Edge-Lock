@@ -142,13 +142,13 @@ function renderDetail(generation = 0) {
   );
 }
 
-it("retire les réglages de source et les choix GLB", async () => {
+it("propose les sources et garde les modificateurs évalués automatiquement", async () => {
   renderDetail();
   await screen.findByLabelText("Aperçu 3D interactif");
   expect(screen.queryByText("Source de l’asset")).not.toBeInTheDocument();
   expect(
-    screen.queryByRole("combobox", { name: "Fichier principal" }),
-  ).not.toBeInTheDocument();
+    screen.getByRole("combobox", { name: "Fichier principal" }),
+  ).toBeInTheDocument();
   expect(
     screen.queryByRole("checkbox", { name: /modificateurs/ }),
   ).not.toBeInTheDocument();
@@ -306,6 +306,64 @@ it("ne recharge pas l’aperçu lors d’un rafraîchissement du catalogue", asy
   expect(
     run.mock.calls.filter(([request]) => request.kind === "preview"),
   ).toHaveLength(1);
+});
+
+it("garde le modèle chargé lorsque la réconciliation retrouve le même artefact", async () => {
+  let count = 0;
+  run.mockImplementation(async (request) =>
+    request.kind === "changes"
+      ? changed
+      : {
+          ...preview,
+          artifactKey: "stable",
+          url: `http://edge-preview.localhost/token-${++count}`,
+        },
+  );
+  renderDetail();
+  await screen.findByLabelText("Aperçu 3D interactif");
+  await act(async () => emitStatus({ ...ready, revision: 2 }));
+  await waitFor(() =>
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(2),
+  );
+  expect(screen.getByLabelText("Aperçu 3D interactif")).toHaveAttribute(
+    "data-url",
+    "http://edge-preview.localhost/token-1",
+  );
+  expect(api.releasePreviewResources).toHaveBeenCalledWith(["token-2"]);
+});
+
+it("actualise une source secondaire même si l’artefact principal ne change pas", async () => {
+  vi.mocked(api.getVariant).mockResolvedValue({
+    ...variant,
+    files: [
+      ...variant.files,
+      { path: "other.glb", kind: "file", hash: "other", size: 20 },
+    ],
+  });
+  renderDetail();
+  await screen.findByLabelText("Aperçu 3D interactif");
+  await userEvent.selectOptions(
+    screen.getByLabelText("Source de l’aperçu"),
+    "other.glb",
+  );
+  await waitFor(() =>
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(2),
+  );
+  await act(async () => emitStatus({ ...ready, revision: 2 }));
+  await waitFor(() =>
+    expect(
+      run.mock.calls.filter(([request]) => request.kind === "preview"),
+    ).toHaveLength(3),
+  );
+  expect(
+    run.mock.calls
+      .filter(([request]) => request.kind === "preview")
+      .at(-1)?.[0],
+  ).toEqual(expect.objectContaining({ previewFile: "other.glb" }));
 });
 
 it("libère un ancien aperçu terminé après une nouvelle sauvegarde", async () => {

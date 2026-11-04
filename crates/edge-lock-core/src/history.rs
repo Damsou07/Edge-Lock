@@ -42,11 +42,28 @@ fn preview_entry(snapshot: &Snapshot) -> Result<ManifestEntry> {
         if let Some(entry) = candidates.iter().find(|entry| &entry.path == path) {
             return Ok((*entry).clone());
         }
-    } else if candidates.len() == 1 {
-        return Ok(candidates[0].clone());
+    } else if let Some(entry) = snapshot
+        .config
+        .generated_glb_file
+        .as_ref()
+        .and_then(|path| candidates.iter().find(|entry| &entry.path == path))
+    {
+        return Ok((*entry).clone());
+    } else if !candidates.is_empty() {
+        let paired = snapshot.config.primary_file.as_deref().map(|primary| {
+            Path::new(primary)
+                .with_extension("glb")
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        return Ok((*candidates
+            .iter()
+            .find(|entry| Some(entry.path.as_str()) == paired.as_deref())
+            .unwrap_or(&candidates[0]))
+        .clone());
     }
     Err(CoreError::Invalid(
-        "Aucun GLB historique unique et autonome disponible ; les sources sont conservées.".into(),
+        "Aucun GLB historique autonome disponible ; les sources sont conservées.".into(),
     ))
 }
 
@@ -93,17 +110,32 @@ impl Library {
         Ok(preview_entry(&self.get_snapshot(id)?)?.path)
     }
 
-    fn verified_preview(
+    fn verified_previews(
         &self,
         snapshot: &Snapshot,
         ctx: &OperationContext,
-    ) -> Result<ManifestEntry> {
-        let entry = preview_entry(snapshot)?;
+    ) -> Result<Vec<ManifestEntry>> {
+        let principal = preview_entry(snapshot)?;
+        let mut entries = vec![principal];
+        entries.extend(
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == "file"
+                        && crate::sync::is_glb(&entry.path)
+                        && entry.path != entries[0].path
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let temporary = tempfile::tempdir_in(&self.store.staging)?;
-        let path = temporary.path().join("preview.glb");
-        self.extract_snapshot_file(&snapshot.id, &entry.path, &path, ctx)?;
-        crate::glb::guard_preview(&path)?;
-        Ok(entry)
+        for (index, entry) in entries.iter().enumerate() {
+            let path = temporary.path().join(format!("preview-{index}.glb"));
+            self.extract_snapshot_file(&snapshot.id, &entry.path, &path, ctx)?;
+            crate::glb::guard_preview(&path)?;
+        }
+        Ok(entries)
     }
 
     fn scope_snapshots(&self, variant_id: &str) -> Result<Vec<Snapshot>> {
@@ -124,7 +156,7 @@ impl Library {
     fn downgrade(
         &self,
         id: &str,
-        entry: &ManifestEntry,
+        entries: &[ManifestEntry],
         release_variant: Option<&str>,
     ) -> Result<()> {
         let mut db = self.db()?;
@@ -140,14 +172,25 @@ impl Library {
             tx.commit()?;
             return Ok(());
         }
-        tx.execute("INSERT OR IGNORE INTO garbage_candidates(hash,size) SELECT hash,size FROM snapshot_entries WHERE snapshot_id=?1 AND kind='file' AND path<>?2", params![id,entry.path])?;
-        tx.execute(
-            "DELETE FROM snapshot_entries WHERE snapshot_id=?1 AND path<>?2",
-            params![id, entry.path],
-        )?;
+        let retained: BTreeSet<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        for entry in read_snapshot(&tx, id)?.entries {
+            if retained.contains(entry.path.as_str()) {
+                continue;
+            }
+            if entry.kind == "file" {
+                tx.execute(
+                    "INSERT OR IGNORE INTO garbage_candidates(hash,size) VALUES(?1,?2)",
+                    params![entry.hash, sql_size(entry.size)?],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM snapshot_entries WHERE snapshot_id=?1 AND path=?2",
+                params![id, entry.path],
+            )?;
+        }
         tx.execute(
             "UPDATE snapshots SET storage_kind='preview',preview_path=?2,legacy=0 WHERE id=?1",
-            params![id, entry.path],
+            params![id, entries[0].path],
         )?;
         tx.commit()?;
         Ok(())
@@ -167,9 +210,9 @@ impl Library {
             }
             let result = (|| {
                 let snapshot = self.get_snapshot(&summary.id)?;
-                let entry = self.verified_preview(&snapshot, ctx)?;
+                let entries = self.verified_previews(&snapshot, ctx)?;
                 ctx.check_cancelled()?;
-                self.downgrade(&snapshot.id, &entry, None)
+                self.downgrade(&snapshot.id, &entries, None)
             })();
             if result.is_err() && ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -328,14 +371,22 @@ impl Library {
             _ => Vec::new(),
         };
         let mut discarded = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut retained_hashes = BTreeSet::new();
         for id in selected {
             ctx.check_cancelled()?;
             let snapshot = self.get_snapshot(&id)?;
             let kept = if action == StorageAction::DeleteVersion {
-                None
+                BTreeSet::new()
             } else {
-                match self.verified_preview(&snapshot, ctx) {
-                    Ok(entry) => Some(entry.path),
+                match self.verified_previews(&snapshot, ctx) {
+                    Ok(entries) => {
+                        retained_hashes
+                            .extend(entries.iter().filter_map(|entry| entry.hash.clone()));
+                        entries
+                            .into_iter()
+                            .map(|entry| entry.path)
+                            .collect::<BTreeSet<_>>()
+                    }
                     Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
                     Err(error) => {
                         if action == StorageAction::ReleaseBackup {
@@ -356,7 +407,7 @@ impl Library {
                 ));
             } else {
                 for entry in &snapshot.entries {
-                    if entry.kind == "file" && Some(&entry.path) != kept.as_ref() {
+                    if entry.kind == "file" && !kept.contains(&entry.path) {
                         discarded
                             .entry(
                                 entry.hash.clone().ok_or_else(|| {
@@ -382,20 +433,7 @@ impl Library {
                 .collect::<std::result::Result<_, _>>()?;
             drop(db);
             // A retained GLB can share a hash with an entry being discarded; count remaining paths too.
-            let preserved = report
-                .versions
-                .iter()
-                .filter(|s| removed_versions.contains(&s.id))
-                .any(|s| {
-                    action != StorageAction::DeleteVersion
-                        && self
-                            .get_snapshot(&s.id)
-                            .ok()
-                            .and_then(|s| preview_entry(&s).ok())
-                            .and_then(|e| e.hash)
-                            .as_deref()
-                            == Some(&hash)
-                });
+            let preserved = retained_hashes.contains(&hash);
             if !preserved && owners.is_subset(&removed_versions) {
                 reclaim.insert(hash);
             }
@@ -558,10 +596,10 @@ impl Library {
                 )?;
                 tx.commit()?;
             } else {
-                let entry = self.verified_preview(&self.get_snapshot(&version.id)?, ctx)?;
+                let entries = self.verified_previews(&self.get_snapshot(&version.id)?, ctx)?;
                 self.downgrade(
                     &version.id,
-                    &entry,
+                    &entries,
                     (action == StorageAction::ReleaseBackup)
                         .then_some(variant_id)
                         .flatten(),
@@ -976,7 +1014,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 }

@@ -147,8 +147,9 @@ pub fn run() {
                             .header("Access-Control-Allow-Origin", origin)
                             .header("Cache-Control", "private, max-age=3600")
                             .body(bytes),
-                        Err(_) => tauri::http::Response::builder()
-                            .status(404)
+                        Err(error) => tauri::http::Response::builder()
+                            .status(if error.code == "memory" { 507 } else { 404 })
+                            .header("Access-Control-Allow-Origin", origin)
                             .body(Vec::new()),
                     }
                 } else {
@@ -174,6 +175,8 @@ pub fn run() {
             commands::update_asset,
             commands::save_category,
             commands::save_game,
+            commands::delete_category,
+            commands::delete_game,
             commands::update_config,
             commands::choose_folder,
             commands::choose_export_path,

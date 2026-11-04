@@ -66,6 +66,8 @@ export const api = {
   ) => invoke<void>("save_category", { id, name, parentId }),
   saveGame: (name: string, id: string | null = null) =>
     invoke<void>("save_game", { id, name }),
+  deleteCategory: (id: string) => invoke<number>("delete_category", { id }),
+  deleteGame: (id: string) => invoke<number>("delete_game", { id }),
   updateConfig: (variantId: string, config: ExportConfig) =>
     invoke<void>("update_config", { variantId, config }),
   setBlenderPath: (path: string) =>

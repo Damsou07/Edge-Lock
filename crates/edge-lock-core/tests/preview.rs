@@ -199,7 +199,41 @@ fn current_preview_choice_is_remembered_and_explicit_choice_has_priority() {
 }
 
 #[test]
-fn remembered_preview_choice_is_scoped_to_current_config_and_never_used_or_saved_by_snapshots() {
+fn explicit_blend_preview_uses_the_selected_source_without_changing_export_config() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("main.blend"), b"main blend").unwrap();
+    fs::write(source.join("alternative.blend"), b"alternative blend").unwrap();
+    triangle(&source.join("main.glb"));
+    let library = Library::open(root.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&source, "Choices", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    let error = match prepare_preview(
+        &library,
+        PreviewRequest {
+            variant_id: &variant.id,
+            snapshot_id: None,
+            preview_file: Some("alternative.blend"),
+            blender_path: None,
+        },
+        &ctx,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a Blender source requires Blender"),
+    };
+    assert!(error.to_string().contains("Configurez Blender"), "{error}");
+    assert_eq!(
+        library.get_variant(&variant.id).unwrap().variant.config,
+        variant.config
+    );
+}
+
+#[test]
+fn remembered_preview_choice_is_isolated_per_current_variant_and_snapshot_and_survives_reopen() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     fs::create_dir(&source).unwrap();
@@ -231,6 +265,25 @@ fn remembered_preview_choice_is_scoped_to_current_config_and_never_used_or_saved
     ));
     preview(Some(&variant.head_snapshot_id), Some("one.glb"));
     assert!(
+        matches!(preview(Some(&variant.head_snapshot_id), None), PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb")
+    );
+    fs::write(
+        Path::new(&variant.workspace_path).join("note.txt"),
+        b"new version",
+    )
+    .unwrap();
+    let next = library
+        .create_snapshot(&variant.id, "Next context", &ctx)
+        .unwrap();
+    assert!(matches!(
+        preview(Some(&next.id), None),
+        PreviewOutcome::Choose(_)
+    ));
+    preview(Some(&next.id), Some("two.glb"));
+    assert!(
+        matches!(preview(Some(&variant.head_snapshot_id), None), PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb")
+    );
+    assert!(
         matches!(preview(None,None),PreviewOutcome::Ready(artifact) if artifact.source_file == "two.glb")
     );
     library
@@ -245,8 +298,16 @@ fn remembered_preview_choice_is_scoped_to_current_config_and_never_used_or_saved
     assert!(matches!(preview(None, None), PreviewOutcome::Choose(_)));
     assert!(matches!(
         preview(Some(&variant.head_snapshot_id), None),
-        PreviewOutcome::Choose(_)
+        PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb"
     ));
+    drop(library);
+    let reopened = Library::open(root.path().join("library")).unwrap();
+    assert!(
+        matches!(prepare_preview(&reopened, PreviewRequest { variant_id: &variant.id, snapshot_id: Some(&variant.head_snapshot_id), preview_file: None, blender_path: None }, &ctx).unwrap(), PreviewOutcome::Ready(artifact) if artifact.source_file == "one.glb")
+    );
+    assert!(
+        matches!(prepare_preview(&reopened, PreviewRequest { variant_id: &variant.id, snapshot_id: Some(&next.id), preview_file: None, blender_path: None }, &ctx).unwrap(), PreviewOutcome::Ready(artifact) if artifact.source_file == "two.glb")
+    );
 }
 
 fn blender_executable() -> PathBuf {

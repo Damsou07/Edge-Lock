@@ -320,6 +320,26 @@ fn affected(root: &Path, paths: &[std::path::PathBuf]) -> HashSet<String> {
         .collect()
 }
 
+fn generated_paths_only(
+    workspace: &Path,
+    generated: Option<&str>,
+    paths: &[std::path::PathBuf],
+) -> bool {
+    let Some(generated) = generated else {
+        return false;
+    };
+    let output = workspace.join(generated);
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            dunce::simplified(path) == dunce::simplified(&output)
+                || (path.parent().map(dunce::simplified) == output.parent().map(dunce::simplified)
+                    && path.extension().is_none()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".edge-lock-")))
+        })
+}
+
 pub fn install(app: &AppHandle, state: &Arc<AppState>) {
     let generation = state.watcher_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut watcher) = state.watcher.lock() {
@@ -346,13 +366,17 @@ pub fn install(app: &AppHandle, state: &Arc<AppState>) {
                     return;
                 }
                 for id in ids {
-                    let generated_only = event.paths.iter().all(|path| {
-                        path.extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
-                            || path.file_name().is_some_and(|name| {
-                                name.to_string_lossy().starts_with(".edge-lock-")
-                            })
-                    });
+                    let generated_only = state
+                        .library()
+                        .ok()
+                        .and_then(|library| library.get_variant(&id).ok())
+                        .is_some_and(|detail| {
+                            generated_paths_only(
+                                Path::new(&detail.variant.workspace_path),
+                                detail.variant.config.generated_glb_file.as_deref(),
+                                &event.paths,
+                            )
+                        });
                     let running = state
                         .workspaces
                         .lock()
@@ -410,6 +434,38 @@ pub fn install(app: &AppHandle, state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_glb_events_are_never_mistaken_for_generated_output() {
+        let workspace = Path::new("workspaces/asset/variant");
+        assert!(generated_paths_only(
+            workspace,
+            Some("main.glb"),
+            &[workspace.join("main.glb")]
+        ));
+        assert!(!generated_paths_only(
+            workspace,
+            Some("main.glb"),
+            &[workspace.join("other.glb")]
+        ));
+        assert!(!generated_paths_only(
+            workspace,
+            None,
+            &[workspace.join("main.glb")]
+        ));
+        for user_model in [".edge-lock-secondary.glb", ".edge-lock-secondary.blend"] {
+            assert!(!generated_paths_only(
+                workspace,
+                Some("main.glb"),
+                &[workspace.join(user_model)]
+            ));
+        }
+        assert!(generated_paths_only(
+            workspace,
+            Some("main.glb"),
+            &[workspace.join(".edge-lock-r4nd0m")]
+        ));
+    }
 
     #[test]
     fn repeated_saves_keep_one_worker_and_invalidate_snapshot_readiness() {

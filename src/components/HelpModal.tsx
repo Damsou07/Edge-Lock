@@ -10,40 +10,42 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
     >
       <div className="help-content">
         <nav className="help-contents" aria-label="Sommaire de l’aide">
-          <a href="#help-rule">La règle des fichiers</a>
+          <a href="#help-rule">Sources et aperçus</a>
           <a href="#help-start">Premiers pas</a>
           <a href="#help-history">Versions et variantes</a>
           <a href="#help-files">Fichiers et dépannage</a>
         </nav>
         <section className="help-rule" id="help-rule" tabIndex={-1}>
-          <h3>La règle : 1 .blend + 1 .glb par workspace</h3>
+          <h3>Plusieurs modèles par workspace</h3>
           <p>
             <strong>
-              Chaque dossier de travail synchronisé contient exactement un
-              .blend source et un .glb dérivé, sous-dossiers compris.
+              Un workspace peut contenir plusieurs .blend et .glb, sous-dossiers
+              compris. L’import nécessite au moins un .blend.
             </strong>{" "}
             La casse des extensions ne change pas cette règle.
           </p>
           <p>
-            Le .blend est la source de vérité. Edge Lock génère le GLB pour
-            l’aperçu et l’export ; gardez vos autres projets Blender dans un
-            autre workspace, par exemple une variante.
+            Edge Lock déduit un fichier principal à partir de la taille, de la
+            date, du nom et de son emplacement. Ce choix reste stable ;
+            changez-le avec Fichier principal ou Re-détecter automatiquement.
           </p>
           <p>
-            À l’import, le dossier doit contenir un .blend et zéro ou un .glb.
-            Edge Lock copie le dossier puis génère le GLB dans cette copie, sans
-            changer l’original. Si le GLB manque ensuite, il est recréé à côté
-            du .blend.
+            Le principal est synchronisé automatiquement. Les sélecteurs Source
+            de l’aperçu et Source de l’export permettent de choisir
+            indépendamment un .blend ou un .glb. Les autres projets Blender sont
+            préparés à la demande. L’import conserve le dossier original et les
+            GLB utilisateur.
           </p>
           <p>
             Les sauvegardes .blend1, textures et références sont autorisées.
-            Chaque variante a son propre décompte ; les historiques, caches et
-            sauvegardes internes n’entrent pas dans celui du workspace.
+            Chaque variante garde son dossier indépendant. Une régénération du
+            seul GLB géré ne crée pas de changement à versionner ; un GLB
+            utilisateur ajouté ou modifié compte bien comme un changement.
           </p>
           <p>
-            Un dossier non conforme reste conservé, mais la synchronisation et
-            les nouvelles versions sont bloquées jusqu’à sa correction manuelle.
-            Vérifiez aussi ses sous-dossiers.
+            L’aperçu n’impose plus de plafond de taille GLB, de géométrie ou de
+            textures. Les ressources réelles de la machine et les fonctions glTF
+            prises en charge restent déterminantes.
           </p>
         </section>
         <section>
@@ -59,6 +61,20 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             créations. Archiver un asset le retire de la vue courante tout en
             conservant ses fichiers et ses versions. Une seule instance peut
             ouvrir une bibliothèque ; utilisez un disque local.
+          </p>
+          <p>
+            Depuis Archives, Supprimer définitivement efface les fichiers,
+            variantes et versions attribuables à un asset. Vider les archives
+            concerne toutes les archives, même filtrées, après confirmation. Les
+            objets partagés restent conservés pour les autres assets ; les
+            anciennes sauvegardes communes non attribuables sont signalées et
+            préservées. Enregistrez et fermez les fichiers concernés dans
+            Blender.
+          </p>
+          <p>
+            Supprimer une catégorie retire aussi ses sous-catégories et archive
+            leurs assets. Supprimer un projet de jeu archive tous ses assets,
+            même liés à d’autres projets, en conservant ces autres associations.
           </p>
         </section>
         <section id="help-start" tabIndex={-1}>
@@ -84,8 +100,8 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             </li>
             <li>
               Après synchronisation, créez une version pour conserver
-              volontairement cet état. Modifier seulement le GLB ne crée pas de
-              changement source à versionner.
+              volontairement cet état. Modifier seulement le GLB géré ne crée
+              pas de changement source à versionner.
             </li>
           </ol>
           <p>
@@ -103,9 +119,9 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           </p>
           <p>
             Le courant et son backup sont normalement conservés complets ; les
-            versions plus anciennes peuvent ne conserver que leur GLB de
-            consultation. Ces versions ne permettent plus de reprendre l’édition
-            Blender.
+            versions plus anciennes peuvent ne conserver que tous leurs GLB de
+            consultation, au choix. Ces versions ne permettent plus de reprendre
+            l’édition Blender.
           </p>
           <p>
             Pour restaurer un backup, enregistrez et fermez le projet dans
@@ -137,15 +153,15 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           </p>
           <p>
             Si la synchronisation échoue, lisez le diagnostic dans la fiche,
-            vérifiez la règle des fichiers et les textures ou dépendances
+            vérifiez le fichier principal et les textures ou dépendances
             utilisées, puis relancez la synchronisation. Une erreur ne remplace
             pas le dernier GLB valide et laisse le .blend accessible.
           </p>
           <p>
-            Avant de déplacer un fichier pour corriger un workspace,
-            conservez-en une copie hors de ce workspace. Les fonctions de
-            sauvegarde Blender ne doivent pas créer un deuxième fichier .blend
-            dans ses sous-dossiers.
+            Une erreur de génération conserve le dernier GLB valide. Vous pouvez
+            choisir une autre source d’aperçu ou exporter un GLB existant. Les
+            versions complètes conservent les sources ; les versions allégées
+            proposent uniquement les GLB enregistrés.
           </p>
         </section>
       </div>

@@ -4,6 +4,8 @@ import { errorMessage } from "../lib/format";
 import { Icon } from "./Icon";
 
 const names: Record<Job["kind"], string> = {
+  archiveDeletionPlan: "Analyse des archives",
+  archiveDeletionApply: "Suppression des archives",
   storageDiagnostic: "Diagnostic du stockage",
   storagePlan: "Analyse du stockage",
   storageApply: "Optimisation du stockage",

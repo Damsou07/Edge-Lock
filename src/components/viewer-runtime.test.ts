@@ -58,6 +58,48 @@ afterEach(() => {
 });
 
 describe("ressources communes des aperçus", () => {
+  it("explique un échec réel d’allocation pendant la lecture", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: () =>
+          Promise.reject(new RangeError("Array buffer allocation failed")),
+      }),
+    );
+    await expect(loadPreviewModel("large.glb")).rejects.toThrow(
+      /Mémoire insuffisante/,
+    );
+  });
+  it("explique un échec d’allocation signalé par le protocole local", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 507 })),
+    );
+    await expect(loadPreviewModel("large.glb")).rejects.toThrow(
+      /Mémoire insuffisante/,
+    );
+  });
+  it("ne refuse pas le chargement selon la taille annoncée du GLB", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(documentBytes(), {
+          headers: { "content-length": String(300 * 1024 * 1024) },
+        }),
+      ),
+    );
+    const scene = new THREE.Group();
+    vi.spyOn(GLTFLoader.prototype, "parseAsync").mockResolvedValue({
+      scene,
+      scenes: [scene],
+      animations: [],
+    } as unknown as GLTF);
+    await expect(loadPreviewModel("model.glb")).resolves.toHaveProperty(
+      "scene",
+      scene,
+    );
+  });
   it("masque le sol disproportionné au décodage et cadre le sujet sans altérer ses ressources", async () => {
     const { scene, subject, floor } = studioScene();
     const geometry = floor.geometry;

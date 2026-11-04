@@ -1,5 +1,6 @@
 export interface ExportConfig {
   primaryFile: string | null;
+  generatedGlbFile?: string | null;
   scene: string | null;
   collection: string | null;
   applyModifiers: boolean;
@@ -146,6 +147,7 @@ export interface Inspection {
 }
 export interface PreviewResult {
   url: string;
+  artifactKey?: string;
   inspection: Inspection;
   sourceLabel: string;
   sourceFile: string;
@@ -173,6 +175,8 @@ export interface WorkspaceStatus {
   error: AppError | null;
 }
 export type JobRequest =
+  | { kind: "archiveDeletionPlan"; assetId?: string }
+  | { kind: "archiveDeletionApply"; assetId?: string; planToken: string }
   | { kind: "storageDiagnostic" }
   | {
       kind: "storagePlan";
@@ -210,6 +214,7 @@ export type JobRequest =
       kind: "export";
       variantId: string;
       snapshotId?: string | null;
+      sourceFile?: string;
       destination: string;
       overwrite: boolean;
     };
@@ -222,6 +227,25 @@ export interface Job {
   total: number | null;
   result: unknown;
   error: AppError | null;
+}
+
+export interface ArchiveDeletionPlan {
+  planToken: string;
+  assets: { id: string; name: string }[];
+  assetIds: string[];
+  variantIds: string[];
+  assetCount: number;
+  variantCount: number;
+  snapshotCount: number;
+  workspaceBytes: number;
+  warnings: string[];
+}
+export interface ArchiveDeletionReport {
+  deletedAssetIds: string[];
+  deletedVariantIds: string[];
+  releasedBytes: number;
+  cleanupPending: boolean;
+  warnings: string[];
 }
 
 export type StorageAction =

@@ -17,6 +17,26 @@ function glb(json: unknown): ArrayBuffer {
 }
 
 describe("validation GLB avant chargement", () => {
+  it("refuse une image SVG embarquée par bufferView", () => {
+    expect(() =>
+      inspectGlb(
+        glb({
+          asset: { version: "2.0" },
+          images: [{ bufferView: 0, mimeType: "image/svg+xml" }],
+        }),
+      ),
+    ).toThrow(/Format d’image/);
+  });
+  it("accepte des métadonnées JSON dépassant 16 Mio", () => {
+    expect(() =>
+      inspectGlb(
+        glb({
+          asset: { version: "2.0" },
+          extras: { notes: "x".repeat(16 * 1024 * 1024) },
+        }),
+      ),
+    ).not.toThrow();
+  });
   it("accepte les ressources embarquées et les noms des clips", () => {
     expect(
       inspectGlb(

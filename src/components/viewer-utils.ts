@@ -1,8 +1,6 @@
-export const MAX_PREVIEW_BYTES = 256 * 1024 * 1024;
-
 type GlbDocument = {
   asset?: { version?: string };
-  images?: { uri?: unknown }[];
+  images?: { uri?: unknown; mimeType?: unknown }[];
   buffers?: { uri?: unknown }[];
   extensionsRequired?: string[];
   animations?: { name?: string }[];
@@ -18,8 +16,6 @@ export function isEmbeddedImageUri(value: unknown): value is string {
 }
 
 export function inspectGlb(buffer: ArrayBuffer): { animationNames: string[] } {
-  if (buffer.byteLength > MAX_PREVIEW_BYTES)
-    throw new Error("Cet aperçu dépasse 256 Mo. Ouvrez l’asset dans Blender.");
   if (buffer.byteLength < 20) throw new Error("Fichier GLB incomplet.");
   const view = new DataView(buffer);
   if (
@@ -31,8 +27,7 @@ export function inspectGlb(buffer: ArrayBuffer): { animationNames: string[] } {
   const jsonLength = view.getUint32(12, true);
   if (
     view.getUint32(16, true) !== 0x4e4f534a ||
-    jsonLength > buffer.byteLength - 20 ||
-    jsonLength > 16 * 1024 * 1024
+    jsonLength > buffer.byteLength - 20
   )
     throw new Error("Structure GLB invalide.");
   let document: GlbDocument;
@@ -68,6 +63,16 @@ export function inspectGlb(buffer: ArrayBuffer): { animationNames: string[] } {
     throw new Error("Les métadonnées GLB sont invalides.");
   if (document.asset?.version !== "2.0")
     throw new Error("Version GLB non prise en charge.");
+  if (
+    (document.images ?? []).some(
+      (image) =>
+        image.mimeType !== undefined &&
+        !["image/png", "image/jpeg", "image/webp"].includes(
+          image.mimeType as string,
+        ),
+    )
+  )
+    throw new Error("Format d’image non pris en charge par l’aperçu.");
   if (
     (document.buffers ?? []).some((resource) => resource.uri !== undefined) ||
     (document.images ?? []).some(

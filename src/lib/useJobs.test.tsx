@@ -49,9 +49,13 @@ it("désinscrit une écoute asynchrone arrivée après le premier cleanup de Str
   expect(unsubscribeSecond).toHaveBeenCalledTimes(1);
 });
 
-it.each(["ready", "render"])(
-  "libère le résultat thumbnail %s si l’annulation arrive après production",
-  async (state) => {
+it.each([
+  { kind: "thumbnail", state: "ready" },
+  { kind: "thumbnail", state: "render" },
+  { kind: "preview", state: "render" },
+] as const)(
+  "libère le résultat $kind $state si l’annulation arrive après production",
+  async ({ kind, state }) => {
     vi.mocked(api.startJob).mockResolvedValue("finished-job");
     let terminal!: (value: unknown) => void;
     vi.mocked(api.getJob).mockImplementation(
@@ -63,7 +67,12 @@ it.each(["ready", "render"])(
     const { result } = renderHook(useJobs);
     const abort = new AbortController();
     const task = result.current
-      .runJob({ kind: "thumbnail", assetId: "a" }, { signal: abort.signal })
+      .runJob(
+        kind === "thumbnail"
+          ? { kind, assetId: "a" }
+          : { kind, variantId: "v" },
+        { signal: abort.signal },
+      )
       .catch((reason: unknown) => reason);
     await waitFor(() =>
       expect(api.getJob).toHaveBeenCalledWith("finished-job"),
@@ -72,7 +81,7 @@ it.each(["ready", "render"])(
     await act(async () =>
       terminal({
         id: "finished-job",
-        kind: "thumbnail",
+        kind,
         status: "completed",
         result: { state, resourceToken: "unclaimed", url: "cached.png" },
         error: null,

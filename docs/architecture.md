@@ -13,9 +13,9 @@ Le cœur expose des opérations synchrones testables avec des dossiers jetables.
 
 ## Source et dérivé canonique
 
-Chaque workspace conforme contient exactement un `.blend` et, après synchronisation, un GLB. La recherche est récursive et insensible à la casse ; `.blend1` reste un fichier utilisateur. Le module `sync` centralise la validation. Les variantes et archives sont indépendantes du décompte.
+Chaque workspace accepte plusieurs `.blend` et `.glb`. L’import exige au moins un `.blend` ; la recherche est récursive et insensible à la casse, et `.blend1` reste un fichier utilisateur. `sync::resolve_project` centralise le choix stable du principal et le chemin du dérivé géré. L’inférence avant copie combine taille (40 points), date (30), nom principal ou de l’asset (20) et profondeur (10). Le chemin départage les égalités. Un choix valide mémorisé n’est pas reclassé à chaque sauvegarde.
 
-Le travail courant impose le `.blend` unique, la scène active entière et les modificateurs actifs évalués. Les anciens champs restent désérialisables et les configurations historiques ne sont pas réécrites.
+Le principal pilote la synchronisation automatique de la scène active entière, avec modificateurs évalués. Les autres sources sont préparées à la demande. `ExportConfig.primaryFile` conserve le choix, `generatedGlbFile` optionnel identifie le dérivé géré ; une collision avec un GLB utilisateur donne un nouveau nom `.edge-lock` suffixé si nécessaire. Les anciens champs restent désérialisables et les configurations historiques ne sont pas réécrites.
 
 Le worker `generate` ouvre une copie cohérente avec les scripts désactivés, rebase les références en mémoire et applique les modificateurs à l’export. Aucun chemin d’export ou de génération ne sauvegarde le `.blend`. Seule l’opération explicite `create` écrit un nouveau fichier dans un dossier neuf.
 
@@ -44,17 +44,17 @@ Les contrats utilisent `camelCase`. `get_workspace_status(variantId)` et `edge-l
 
 La fiche s’abonne avant sa lecture initiale, ignore les révisions anciennes et recharge l’aperçu courant pour un nouvel artefact réussi. Elle garde le dernier affichage pendant le traitement et libère les ressources obsolètes. La clé d’aperçu ne dépend pas du rafraîchissement global du catalogue, évitant les boucles. Les événements courants ne déplacent pas une consultation historique.
 
-Les fichiers et changements sont renouvelés après stabilisation. Le bouton de version utilise l’autorisation backend et reste indisponible pendant vérification, conversion, erreur ou non-conformité. Les contrôles de source/export et de GLB courant ont disparu. Un GLB vide valide affiche un état calme. Les erreurs gardent l’accès au dossier et à Blender et proposent une reprise.
+Les fichiers et changements sont renouvelés après stabilisation. Le bouton de version utilise l’autorisation backend et reste indisponible pendant vérification, conversion, erreur ou non-conformité du principal. Les sélecteurs indépendants d’aperçu et d’export proposent les sources présentes. Le champ `previewFile` accepte un `.blend` ou `.glb` courant/historique ; l’export ajoute `sourceFile` optionnel. Les GLB choisis sont restitués exactement ; les `.blend` choisis sont préparés isolément. Une erreur secondaire ne modifie pas le principal. Un GLB vide valide affiche un état calme.
 
-L’aide permanente de la barre latérale réutilise la modale accessible, sans dépendre d’une bibliothèque active. Elle rappelle le contrat récursif du workspace synchronisé (un `.blend` source et un `.glb` dérivé) et distingue la phase d’import où le GLB peut encore manquer.
+L’aide permanente de la barre latérale réutilise la modale accessible sans bibliothèque active. Elle décrit les sources multiples, les sélections, le principal stable, la conservation historique et les suppressions confirmées.
 
 Le tableau Fichiers filtre uniquement le manifeste déjà chargé, courant ou historique : extension normalisée du nom de fichier, dossiers/sans extension et bornes de taille inclusives en base 1024. Le filtrage précède la pagination de 100 entrées. La sélection asset/variante/version délimite l’état des filtres ; un rafraîchissement de cette même sélection les conserve. Aucune lecture disque, migration ou modification IPC n’est nécessaire.
 
-La galerie lit les dernières PNG via `get_asset_thumbnails`, puis prépare les seules cartes visibles avec un job `thumbnail` à la fois. La première variante représente l’asset ; sa vignette et son aperçu utilisent le même GLB canonique.
+La galerie lit les dernières PNG via `get_asset_thumbnails`, puis prépare les seules cartes visibles avec un job `thumbnail` à la fois. La première variante représente l’asset ; sa vignette utilise le GLB canonique. Le choix local d’aperçu dans la fiche reste indépendant.
 
 ## Versions et compatibilité
 
-Le stockage reconnaît les objets bruts et les objets `.zst`, tous identifiés par le BLAKE3 des octets originaux. `files.rs` centralise compression, décompression bornée et vérification. Le schéma 3 conserve les anciennes entrées sans réduction implicite et empêche les anciennes applications d’ouvrir ce nouveau stockage.
+Le stockage reconnaît les objets bruts et `.zst`, identifiés par le BLAKE3 des octets originaux. `files.rs` centralise compression, décompression bornée et vérification. Le schéma 4 ajoute la propriété des sauvegardes GLB et les reçus durables de suppression. La migration sauvegarde d’abord le catalogue, conserve les versions et interdit leur ouverture par une ancienne application.
 
 `history.rs`, sous-module de la bibliothèque, gère les rôles courant/backup, la conversion en consultation seule, les estimations confirmables, la purge des objets libérés et les journaux de restauration. Les mêmes verrous que les captures sérialisent ces mutations. Les références entre variantes restent valides grâce à des enregistrements de filiation conservés lors des suppressions. Les objets du GLB historique restent hors des caches évictables.
 
@@ -66,11 +66,15 @@ Le diagnostic utilise la bibliothèque déjà ouverte et le verrou de mutation s
 
 L’import copie et valide le dossier dans un staging, génère le GLB, puis publie workspace et première version. L’original reste intact. Nouveau projet et création de variante depuis un historique conforme suivent la même préparation.
 
-Le prédicat commun des changements compare les fichiers et dossiers utilisateur en excluant uniquement les fichiers `.glb`. Les anciennes options d’export ne créent pas de changement artificiel. Le GLB reste inclus dans les manifestes et comptes d’octets.
+Le prédicat commun des changements exclut uniquement les chemins des dérivés gérés identifiés par configuration. Les GLB utilisateur et les changements de principal deviennent versionnables. La surveillance n’assimile plus tous les événements GLB à une publication du worker. Les anciennes options scène/collection ne créent pas de changement artificiel.
 
 La création backend synchronise puis capture le workspace. Les sources et le GLB capturés doivent correspondre au reçu : une sauvegarde externe entre conversion et capture entraîne un nouvel essai puis un refus si le projet reste instable. La porte d’opération protège contre les opérations Edge Lock concurrentes ; les empreintes protègent contre Blender.
 
-Les anciens assets non conformes ne sont ni supprimés ni réorganisés. Les historiques restent lisibles ; synchronisation et nouvelles versions sont bloquées avec diagnostic. Les aperçus historiques utilisent les données immuables ; les nouvelles générations GLB appliquent toujours les modificateurs. Les reçus restent régénérables ; le stockage historique utilise le schéma 3.
+Les anciens assets ne sont ni supprimés ni réorganisés. Un reçu valide conserve le chemin du dérivé historique. Les anciens dossiers contenant plusieurs modèles sont désormais acceptés. Le principal d’un snapshot reste figé ; ses dates de matérialisation ne servent pas à une nouvelle inférence. L’allègement conserve tous les GLB valides et autonomes ; un échec de validation conserve le snapshot complet.
+
+`archives.rs` prépare les suppressions définitives sous jeton, déplace les workspaces dans un staging journalisé puis retire leurs références dans une transaction. Un reçu SQL authentifie le journal après commit. Avant commit, la récupération restaure les dossiers ; après commit, elle reprend le nettoyage idempotent. Les objets et caches partagés sont conservés tant qu’un survivant les utilise. Les anciennes sauvegardes communes sans propriétaire restent signalées. Les jobs `archiveDeletionPlan`/`archiveDeletionApply` réutilisent la porte d’opération ; les ressources et états de surveillance des variantes supprimées sont révoqués.
+
+`delete_category` supprime une branche et archive ses assets transactionnellement. `delete_game` archive tous les assets associés et retire uniquement les liens au projet supprimé. L’interface réutilise les modales et styles de confirmation existants.
 
 ## Ressources et rendu
 
@@ -86,4 +90,4 @@ La fiche et la capture PNG partagent les mêmes bounds de géométrie visible po
 
 Aperçus historiques, exports, GLB canoniques et vignettes partagent le budget de 2 Gio ; les ressources actives sont protégées. Les reçus ne certifient un artefact que si ses empreintes correspondent. Les anciennes préférences de GLB courant ne pilotent plus la synchronisation.
 
-L’inspecteur GLB vérifie structure, plages, scène et autonomie des ressources. Les budgets de lecture 3D ne bloquent pas le versionnage d’un GLB canonique valide. Le comptage des arêtes reste borné et peut être indisponible. Les shaders procéduraux, simulations et dépendances externes non capturées restent des limites documentées.
+L’inspecteur GLB vérifie structure, plages, scène et autonomie des ressources. Les plafonds de taille GLB, géométrie, textures et JSON ont été retirés du cœur, du transport et du lecteur. Les contraintes du format, allocations réelles et capacités WebGL restent applicables. Le comptage des arêtes reste borné et peut être indisponible sans bloquer l’aperçu. Les limites PNG des vignettes et le budget de cache restent distincts. Les shaders procéduraux, simulations et dépendances externes non capturées restent des limites documentées.

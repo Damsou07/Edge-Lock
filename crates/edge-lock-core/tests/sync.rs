@@ -88,6 +88,110 @@ fn hash(path: &Path) -> String {
     blake3::hash(&fs::read(path).unwrap()).to_hex().to_string()
 }
 
+fn empty_glb(path: &Path, label: &str) {
+    let mut json = serde_json::to_vec(&serde_json::json!({"asset":{"version":"2.0","generator":label},"scenes":[{"nodes":[]}],"scene":0})).unwrap();
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let mut bytes = b"glTF".to_vec();
+    bytes.extend(2u32.to_le_bytes());
+    bytes.extend((20 + json.len() as u32).to_le_bytes());
+    bytes.extend((json.len() as u32).to_le_bytes());
+    bytes.extend(0x4e4f534au32.to_le_bytes());
+    bytes.extend(json);
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+#[ignore = "requires explicitly configured Blender; uses disposable fixtures only"]
+fn multiple_models_preserve_user_glbs_and_version_secondary_edits_without_regenerating() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/blender-tests");
+    fs::create_dir_all(&directory).unwrap();
+    let root = tempfile::tempdir_in(directory).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    run_fixture(root.path(), &source.join("main.blend"), "create");
+    fs::copy(source.join("main.blend"), source.join("secondary.blend")).unwrap();
+    for (name, timestamp) in [("main.blend", 20), ("secondary.blend", 10)] {
+        fs::File::options()
+            .write(true)
+            .open(source.join(name))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            ))
+            .unwrap();
+    }
+    empty_glb(&source.join("main.glb"), "user main");
+    empty_glb(&source.join("secondary.glb"), "user secondary");
+    let original_main_glb = fs::read(source.join("main.glb")).unwrap();
+    let original_secondary_glb = fs::read(source.join("secondary.glb")).unwrap();
+    let library = Library::open(root.path().join("library")).unwrap();
+    let runner = BlenderRunner::new(executable());
+    let ctx = OperationContext::default();
+    let asset = sync::import_project(&library, &source, "Multiple", &runner, &ctx).unwrap();
+    let variant = &asset.variants[0];
+    assert_eq!(variant.config.primary_file.as_deref(), Some("main.blend"));
+    assert_eq!(
+        variant.config.generated_glb_file.as_deref(),
+        Some("main.edge-lock.glb")
+    );
+    let work = Path::new(&variant.workspace_path);
+    assert_eq!(fs::read(work.join("main.glb")).unwrap(), original_main_glb);
+    assert_eq!(
+        fs::read(work.join("secondary.glb")).unwrap(),
+        original_secondary_glb
+    );
+    let generated = hash(&work.join("main.edge-lock.glb"));
+    // A secondary blend can even be temporarily unreadable by Blender: only the principal is synchronized.
+    fs::write(
+        work.join("secondary.blend"),
+        b"independent work in progress",
+    )
+    .unwrap();
+    assert!(
+        sync::synchronize_variant(&library, &variant.id, None, &ctx)
+            .unwrap()
+            .source_changed
+    );
+    let second =
+        sync::create_snapshot(&library, &variant.id, "Secondary blend edit", None, &ctx).unwrap();
+    empty_glb(&work.join("secondary.glb"), "user secondary updated");
+    assert!(
+        sync::synchronize_variant(&library, &variant.id, None, &ctx)
+            .unwrap()
+            .source_changed
+    );
+    sync::create_snapshot(&library, &variant.id, "Secondary GLB edit", None, &ctx).unwrap();
+    assert_eq!(hash(&work.join("main.edge-lock.glb")), generated);
+    assert_eq!(
+        fs::read(source.join("main.glb")).unwrap(),
+        original_main_glb
+    );
+    assert_eq!(
+        fs::read(source.join("secondary.glb")).unwrap(),
+        original_secondary_glb
+    );
+    // The initial state has rotated to consultation and retains every model GLB.
+    let compact = library.get_snapshot(&variant.head_snapshot_id).unwrap();
+    assert_eq!(compact.storage.kind, "preview");
+    assert_eq!(compact.entries.len(), 3);
+    assert_eq!(
+        library.get_snapshot(&second.id).unwrap().storage.kind,
+        "full"
+    );
+    let extracted = root.path().join("historical-secondary.glb");
+    library
+        .extract_snapshot_file(&compact.id, "secondary.glb", &extracted, &ctx)
+        .unwrap();
+    assert_eq!(fs::read(extracted).unwrap(), original_secondary_glb);
+}
+
 #[test]
 #[ignore = "requires explicitly configured Blender; uses disposable fixtures only"]
 fn import_save_sync_snapshot_and_historical_fork_keep_sources_editable_and_glbs_current() {

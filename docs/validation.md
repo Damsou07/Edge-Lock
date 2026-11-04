@@ -1,6 +1,44 @@
-# Validation du MVP
+# Validation d’Edge Lock
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Les bilans du 3 novembre 2026 concernent l’export des personnages avec morphs, l’aide, les filtres de fichiers, le diagnostic global du stockage, Zstd et la gestion de l’historique dans le checkout de développement 0.2.0. Les bilans précédents sont conservés comme historique ; leurs installateurs et hashes ne contiennent pas cette implémentation.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le bilan du 4 novembre 2026 concerne Edge Lock 0.3.0. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas cette implémentation.
+
+## Sources multiples et suppression des archives — 4 novembre 2026
+
+### TDD et données
+
+Les nouveaux comportements ont été constatés en échec avant correction : choix d’aperçu/export/principal dans l’interface, suppression confirmée des archives et des catégories, plafonds GLB/JSON/textures, principal et propriété du dérivé, versionnage des fichiers secondaires, conservation des GLB historiques, annulation des ressources et perte du contexte graphique. La revue a ajouté des régressions pour la redétection du même principal après perte du reçu, les modèles utilisateur préfixés `.edge-lock-`, les préférences d’aperçu par snapshot et les reçus anciens incohérents.
+
+`cargo test --workspace --locked` réussit : **121 tests Rust ordinaires**, dont les contrats Tauri, migration 3→4, récupération après interruption, références partagées, sauvegardes GLB à plusieurs propriétaires et refus d’un journal modifié. Les tests de suppression couvrent un fichier verrouillé après commit, la reprise répétée et un workspace recréé à son ancien chemin. Les temporaires sont isolés sous `.test-data/validation-temp` ; les avertissements de liens physiques du cache incrémental entraînent une copie sans affecter les résultats.
+
+Les **23 intégrations Blender 5.1.1 passent** : 17 tests du worker, quatre du cache et deux de synchronisation. Elles ont été exécutées directement depuis les exécutables de tests compilés, avec `--ignored --test-threads=1` et `EDGE_LOCK_TEST_BLENDER` configuré. Les **cinq tests Node des fixtures passent**, y compris création/sauvegarde réelle du Mirror et vérification des PNG du modèle de stress. Le benchmark de stockage de 1 000 assets et le test opt-in de junction Windows ne sont pas exécutés pour cette évolution ; les helpers ignorés d’arrêt brutal sont invoqués par leurs tests parents.
+
+La migration sauvegarde le catalogue existant avant transaction, conserve les objets bruts/Zstd, tags, variantes et historiques, et ajoute le suivi de propriété des backups et les reçus de suppression. Les anciennes sauvegardes communes non attribuables restent conservées et signalées. Aucune bibliothèque personnelle n’est utilisée comme fixture.
+
+### Application Windows et aperçu volumineux
+
+Le rapport final `.test-data/desktop-Yfyzop/report.json` est **`passed` pour 17 groupes de vérifications**, en environ 163 secondes, sur le binaire debug final indiqué ci-dessous, avec bibliothèque, réglages et profil WebView jetables. Il couvre les parcours existants et les nouveaux choix `.blend`/`.glb`, exports exacts, changement/redétection du principal, version multimodèle, suppression de branche, projet partagé, suppression définitive individuelle et vidage global malgré une recherche sans résultat. Les annulations des confirmations conservent les assets. Le benchmark indépendant de 50 imports est explicitement omis par `EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1`. Un premier passage complet avait également réussi dans `.test-data/desktop-iw0kqB` avant les derniers garde-fous.
+
+Un GLB synthétique de 3 152 548 octets contient **33 textures PNG distinctes de 2048 × 2048**, toutes utilisées par des triangles visibles, soit **553 648 128 octets / 528 Mio RGBA décompressés**. L’interface le charge et l’affiche en **3 693 ms** lors du passage final, avec `EDGE_LOCK_E2E_STRESS_TEXTURES=1`. La capture `preview-textures-over-512mib-1440.png` a été inspectée. Cette mesure reproduit et dépasse l’ancien plafond de 512 Mio sans décodage massif dans les tests unitaires.
+
+La somme des working sets de l’application et de ses six processus WebView passe de **624 463 872** à **1 802 387 456 octets** pendant ce rendu. Cette mesure exclut la mémoire GPU et peut compter plusieurs fois des pages partagées ; elle ne constitue pas une exigence minimale ni une garantie de performance. Les capacités réelles RAM/GPU restent déterminantes.
+
+Les captures d’aide, fiche, sources et confirmations à 1440 et 1024 pixels ont été inspectées. Les contrôles restent lisibles dans le thème existant. Le premier lancement du pilote localhost a été bloqué par le sandbox ; le parcours réussi a utilisé son autorisation locale hors sandbox. Une première exécution avait ensuite révélé une confusion du harness entre erreur IPC `not_found` attendue et erreur de protocole WebDriver ; le wrapper a été corrigé avant le passage final réussi.
+
+### Livraison
+
+**141 tests frontend passent dans 17 fichiers** avec `npm test -- --maxWorkers=2`. Les contrôles ESLint, TypeScript, Prettier global, `cargo fmt --all --check`, Clippy de toutes les cibles avec `-D warnings` et `git diff --check` passent. Les builds Vite et Tauri debug/release réussissent. La réconciliation conserve le modèle GPU déjà chargé lorsque la clé d’artefact est identique ; le jeton reçu en doublon est libéré. Une lecture de miniatures est sérialisée avec les suppressions pour empêcher la recréation tardive d’un jeton supprimé.
+
+Une exécution frontend sous charge avait révélé une lecture de catalogue supplémentaire provoquée par le debounce d’une recherche inchangée. La mise à jour d’état est désormais évitée dans ce cas et la suite complète repasse. Les premiers contrôles Clippy ont aussi conduit à simplifier les paramètres de génération et à retirer des clones/unwrap inutiles. Un lancement concurrent d’un exécutable de test Blender avait empêché son réédition de liens sous Windows ; la suite Rust finale a été relancée après sa fermeture et réussit intégralement.
+
+L’empaquetage NSIS a nécessité l’accès au composant officiel, initialement bloqué par le réseau restreint puis réussi après autorisation. L’installation et la mise à niveau sur une VM ou Windows Sandbox restent à vérifier : Windows Sandbox n’est pas disponible sur ce poste. La migration des données est vérifiée sur une bibliothèque synthétique ; aucun installateur n’est exécuté sur l’installation personnelle.
+
+Les versions fichier et produit des trois artefacts indiquent **Edge Lock 0.3.0**. Les applications sont PE x64 (`0x8664`) ; le bootstrap NSIS est PE x86 (`0x014C`) et cible l’application x64. Les octets du worker Blender courant sont présents dans les deux exécutables. Le rapport local est `.test-data/release-verification-030.json`.
+
+| Artefact | Octets | SHA-256 |
+| --- | ---: | --- |
+| `target/debug/edge-lock.exe` | 25 447 424 | `74C5CB3F17714D7A40F7590675DE77E48AA6DDC4396BA3396243420AF64AA1B5` |
+| `target/release/edge-lock.exe` | 18 001 408 | `424EBB0DE469D70D30817AAACE6F7E34314E2F5F145119F5435396941300D406` |
+| `target/release/bundle/nsis/Edge Lock_0.3.0_x64-setup.exe` | 6 709 643 | `4B95B06647D5A9B74AAA04B042F92ECBD59AE195520F6A7DAFF17C2CFD272B1C` |
 
 ## Export des personnages, aide et filtres — 3 novembre 2026
 

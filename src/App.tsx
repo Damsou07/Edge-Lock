@@ -19,6 +19,9 @@ import {
 import { AssetDetailView } from "./components/AssetDetailView";
 import { StorageOptimizationView } from "./components/StorageOptimizationView";
 import { HelpModal } from "./components/HelpModal";
+import { ArchiveDeletionModal } from "./components/ArchiveDeletionModal";
+import { TaxonomyDeletionModal } from "./components/TaxonomyDeletionModal";
+import type { TaxonomyDeletionTarget } from "./components/TaxonomyDeletionModal";
 import {
   errorMessage,
   formatBytes,
@@ -47,12 +50,14 @@ function CategoryTree({
   parentId = null,
   selected,
   onSelect,
+  onDelete,
   depth = 0,
 }: {
   categories: Category[];
   parentId?: string | null;
   selected: string | null;
   onSelect: (id: string) => void;
+  onDelete: (target: TaxonomyDeletionTarget) => void;
   depth?: number;
 }) {
   if (depth > 12) return null;
@@ -60,19 +65,35 @@ function CategoryTree({
     .filter((category) => category.parentId === parentId)
     .map((category) => (
       <div key={category.id}>
-        <button
-          className={`nav-item category-item ${selected === category.id ? "active" : ""}`}
-          style={{ paddingLeft: 15 + depth * 16 }}
-          onClick={() => onSelect(category.id)}
-        >
-          <Icon name="folder" size={16} />
-          <span>{category.name}</span>
-        </button>
+        <div className="nav-taxonomy-row">
+          <button
+            className={`nav-item category-item ${selected === category.id ? "active" : ""}`}
+            style={{ paddingLeft: 15 + depth * 16 }}
+            onClick={() => onSelect(category.id)}
+          >
+            <Icon name="folder" size={16} />
+            <span>{category.name}</span>
+          </button>
+          <button
+            className="icon-button taxonomy-delete"
+            aria-label={`Supprimer la catégorie ${category.name}`}
+            onClick={() =>
+              onDelete({
+                kind: "category",
+                id: category.id,
+                name: category.name,
+              })
+            }
+          >
+            <Icon name="trash" size={14} />
+          </button>
+        </div>
         <CategoryTree
           categories={categories}
           parentId={category.id}
           selected={selected}
           onSelect={onSelect}
+          onDelete={onDelete}
           depth={depth + 1}
         />
       </div>
@@ -199,6 +220,11 @@ export default function App() {
     "import" | "create" | "settings" | "category" | "game" | "help" | null
   >(null);
   const [importSource, setImportSource] = useState("");
+  const [archiveDeletion, setArchiveDeletion] = useState<{
+    assetId?: string;
+  } | null>(null);
+  const [taxonomyDeletion, setTaxonomyDeletion] =
+    useState<TaxonomyDeletionTarget | null>(null);
   const [generation, setGeneration] = useState(0);
   const { jobs, runJob: runBaseJob, dismiss } = useJobs();
   const library = bootstrap?.library;
@@ -211,7 +237,13 @@ export default function App() {
   } = useAssetThumbnails(
     page.items,
     library?.root,
-    !!library && section === "assets" && !selected && !modal && !opening,
+    !!library &&
+      section === "assets" &&
+      !selected &&
+      !modal &&
+      !opening &&
+      !archiveDeletion &&
+      !taxonomyDeletion,
     runBaseJob,
   );
   const refresh = useCallback(() => setGeneration((value) => value + 1), []);
@@ -325,7 +357,12 @@ export default function App() {
   }, []);
   useEffect(() => {
     const timer = setTimeout(
-      () => setFilter((previous) => ({ ...previous, search, offset: 0 })),
+      () =>
+        setFilter((previous) =>
+          previous.search === search
+            ? previous
+            : { ...previous, search, offset: 0 },
+        ),
       220,
     );
     return () => clearTimeout(timer);
@@ -342,7 +379,7 @@ export default function App() {
           setError("Déposez un seul dossier à la fois.");
           return;
         }
-        if (modal) {
+        if (modal || archiveDeletion || taxonomyDeletion) {
           setError("Fermez le formulaire ouvert avant de déposer un dossier.");
           return;
         }
@@ -361,7 +398,7 @@ export default function App() {
       active = false;
       unlisten?.();
     };
-  }, [library, modal]);
+  }, [library, modal, archiveDeletion, taxonomyDeletion]);
   useEffect(() => {
     if (!library) return;
     let active = true;
@@ -413,7 +450,7 @@ export default function App() {
           },
           library: value,
           startupError: null,
-          version: previous?.version ?? "0.1.0",
+          version: previous?.version ?? "0.3.0",
         }));
         setSelected(null);
         setSection("assets");
@@ -519,6 +556,7 @@ export default function App() {
           <CategoryTree
             categories={taxonomy.categories}
             selected={section === "assets" ? filter.categoryId : null}
+            onDelete={setTaxonomyDeletion}
             onSelect={(id) =>
               changeFilter({ categoryId: id, gameId: null, archived: false })
             }
@@ -538,20 +576,34 @@ export default function App() {
             </button>
           </div>
           {taxonomy.games.map((game) => (
-            <button
-              key={game.id}
-              className={`nav-item ${section === "assets" && filter.gameId === game.id ? "active" : ""}`}
-              onClick={() =>
-                changeFilter({
-                  gameId: game.id,
-                  categoryId: null,
-                  archived: false,
-                })
-              }
-            >
-              <Icon name="game" size={17} />
-              <span>{game.name}</span>
-            </button>
+            <div key={game.id} className="nav-taxonomy-row">
+              <button
+                className={`nav-item ${section === "assets" && filter.gameId === game.id ? "active" : ""}`}
+                onClick={() =>
+                  changeFilter({
+                    gameId: game.id,
+                    categoryId: null,
+                    archived: false,
+                  })
+                }
+              >
+                <Icon name="game" size={17} />
+                <span>{game.name}</span>
+              </button>
+              <button
+                className="icon-button taxonomy-delete"
+                aria-label={`Supprimer le projet de jeu ${game.name}`}
+                onClick={() =>
+                  setTaxonomyDeletion({
+                    kind: "game",
+                    id: game.id,
+                    name: game.name,
+                  })
+                }
+              >
+                <Icon name="trash" size={14} />
+              </button>
+            </div>
           ))}
           {!taxonomy.games.length && (
             <p className="sidebar-hint">Retrouvez les assets de vos jeux.</p>
@@ -605,7 +657,7 @@ export default function App() {
           <button className="nav-item" onClick={() => setModal("settings")}>
             <Icon name="settings" size={17} />
             <span>Réglages</span>
-            <span className="version">v{bootstrap?.version ?? "0.1.0"}</span>
+            <span className="version">v{bootstrap?.version ?? "0.3.0"}</span>
           </button>
         </div>
       </aside>
@@ -719,6 +771,7 @@ export default function App() {
             generation={generation}
             onBack={() => setSelected(null)}
             onChanged={refresh}
+            onDeleteRequested={() => setArchiveDeletion({ assetId: selected })}
             onError={setError}
             runJob={runJob}
           />
@@ -738,6 +791,15 @@ export default function App() {
                 </p>
               </div>
               <div className="heading-actions">
+                {filter.archived && (
+                  <button
+                    className="button danger"
+                    onClick={() => setArchiveDeletion({})}
+                  >
+                    <Icon name="trash" />
+                    Vider les archives
+                  </button>
+                )}
                 <button
                   className="button secondary"
                   onClick={() => setModal("import")}
@@ -943,6 +1005,37 @@ export default function App() {
         )}
       </main>
       <Jobs jobs={jobs} dismiss={dismiss} onError={setError} />
+      {archiveDeletion && (
+        <ArchiveDeletionModal
+          key={library?.root}
+          {...archiveDeletion}
+          runJob={runJob}
+          onClose={() => setArchiveDeletion(null)}
+          onDeleted={() => {
+            setSelected(null);
+            setFilter((previous) => ({ ...previous, offset: 0 }));
+            refresh();
+            void api
+              .bootstrap()
+              .then(setBootstrap)
+              .catch((reason: unknown) => setError(errorMessage(reason)));
+          }}
+        />
+      )}
+      {taxonomyDeletion && (
+        <TaxonomyDeletionModal
+          target={taxonomyDeletion}
+          onClose={() => setTaxonomyDeletion(null)}
+          onDeleted={() => {
+            resetFilters();
+            refresh();
+            void api
+              .bootstrap()
+              .then(setBootstrap)
+              .catch((reason: unknown) => setError(errorMessage(reason)));
+          }}
+        />
+      )}
       {modal === "help" && <HelpModal onClose={() => setModal(null)} />}
       {(modal === "import" || modal === "create") && (
         <CreateAssetModal
@@ -969,7 +1062,7 @@ export default function App() {
             bootstrap?.settings ?? { libraryPath: null, blenderPath: null }
           }
           libraryPath={library?.root ?? null}
-          version={bootstrap?.version ?? "0.1.0"}
+          version={bootstrap?.version ?? "0.3.0"}
           onClose={() => setModal(null)}
           onChanged={(path) =>
             setBootstrap((previous) =>

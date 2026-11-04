@@ -53,6 +53,51 @@ fn version(library: &Library, id: &str, work: &Path, n: u8) -> edge_lock_core::S
 }
 
 #[test]
+fn compaction_keeps_every_autonomous_glb_and_its_exact_bytes() {
+    let (temp, library, id, work) = fixture();
+    let ctx = OperationContext::default();
+    glb(&work.join("secondary.glb"), "secondary model");
+    fs::write(work.join("secondary.blend"), b"second editable source").unwrap();
+    let multiple = library
+        .create_snapshot(&id, "Multiple models", &ctx)
+        .unwrap();
+    let expected = fs::read(work.join("secondary.glb")).unwrap();
+    version(&library, &id, &work, 3);
+    version(&library, &id, &work, 4);
+    let compact = library.get_snapshot(&multiple.id).unwrap();
+    assert_eq!(compact.storage.kind, "preview");
+    assert_eq!(compact.entries.len(), 2);
+    assert!(
+        compact
+            .entries
+            .iter()
+            .all(|entry| entry.path.ends_with(".glb"))
+    );
+    let output = temp.path().join("secondary-historical.glb");
+    library
+        .extract_snapshot_file(&multiple.id, "secondary.glb", &output, &ctx)
+        .unwrap();
+    assert_eq!(fs::read(output).unwrap(), expected);
+    let backup = library
+        .preview_storage_action(&id, StorageAction::ReleaseBackup, None, &ctx)
+        .unwrap();
+    let applied = library
+        .apply_storage_action(
+            &id,
+            StorageAction::ReleaseBackup,
+            None,
+            &backup.plan_token,
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(backup.reclaimable_bytes, applied.released_bytes);
+    let head = library.get_variant(&id).unwrap().variant;
+    let preview = library.get_snapshot(&multiple.id).unwrap();
+    assert_eq!(preview.entries.len(), 2);
+    assert_eq!(head.backup_snapshot_id, None);
+}
+
+#[test]
 fn global_actions_work_without_any_variant_and_keep_legacy_calls_compatible() {
     let empty = tempfile::tempdir().unwrap();
     let library = Library::open(empty.path().join("library")).unwrap();

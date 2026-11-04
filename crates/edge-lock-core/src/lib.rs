@@ -9,4 +9,6 @@ pub mod preview;
 pub mod sync;
 
 pub use domain::*;
-pub use library::{Library, StorageAction};
+pub use library::{
+    ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, Library, StorageAction,
+};

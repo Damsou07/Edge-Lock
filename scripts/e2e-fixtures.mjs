@@ -1,7 +1,7 @@
 import { deflateSync } from "node:zlib";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { BoxGeometry } from "three";
 
 /** Run only disposable fixture authoring in a private Blender process. */
@@ -169,6 +169,142 @@ function contrastingPng() {
     pngChunk("IDAT", deflateSync(pixels)),
     pngChunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+function stressTexturePng(size, index) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(size, 0);
+  header.writeUInt32BE(size, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const stride = 1 + size * 4;
+  const split = 1 + (size / 2) * 4;
+  const color = Buffer.from([
+    (48 + index * 7) % 256,
+    (96 + index * 11) % 256,
+    (144 + index * 13) % 256,
+    255,
+  ]);
+  const contrasting = Buffer.from([color[1], color[2], color[0], 255]);
+  const upper = Buffer.alloc(stride);
+  const lower = Buffer.alloc(stride);
+  upper.fill(color, 1, split);
+  upper.fill(contrasting, split);
+  lower.fill(contrasting, 1, split);
+  lower.fill(color, split);
+  // Only one uncompressed image is authored at a time; retain compressed PNGs.
+  const pixels = Buffer.allocUnsafe(size * stride);
+  for (let y = 0; y < size; y++)
+    (y < size / 2 ? upper : lower).copy(pixels, y * stride);
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(pixels, { level: 1 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+/** Real decoded texture regression: 33 independently used PNGs, 528 MiB RGBA. */
+export async function prepareTextureStressFixture(destination) {
+  const textureCount = 33;
+  const textureWidth = 2048;
+  const textureHeight = 2048;
+  const floatBytes = (values) => {
+    const bytes = Buffer.alloc(values.length * 4);
+    values.forEach((value, index) => bytes.writeFloatLE(value, index * 4));
+    return bytes;
+  };
+  const parts = [
+    floatBytes([-0.45, -0.45, 0, 0.45, -0.45, 0, 0, 0.45, 0]),
+    floatBytes([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+    floatBytes([0, 0, 1, 0, 0.5, 1]),
+  ];
+  for (let index = 0; index < textureCount; index++)
+    parts.push(stressTexturePng(textureWidth, index));
+  const bufferViews = [];
+  let offset = 0;
+  for (const part of parts) {
+    bufferViews.push({
+      buffer: 0,
+      byteOffset: offset,
+      byteLength: part.length,
+    });
+    offset += Math.ceil(part.length / 4) * 4;
+  }
+  const binary = Buffer.alloc(offset);
+  parts.forEach((part, index) =>
+    part.copy(binary, bufferViews[index].byteOffset),
+  );
+  const indices = Array.from({ length: textureCount }, (_, index) => index);
+  const glb = encodeGlb(
+    {
+      asset: {
+        version: "2.0",
+        generator: "Edge Lock disposable texture stress fixture",
+      },
+      scene: 0,
+      scenes: [{ nodes: indices }],
+      nodes: indices.map((index) => ({
+        mesh: index,
+        name: `Texture ${index + 1}`,
+        translation: [
+          ((index % 6) - 2.5) * 1.1,
+          (2.5 - Math.floor(index / 6)) * 1.1,
+          0,
+        ],
+      })),
+      meshes: indices.map((index) => ({
+        primitives: [
+          {
+            attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 },
+            material: index,
+          },
+        ],
+      })),
+      materials: indices.map((index) => ({
+        doubleSided: true,
+        pbrMetallicRoughness: {
+          baseColorFactor: [1, 1, 1, 1],
+          baseColorTexture: { index },
+          metallicFactor: 0,
+          roughnessFactor: 1,
+        },
+      })),
+      textures: indices.map((index) => ({ sampler: 0, source: index })),
+      // Nearest filtering avoids the additional one-third GPU memory of mipmaps.
+      samplers: [
+        { magFilter: 9728, minFilter: 9728, wrapS: 33071, wrapT: 33071 },
+      ],
+      images: indices.map((index) => ({
+        bufferView: index + 3,
+        mimeType: "image/png",
+      })),
+      buffers: [{ byteLength: binary.length }],
+      bufferViews,
+      accessors: [
+        {
+          bufferView: 0,
+          componentType: 5126,
+          count: 3,
+          type: "VEC3",
+          min: [-0.45, -0.45, 0],
+          max: [0.45, 0.45, 0],
+        },
+        { bufferView: 1, componentType: 5126, count: 3, type: "VEC3" },
+        { bufferView: 2, componentType: 5126, count: 3, type: "VEC2" },
+      ],
+    },
+    binary,
+  );
+  await mkdir(dirname(destination), { recursive: true });
+  await writeFile(destination, glb);
+  return {
+    path: destination,
+    textureCount,
+    textureWidth,
+    textureHeight,
+    decodedTextureBytes: textureCount * textureWidth * textureHeight * 4,
+  };
 }
 
 /** A white material can only show red and green when the embedded texture loads. */

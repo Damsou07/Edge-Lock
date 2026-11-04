@@ -412,11 +412,7 @@ impl BlenderRunner {
         }
         let workspace = fs::canonicalize(workspace)?;
         let logical_workspace = logical_workspace.map(absolute_logical_path).transpose()?;
-        let blend_file = if operation == "generate" {
-            primary_blend(&workspace, &ExportConfig::default())?
-        } else {
-            primary_blend(&workspace, config)?
-        };
+        let blend_file = primary_blend(&workspace, config)?;
         let parent = destination
             .parent()
             .ok_or_else(|| CoreError::Invalid("Destination d'export invalide.".into()))?;

@@ -90,8 +90,8 @@ export function CreateAssetModal({
             </label>
             <p className="field-help">
               Une copie complète est créée dans Edge Lock. Le dossier source
-              reste intact. Un seul fichier .blend est requis ; son GLB est
-              généré automatiquement avec les modificateurs.
+              reste intact. Au moins un fichier .blend est requis ; le GLB du
+              principal est généré automatiquement avec les modificateurs.
             </p>
           </>
         )}

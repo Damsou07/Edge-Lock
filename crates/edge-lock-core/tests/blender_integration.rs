@@ -53,7 +53,7 @@ fn rejects_ambiguous_or_escaping_primary_file_before_launch() {
             &directory.path().join("canonical.glb"),
             &context,
         ),
-        Err(CoreError::Invalid(_))
+        Err(CoreError::External(_))
     ));
     let config = ExportConfig {
         primary_file: Some("../outside.blend".into()),

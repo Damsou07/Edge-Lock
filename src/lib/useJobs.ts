@@ -61,7 +61,7 @@ export function useJobs() {
             await cancellation;
             if (
               job.status === "completed" &&
-              request.kind === "thumbnail" &&
+              (request.kind === "thumbnail" || request.kind === "preview") &&
               typeof job.result === "object" &&
               job.result !== null &&
               "resourceToken" in job.result &&

@@ -314,6 +314,34 @@ code {
   background-color: #8bdef71c;
   color: var(--text);
 }
+.nav-taxonomy-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.nav-taxonomy-row > .nav-item {
+  flex: 1;
+  min-width: 0;
+}
+.taxonomy-delete {
+  flex: 0 0 26px;
+  color: var(--pink-text);
+}
+.button.danger {
+  color: var(--pink-text);
+  border: 1px solid var(--pink-soft);
+  background: linear-gradient(145deg, #ee268f20, #243e58);
+}
+.button.danger:hover {
+  background-color: #ee268f33;
+}
+.heading-actions {
+  flex-wrap: wrap;
+}
+.config-form select {
+  width: 100%;
+  min-width: 0;
+}
 .nav-item.active {
   background: linear-gradient(100deg, #7bdcff29, #82b8e01a);
   color: var(--blue);

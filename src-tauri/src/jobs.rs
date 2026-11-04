@@ -24,6 +24,13 @@ use tauri::{AppHandle, Emitter};
     rename_all_fields = "camelCase"
 )]
 pub enum JobRequest {
+    ArchiveDeletionPlan {
+        asset_id: Option<String>,
+    },
+    ArchiveDeletionApply {
+        asset_id: Option<String>,
+        plan_token: String,
+    },
     StorageDiagnostic,
     StoragePlan {
         variant_id: Option<String>,
@@ -67,6 +74,7 @@ pub enum JobRequest {
     Preview {
         variant_id: String,
         snapshot_id: Option<String>,
+        #[serde(alias = "sourceFile")]
         preview_file: Option<String>,
     },
     Thumbnail {
@@ -75,6 +83,7 @@ pub enum JobRequest {
     Export {
         variant_id: String,
         snapshot_id: Option<String>,
+        source_file: Option<String>,
         destination: String,
         overwrite: bool,
     },
@@ -82,6 +91,8 @@ pub enum JobRequest {
 impl JobRequest {
     fn kind(&self) -> &str {
         match self {
+            Self::ArchiveDeletionPlan { .. } => "archiveDeletionPlan",
+            Self::ArchiveDeletionApply { .. } => "archiveDeletionApply",
             Self::StorageDiagnostic => "storageDiagnostic",
             Self::StoragePlan { .. } => "storagePlan",
             Self::StorageApply { .. } => "storageApply",
@@ -283,6 +294,21 @@ fn run(
     ctx: &OperationContext,
 ) -> AppResult<Value> {
     match request {
+        JobRequest::ArchiveDeletionPlan { asset_id } => Ok(serde_json::to_value(
+            library.plan_archive_deletion(asset_id.as_deref(), ctx)?,
+        )?),
+        JobRequest::ArchiveDeletionApply {
+            asset_id,
+            plan_token,
+        } => {
+            let report = library.apply_archive_deletion(asset_id.as_deref(), plan_token, ctx)?;
+            lock(&state.previews)?.revoke_variants(&report.deleted_variant_ids);
+            let mut entries = lock(&state.workspaces)?;
+            for id in &report.deleted_variant_ids {
+                entries.remove(id);
+            }
+            Ok(serde_json::to_value(report)?)
+        }
         JobRequest::StorageDiagnostic => {
             Ok(serde_json::to_value(library.storage_diagnostic(ctx)?)?)
         }
@@ -394,7 +420,7 @@ fn run(
                 )?;
                 return Ok(serde_json::to_value(artifact.inspection)?);
             }
-            let material = prepare(library, variant_id, snapshot_id.as_deref(), ctx)?;
+            let material = prepare(library, variant_id, snapshot_id.as_deref(), None, ctx)?;
             let inspection = inspect(state, &material.path, &material.snapshot.config, ctx)?;
             if snapshot_id.is_none() {
                 library.set_geometry(variant_id, inspection.geometry.triangles)?;
@@ -407,28 +433,24 @@ fn run(
             preview_file,
         } => {
             let blender_path = lock(&state.settings)?.blender_path.clone();
-            let artifact = if snapshot_id.is_none() {
-                current_preview(state, library, variant_id, ctx)?
-            } else {
-                match preview::prepare_preview(
-                    library,
-                    PreviewRequest {
-                        variant_id,
-                        snapshot_id: snapshot_id.as_deref(),
-                        preview_file: preview_file.as_deref(),
-                        blender_path: blender_path.as_deref().map(Path::new),
-                    },
-                    ctx,
-                )? {
-                    PreviewOutcome::Ready(artifact) => artifact,
-                    PreviewOutcome::Choose(candidates) => {
-                        let mut error = AppError::new(
-                            "preview_ambiguous",
-                            "Plusieurs GLB sont disponibles. Choisissez le fichier d’aperçu.",
-                        );
-                        error.details = Some(json!({ "candidates": candidates }));
-                        return Err(error);
-                    }
+            let artifact = match preview::prepare_preview(
+                library,
+                PreviewRequest {
+                    variant_id,
+                    snapshot_id: snapshot_id.as_deref(),
+                    preview_file: preview_file.as_deref(),
+                    blender_path: blender_path.as_deref().map(Path::new),
+                },
+                ctx,
+            )? {
+                PreviewOutcome::Ready(artifact) => artifact,
+                PreviewOutcome::Choose(candidates) => {
+                    let mut error = AppError::new(
+                        "preview_ambiguous",
+                        "Plusieurs GLB sont disponibles. Choisissez le fichier d’aperçu.",
+                    );
+                    error.details = Some(json!({ "candidates": candidates }));
+                    return Err(error);
                 }
             };
             if snapshot_id.is_none() && artifact.updates_geometry {
@@ -437,7 +459,7 @@ fn run(
             let resource = preview_resources::register(
                 state,
                 library,
-                PreviewResource::glb(artifact.path.clone(), None),
+                PreviewResource::glb(artifact.path.clone(), None).with_owner(variant_id),
             )?;
             trim_cache(&library.root().join("cache"), &artifact.path, state);
             Ok(
@@ -493,6 +515,7 @@ fn run(
         JobRequest::Export {
             variant_id,
             snapshot_id,
+            source_file,
             destination,
             overwrite,
         } => {
@@ -514,10 +537,22 @@ fn run(
                     ));
                 }
                 // Historical export serves the saved artifact, without regenerating old sources.
+                if let Some(relative) = source_file
+                    .as_deref()
+                    .filter(|path| is_model_extension(path, "glb"))
+                {
+                    let temp = tempfile::tempdir_in(library.root().join("staging"))?;
+                    let path = temp.path().join("historical.glb");
+                    library.extract_snapshot_file(id, relative, &path, ctx)?;
+                    glb::validate_glb(&path)?;
+                    publish_export(&path, &destination, *overwrite, ctx)?;
+                    return Ok(json!({"path":destination.to_string_lossy()}));
+                }
                 let stored_glb = library.snapshot_glb_path(id);
-                if snapshot.storage.preview_path.is_some()
-                    || snapshot.storage.kind == "preview"
-                    || stored_glb.is_ok()
+                if source_file.is_none()
+                    && (snapshot.storage.preview_path.is_some()
+                        || snapshot.storage.kind == "preview"
+                        || stored_glb.is_ok())
                 {
                     let relative = stored_glb?;
                     let temp = tempfile::tempdir_in(library.root().join("staging"))?;
@@ -528,7 +563,13 @@ fn run(
                     return Ok(json!({"path":destination.to_string_lossy()}));
                 }
             }
-            let material = prepare(library, variant_id, snapshot_id.as_deref(), ctx)?;
+            let material = prepare(
+                library,
+                variant_id,
+                snapshot_id.as_deref(),
+                source_file.as_deref(),
+                ctx,
+            )?;
             let (path, _) = derived_glb(state, library, &material, ctx)?;
             ctx.check_cancelled()?;
             publish_export(&path, &destination, *overwrite, ctx)?;
@@ -546,6 +587,7 @@ fn prepare(
     library: &Library,
     variant_id: &str,
     snapshot_id: Option<&str>,
+    source_file: Option<&str>,
     ctx: &OperationContext,
 ) -> AppResult<Material> {
     let root = library.root();
@@ -567,20 +609,47 @@ fn prepare(
     } else {
         library.capture_working(variant_id, &path, ctx)?
     };
-    if snapshot_id.is_none() {
-        let layout = sync::validate_project(&snapshot.entries)?;
-        snapshot.config = ExportConfig {
-            primary_file: Some(layout.blend_file),
-            scene: None,
-            collection: None,
-            apply_modifiers: true,
-        };
+    if let Some(selected) = source_file {
+        select_export_source(&mut snapshot.config, &snapshot.entries, selected)?;
+    } else if snapshot_id.is_none() {
+        snapshot.config =
+            sync::resolve_project(&path, &snapshot.entries, &snapshot.config)?.config();
     }
     Ok(Material {
         _temporary: temporary,
         path,
         snapshot,
     })
+}
+
+fn is_model_extension(path: &str, extension: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
+fn select_export_source(
+    config: &mut ExportConfig,
+    entries: &[edge_lock_core::ManifestEntry],
+    selected: &str,
+) -> AppResult<()> {
+    if !(is_model_extension(selected, "blend") || is_model_extension(selected, "glb"))
+        || !entries
+            .iter()
+            .any(|entry| entry.kind == "file" && entry.path == selected)
+    {
+        return Err(AppError::new(
+            "invalid",
+            "Choisissez un fichier .blend ou .glb présent dans cette version.",
+        ));
+    }
+    if config.primary_file.as_deref() != Some(selected) {
+        config.scene = None;
+        config.collection = None;
+    }
+    config.primary_file = Some(selected.into());
+    config.apply_modifiers = true;
+    Ok(())
 }
 
 fn primary(workspace: &Path, config: &ExportConfig) -> AppResult<PathBuf> {
@@ -878,6 +947,93 @@ mod tests {
         let thumbnail: JobRequest =
             serde_json::from_value(json!({"kind":"thumbnail","assetId":"asset"})).unwrap();
         assert!(matches!(thumbnail, JobRequest::Thumbnail {asset_id} if asset_id == "asset"));
+    }
+
+    #[test]
+    fn selected_glb_preview_and_exports_preserve_the_exact_current_and_historical_files() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"main blend").unwrap();
+        let glb_bytes = |label: &str| {
+            let mut json =
+                serde_json::to_vec(&json!({"asset":{"version":"2.0"},"extras":{"label":label}}))
+                    .unwrap();
+            while !json.len().is_multiple_of(4) {
+                json.push(b' ');
+            }
+            let mut bytes = b"glTF".to_vec();
+            bytes.extend(2u32.to_le_bytes());
+            bytes.extend(((20 + json.len()) as u32).to_le_bytes());
+            bytes.extend((json.len() as u32).to_le_bytes());
+            bytes.extend(0x4e4f534au32.to_le_bytes());
+            bytes.extend(json);
+            bytes
+        };
+        fs::write(source.join("one.glb"), glb_bytes("one")).unwrap();
+        let historical = glb_bytes("historical");
+        fs::write(source.join("two.glb"), &historical).unwrap();
+        let canonical = "main.generated.glb";
+        fs::write(source.join(canonical), glb_bytes("canonical")).unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let ctx = OperationContext::default();
+        let asset = library
+            .import_folder(
+                &source,
+                "Choices",
+                ExportConfig {
+                    primary_file: Some("main.blend".into()),
+                    generated_glb_file: Some(canonical.into()),
+                    ..ExportConfig::default()
+                },
+                &ctx,
+            )
+            .unwrap();
+        let variant = &asset.variants[0];
+        let state = crate::state::test_state(library.clone());
+        let default_preview: JobRequest =
+            serde_json::from_value(json!({"kind":"preview","variantId":variant.id})).unwrap();
+        assert_eq!(
+            run(&state, &library, &default_preview, &ctx).unwrap()["sourceFile"],
+            canonical
+        );
+        let preview: JobRequest = serde_json::from_value(
+            json!({"kind":"preview","variantId":variant.id,"previewFile":"two.glb"}),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&state, &library, &preview, &ctx).unwrap()["sourceFile"],
+            "two.glb"
+        );
+        let current = glb_bytes("current");
+        fs::write(Path::new(&variant.workspace_path).join("two.glb"), &current).unwrap();
+        for (snapshot_id, expected, name) in [
+            (None, &current, "current.glb"),
+            (
+                Some(&variant.head_snapshot_id),
+                &historical,
+                "historical.glb",
+            ),
+        ] {
+            let destination = root.path().join(name);
+            let request: JobRequest = serde_json::from_value(json!({"kind":"export","variantId":variant.id,"snapshotId":snapshot_id,"sourceFile":"two.glb","destination":destination,"overwrite":false})).unwrap();
+            run(&state, &library, &request, &ctx).unwrap();
+            assert_eq!(fs::read(destination).unwrap(), *expected);
+        }
+        let invalid: JobRequest = serde_json::from_value(
+            json!({"kind":"preview","variantId":variant.id,"previewFile":"../outside.glb"}),
+        )
+        .unwrap();
+        assert!(run(&state, &library, &invalid, &ctx).is_err());
+        assert_eq!(
+            library
+                .get_variant(&variant.id)
+                .unwrap()
+                .variant
+                .config
+                .primary_file,
+            variant.config.primary_file
+        );
     }
 
     #[test]

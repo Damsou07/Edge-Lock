@@ -25,6 +25,8 @@ vi.mock("./api", () => ({
     getAssetThumbnails: vi.fn(),
     releasePreviewResources: vi.fn(),
     invalidateThumbnail: vi.fn(),
+    deleteCategory: vi.fn(),
+    deleteGame: vi.fn(),
   },
 }));
 
@@ -90,6 +92,42 @@ beforeEach(() => {
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("propose le vidage global uniquement dans les archives", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Importer" })).toBeEnabled(),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Vider les archives" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Archives" }));
+    expect(
+      await screen.findByRole("button", { name: "Vider les archives" }),
+    ).toBeInTheDocument();
+  });
+  it("confirme la suppression d’une catégorie avant d’archiver ses assets", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
+    vi.mocked(api.getTaxonomy).mockResolvedValue({
+      categories: [{ id: "cat", name: "Personnages", parentId: null }],
+      games: [],
+      tags: [],
+    });
+    vi.mocked(api.deleteCategory).mockResolvedValue(1);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Supprimer la catégorie Personnages",
+      }),
+    );
+    expect(api.deleteCategory).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/sous-catégories/);
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Supprimer et archiver" }),
+    );
+    await waitFor(() => expect(api.deleteCategory).toHaveBeenCalledWith("cat"));
+  });
   it("ouvre l’aide sans bibliothèque et retrouve le contexte après fermeture", async () => {
     vi.spyOn(HTMLDialogElement.prototype, "showModal").mockImplementation(
       function (this: HTMLDialogElement) {
@@ -110,7 +148,9 @@ describe("bibliothèque Edge Lock", () => {
       name: "Aide et mode d’emploi",
     });
     expect(
-      within(dialog).getByRole("heading", { name: /1 \.blend \+ 1 \.glb/ }),
+      within(dialog).getByRole("heading", {
+        name: "Plusieurs modèles par workspace",
+      }),
     ).toBeInTheDocument();
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Fermer" }),

@@ -16,7 +16,12 @@ import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve, join, relative, isAbsolute, sep } from "node:path";
 import { createHash } from "node:crypto";
-import { prepareBlendFixture, saveMirrorFixture } from "./e2e-fixtures.mjs";
+import {
+  animatedTexturedTriangle,
+  prepareBlendFixture,
+  prepareTextureStressFixture,
+  saveMirrorFixture,
+} from "./e2e-fixtures.mjs";
 
 const root = resolve(".");
 await mkdir(".test-data", { recursive: true });
@@ -103,7 +108,7 @@ async function request(method, path, data) {
     signal: AbortSignal.timeout(120_000),
   });
   const result = await response.json();
-  if (!response.ok || result.value?.error)
+  if (!response.ok || typeof result.value?.error === "string")
     throw new Error(`${method} ${path}: ${JSON.stringify(result)}`);
   return result.value;
 }
@@ -583,10 +588,10 @@ async function testVisualRefreshAndCanonicalRules() {
   await assertBlueButton(".blender-button", "ui-blender-hover.png");
   assert.equal(
     await script('return !!document.querySelector(".config-form");'),
-    false,
+    true,
   );
   report.checks.push(
-    "Thème à 1440/1024/860 px : police locale, logo, grille/liste/tableau/modales ; aucun ancien menu de source ou choix des modificateurs",
+    "Thème à 1440/1024/860 px : police locale, logo, grille/liste/tableau/modales et sélecteurs de fichier principal et de source d’export",
   );
 }
 
@@ -633,42 +638,527 @@ async function testAutomaticMirror(variant) {
   );
 }
 
-async function testStrictImportRules(variant) {
-  const invalidRoot = join(testRoot, "invalid-projects");
-  await mkdir(invalidRoot);
-  for (const [name, files] of [
-    ["GLB seul", ["only.glb"]],
-    ["Deux sources", ["first.blend", "nested/second.blend"]],
-    ["Deux GLB", ["model.blend", "first.glb", "second.glb"]],
-  ]) {
-    const directory = join(invalidRoot, name);
-    await mkdir(directory);
-    for (const file of files) {
-      const target = join(directory, file);
-      await mkdir(resolve(target, ".."), { recursive: true });
-      await copyFile(
-        join(
-          variant.workspacePath,
-          file.endsWith(".blend") ? "model.blend" : "model.glb",
-        ),
-        target,
-      );
-    }
-    const before = await fileManifest(directory);
-    await assert.rejects(
-      () =>
-        job({
-          kind: "import",
-          source: directory,
-          name,
-          config: canonicalConfig,
-        }),
-      /non conforme/i,
+async function testFlexibleImportRules(variant) {
+  const glbOnly = join(testRoot, "glb-only");
+  await mkdir(glbOnly);
+  await copyFile(
+    join(variant.workspacePath, "model.glb"),
+    join(glbOnly, "only.glb"),
+  );
+  const glbBefore = await fileManifest(glbOnly);
+  await assert.rejects(
+    () =>
+      job({
+        kind: "import",
+        source: glbOnly,
+        name: "GLB seul",
+        config: canonicalConfig,
+      }),
+    /aucun fichier \.blend|non conforme/i,
+  );
+  assert.deepEqual(await fileManifest(glbOnly), glbBefore);
+  const directory = join(testRoot, "mixed-project");
+  await mkdir(join(directory, "nested"), { recursive: true });
+  await copyFile(
+    join(variant.workspacePath, "model.blend"),
+    join(directory, "principal.blend"),
+  );
+  await copyFile(
+    join(variant.workspacePath, "model.blend"),
+    join(directory, "nested/alternative.blend"),
+  );
+  await copyFile(
+    join(variant.workspacePath, "model.glb"),
+    join(directory, "principal.glb"),
+  );
+  await writeFile(
+    join(directory, "choix.glb"),
+    animatedTexturedTriangle({ dataUri: true }),
+  );
+  const before = await fileManifest(directory);
+  const imported = await job({
+    kind: "import",
+    source: directory,
+    name: "Principal",
+    config: canonicalConfig,
+  });
+  const work = imported.variants[0];
+  assert.equal(work.config.primaryFile, "principal.blend");
+  assert.equal(work.config.generatedGlbFile, "principal.edge-lock.glb");
+  for (const entry of before.filter((entry) => entry.kind === "file"))
+    assert.equal(
+      await fileHash(join(work.workspacePath, entry.path)),
+      entry.hash,
+      `Existing source must survive mixed import: ${entry.path}`,
     );
-    assert.deepEqual(await fileManifest(directory), before);
-  }
+  assert.deepEqual(await fileManifest(directory), before);
+  await invoke("update_asset", {
+    id: imported.asset.id,
+    name: imported.asset.name,
+    categoryId: null,
+    tags: ["flexible-e2e"],
+    gameIds: [],
+    archived: true,
+  });
   report.checks.push(
-    "Imports GLB seul, plusieurs .blend ou plusieurs GLB refusés sans modifier leurs fichiers",
+    "Import de plusieurs .blend et GLB accepté ; principal déduit du nom, GLB existants et sources préservés ; import GLB seul toujours refusé",
+  );
+  return { imported, directory, before };
+}
+
+async function exportSelectedSource(destination, variantId) {
+  // WebDriver controls the WebView; the native save picker is outside its surface.
+  // Read the actual UI selection and execute the same real export IPC contract.
+  const sourceFile = await script(
+    "return document.querySelector('.config-form label:last-of-type select').value;",
+  );
+  await job(
+    { kind: "export", variantId, sourceFile, destination, overwrite: false },
+    300_000,
+  );
+}
+
+async function desktopWorkingSet() {
+  // Only report the disposable Edge Lock process and its descendants, never command lines.
+  return new Promise((resolve) => {
+    const capture = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `$all=@(Get-CimInstance Win32_Process); $ids=[System.Collections.Generic.HashSet[uint32]]::new(); foreach($item in $all){if($item.Name -eq 'edge-lock.exe' -and $item.ExecutablePath -eq $env:EDGE_LOCK_MEMORY_TARGET){[void]$ids.Add([uint32]$item.ProcessId)}}; do{$added=$false;foreach($item in $all){if($ids.Contains([uint32]$item.ParentProcessId) -and $ids.Add([uint32]$item.ProcessId)){$added=$true}}}while($added);$selected=@($all|Where-Object{$ids.Contains([uint32]$_.ProcessId)});[ordered]@{workingSetBytes=[long](($selected|Measure-Object WorkingSetSize -Sum).Sum);processCount=$selected.Count;webviewCount=@($selected|Where-Object Name -eq 'msedgewebview2.exe').Count;gpuMemoryIncluded=$false}|ConvertTo-Json -Compress`,
+      ],
+      {
+        windowsHide: true,
+        env: { ...process.env, EDGE_LOCK_MEMORY_TARGET: executable },
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    let output = "";
+    capture.stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+    const timer = setTimeout(() => {
+      capture.kill();
+      resolve(null);
+    }, 15_000);
+    capture.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    capture.on("close", () => {
+      clearTimeout(timer);
+      try {
+        resolve(JSON.parse(output));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
+  const asset = fixture.imported;
+  const variant = asset.variants[0];
+  await invoke("update_asset", {
+    id: asset.asset.id,
+    name: asset.asset.name,
+    categoryId: null,
+    tags: ["flexible-e2e"],
+    gameIds: [],
+    archived: false,
+  });
+  await script("window.location.reload();return true;");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('.asset-card')].some(card=>card.textContent.includes('Principal'));",
+    ),
+  );
+  await clickText("Principal");
+  await waitForModel("principal.edge-lock.glb");
+  for (const selected of ["choix.glb", "nested/alternative.blend"]) {
+    await setFilter(".preview-source-choice select", selected);
+    await waitForModel(selected);
+    assert.equal(
+      await script(
+        "return document.querySelector('.preview-source-choice select').value;",
+      ),
+      selected,
+    );
+  }
+  await setFilter(
+    ".config-form label:first-of-type select",
+    "nested/alternative.blend",
+  );
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: variant.id })).variant.config
+        .primaryFile === "nested/alternative.blend",
+    300_000,
+  );
+  await until(() =>
+    script(
+      "const select=document.querySelector('.config-form label:first-of-type select');return select?.value==='nested/alternative.blend'&&!select.disabled;",
+    ),
+  );
+  await until(
+    async () =>
+      (await invoke("get_workspace_status", { variantId: variant.id }))
+        .state === "ready",
+    300_000,
+  );
+  await clickText("Re-détecter automatiquement");
+  await until(
+    async () =>
+      (await invoke("get_variant", { id: variant.id })).variant.config
+        .primaryFile === "principal.blend",
+    300_000,
+  );
+  await until(
+    async () =>
+      (await invoke("get_workspace_status", { variantId: variant.id }))
+        .state === "ready",
+    300_000,
+  );
+  for (const [sourceFile, name] of [
+    ["choix.glb", "choice-export.glb"],
+    ["nested/alternative.blend", "blend-export.glb"],
+  ]) {
+    await setFilter(".config-form label:last-of-type select", sourceFile);
+    const output = join(testRoot, name);
+    await exportSelectedSource(output, variant.id);
+    const bytes = await readFile(output);
+    assert.equal(bytes.subarray(0, 4).toString(), "glTF");
+    if (sourceFile.endsWith(".glb"))
+      assert.equal(
+        await fileHash(output),
+        await fileHash(join(variant.workspacePath, sourceFile)),
+      );
+  }
+  if (process.env.EDGE_LOCK_E2E_STRESS_TEXTURES === "1") {
+    await viewport(1440, 940);
+    const workingSetBefore = await desktopWorkingSet();
+    const started = performance.now();
+    const stress = await prepareTextureStressFixture(
+      join(variant.workspacePath, "stress-textures.glb"),
+    );
+    report.textureStress = {
+      ...stress,
+      status: "running",
+      payloadBytes: (await lstat(stress.path)).size,
+      workingSetBefore,
+    };
+    try {
+      await invoke("request_workspace_sync", { variantId: variant.id });
+      await until(
+        () =>
+          script(
+            "return [...document.querySelectorAll('.preview-source-choice option')].some(option=>option.value==='stress-textures.glb');",
+          ),
+        300_000,
+      );
+      await setFilter(".preview-source-choice select", "stress-textures.glb");
+      await waitForModel("stress-textures.glb");
+      assert.equal(
+        await script(
+          "return !!document.querySelector('.preview-notice[role=alert]');",
+        ),
+        false,
+      );
+      await screenshot("preview-textures-over-512mib-1440.png");
+      report.textureStress.workingSetRendered = await desktopWorkingSet();
+      report.textureStress.status = "passed";
+      report.textureStress.elapsedMs = Math.round(performance.now() - started);
+      await setFilter(".preview-source-choice select", "choix.glb");
+      await waitForModel("choix.glb");
+    } catch (error) {
+      report.textureStress.status = "failed";
+      report.textureStress.error = String(error);
+      report.textureStress.elapsedMs = Math.round(performance.now() - started);
+      await screenshot("preview-textures-over-512mib-failure.png").catch(
+        () => {},
+      );
+      try {
+        await script("window.location.reload();return true;");
+        await until(() =>
+          script("return !!document.querySelector('.app-shell');"),
+        );
+      } catch {
+        if (session)
+          await request("DELETE", `/session/${session}`).catch(() => {});
+        session = undefined;
+        await newSession();
+      }
+      await until(() =>
+        script(
+          "return [...document.querySelectorAll('.asset-card')].some(card=>card.textContent.includes('Principal'));",
+        ),
+      );
+      const fallback = await job({
+        kind: "preview",
+        variantId: variant.id,
+        previewFile: "choix.glb",
+      });
+      await invoke("release_preview_resources", {
+        tokens: [fallback.resourceToken],
+      });
+      await clickText("Principal");
+      await waitForModel("choix.glb");
+    }
+  }
+  await writeFile(
+    join(variant.workspacePath, "secondary-note.txt"),
+    "All model sources are versioned",
+  );
+  const snapshot = await job({
+    kind: "snapshot",
+    variantId: variant.id,
+    message: "Plusieurs modèles et GLB conservés",
+  });
+  for (const name of [
+    "principal.blend",
+    "nested/alternative.blend",
+    "principal.glb",
+    "choix.glb",
+    "secondary-note.txt",
+  ])
+    assert.ok(
+      snapshot.entries.some((entry) => entry.path === name),
+      `Missing mixed-workspace snapshot entry: ${name}`,
+    );
+  for (const [width, height] of [
+    [1440, 940],
+    [1024, 700],
+  ]) {
+    await viewport(width, height);
+    await script(
+      "document.querySelector('.config-form').scrollIntoView({block:'center'});",
+    );
+    assert.equal(
+      await script(
+        "return [...document.querySelectorAll('.config-form select,.preview-source-choice select')].every(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;});",
+      ),
+      true,
+    );
+    await screenshot(`flexible-sources-${width}.png`);
+  }
+  await viewport(1440, 940);
+  await invoke("save_category", {
+    id: null,
+    name: "Parent E2E",
+    parentId: null,
+  });
+  let taxonomy = await invoke("get_taxonomy");
+  const parent = taxonomy.categories.find((c) => c.name === "Parent E2E");
+  await invoke("save_category", {
+    id: null,
+    name: "Enfant E2E",
+    parentId: parent.id,
+  });
+  await invoke("save_game", { id: null, name: "Projet supprimé E2E" });
+  await invoke("save_game", { id: null, name: "Projet conservé E2E" });
+  taxonomy = await invoke("get_taxonomy");
+  const child = taxonomy.categories.find((c) => c.name === "Enfant E2E");
+  const game = taxonomy.games.find((g) => g.name === "Projet supprimé E2E");
+  const keep = taxonomy.games.find((g) => g.name === "Projet conservé E2E");
+  await invoke("update_asset", {
+    id: asset.asset.id,
+    name: asset.asset.name,
+    categoryId: child.id,
+    tags: ["flexible-e2e"],
+    gameIds: [keep.id],
+    archived: false,
+  });
+  const gameAsset = await job({
+    kind: "import",
+    source,
+    name: "Asset de projet E2E",
+    config: canonicalConfig,
+  });
+  await invoke("update_asset", {
+    id: gameAsset.asset.id,
+    name: gameAsset.asset.name,
+    categoryId: null,
+    tags: [],
+    gameIds: [game.id, keep.id],
+    archived: false,
+  });
+  await script("window.location.reload();return true;");
+  await until(() =>
+    script(
+      "return !!document.querySelector('[aria-label=\"Supprimer la catégorie Parent E2E\"]');",
+    ),
+  );
+  await clickSelector('[aria-label="Supprimer la catégorie Parent E2E"]');
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('1 asset concerné');",
+    ),
+  );
+  await screenshot("category-subtree-delete-1440.png");
+  await clickText("Annuler");
+  assert.ok(
+    (await invoke("get_taxonomy")).categories.some((c) => c.id === parent.id),
+  );
+  await clickSelector('[aria-label="Supprimer la catégorie Parent E2E"]');
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('dialog[open] button')].some(b=>b.textContent.includes('Supprimer et archiver')&&!b.disabled);",
+    ),
+  );
+  await clickText("Supprimer et archiver");
+  await until(() => script("return !document.querySelector('dialog[open]');"));
+  const categoryArchived = await invoke("get_asset", { id: asset.asset.id });
+  assert.equal(categoryArchived.asset.archived, true);
+  assert.equal(categoryArchived.asset.categoryId, null);
+  assert.deepEqual(categoryArchived.asset.gameIds, [keep.id]);
+  assert.ok(
+    !(await invoke("get_taxonomy")).categories.some((c) =>
+      [parent.id, child.id].includes(c.id),
+    ),
+  );
+  await access(join(variant.workspacePath, "principal.blend"));
+  await clickSelector(
+    '[aria-label="Supprimer le projet de jeu Projet supprimé E2E"]',
+  );
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('1 asset concerné');",
+    ),
+  );
+  await viewport(1024, 700);
+  await screenshot("game-delete-1024.png");
+  await clickText("Supprimer et archiver");
+  await until(() => script("return !document.querySelector('dialog[open]');"));
+  const gameArchived = await invoke("get_asset", { id: gameAsset.asset.id });
+  assert.equal(gameArchived.asset.archived, true);
+  assert.deepEqual(gameArchived.asset.gameIds, [keep.id]);
+  await access(join(gameAsset.variants[0].workspacePath, "model.blend"));
+  await clickText("Archives");
+  await setFilter('[aria-label="Rechercher des assets"]', "Principal");
+  await until(() =>
+    script(
+      "return document.querySelectorAll('.asset-card').length===1&&document.querySelector('.asset-card')?.textContent.includes('Principal');",
+    ),
+  );
+  await clickText("Principal");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('.heading-actions button')].some(b=>b.textContent.includes('Supprimer définitivement'));",
+    ),
+  );
+  await clickText("Supprimer définitivement");
+  await until(() =>
+    script(
+      "return document.querySelector('dialog[open]')?.textContent.includes('1 asset');",
+    ),
+  );
+  await viewport(1440, 940);
+  await screenshot("archive-single-confirmation-1440.png");
+  await clickSelector("dialog[open] .button.danger");
+  await until(
+    () =>
+      script(
+        "return document.querySelector('dialog[open]')?.textContent.includes('Suppression terminée');",
+      ),
+    120_000,
+  );
+  await assert.rejects(
+    () => invoke("get_asset", { id: asset.asset.id }),
+    (error) => error.code === "not_found",
+  );
+  await assert.rejects(() =>
+    access(join(library, "workspaces", asset.asset.id)),
+  );
+  await clickText("Fermer");
+  const archiveFilter = {
+    search: "",
+    categoryId: null,
+    gameId: null,
+    tag: null,
+    sort: "name",
+    archived: true,
+    offset: 0,
+    limit: 100,
+  };
+  const archived = [];
+  while (true) {
+    const page = await invoke("list_assets", {
+      filter: { ...archiveFilter, offset: archived.length },
+    });
+    archived.push(...page.items);
+    if (archived.length >= page.total) break;
+  }
+  assert.ok(archived.some((item) => item.id === gameAsset.asset.id));
+  const activeBefore = await invoke("list_assets", {
+    filter: { ...archiveFilter, archived: false },
+  });
+  await setFilter(
+    '[aria-label="Rechercher des assets"]',
+    "Filtre E2E sans résultat",
+  );
+  await until(() =>
+    script(
+      "return document.querySelectorAll('.asset-card').length===0&&!document.querySelector('.asset-results.is-loading');",
+    ),
+  );
+  await clickText("Vider les archives");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('dialog[open] button')].some(b=>b.textContent.includes('Supprimer définitivement')&&!b.disabled);",
+    ),
+  );
+  assert.equal(
+    await script(
+      "return document.querySelector('dialog[open]').textContent.includes(arguments[0]);",
+      [`${archived.length} asset`],
+    ),
+    true,
+  );
+  await clickText("Annuler");
+  assert.equal(
+    (await invoke("list_assets", { filter: archiveFilter })).total,
+    archived.length,
+  );
+  await clickText("Vider les archives");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('dialog[open] button')].some(b=>b.textContent.includes('Supprimer définitivement')&&!b.disabled);",
+    ),
+  );
+  await viewport(1024, 700);
+  await screenshot("archives-global-confirmation-1024.png");
+  await clickSelector("dialog[open] .button.danger");
+  await until(
+    () =>
+      script(
+        "return document.querySelector('dialog[open]')?.textContent.includes('Suppression terminée');",
+      ),
+    300_000,
+  );
+  assert.equal(
+    (await invoke("list_assets", { filter: archiveFilter })).total,
+    0,
+  );
+  assert.equal(
+    (
+      await invoke("list_assets", {
+        filter: { ...archiveFilter, archived: false },
+      })
+    ).total,
+    activeBefore.total,
+  );
+  assert.ok(
+    (await invoke("get_asset", { id: survivorId })).variants.length > 0,
+  );
+  for (const removed of archived)
+    await assert.rejects(() => access(join(library, "workspaces", removed.id)));
+  assert.deepEqual(await fileManifest(fixture.directory), fixture.before);
+  await access(join(testRoot, "choice-export.glb"));
+  await clickText("Fermer");
+  await viewport(1440, 940);
+  report.checks.push(
+    "Sources aperçu/export .blend et .glb sélectionnées dans l’UI ; principal manuel et redétection ; versions multi-fichiers ; catégorie récursive et projet multi-associations archivés ; suppression individuelle puis toutes archives malgré filtre vide, confirmations annulables, fichiers externes préservés (1440/1024 px)",
   );
 }
 
@@ -1812,7 +2302,7 @@ try {
       .length,
     1,
   );
-  await testStrictImportRules(main);
+  const flexibleFixture = await testFlexibleImportRules(main);
   assert.equal(await readFile(join(source, "notes.txt"), "utf8"), "original");
   await access(join(main.workspacePath, "empty"));
   report.checks.push(
@@ -2127,6 +2617,12 @@ try {
   );
   assert.equal(
     await script('return !document.querySelector(".config-form");'),
+    false,
+  );
+  assert.equal(
+    await script(
+      "return document.querySelector('.config-form label:first-of-type select').disabled;",
+    ),
     true,
   );
   await screenshot("ui-history-readonly.png");
@@ -2139,6 +2635,12 @@ try {
     "The imported source folder must remain unchanged throughout the desktop scenarios",
   );
   await testHistoryStorage();
+  await testFlexibleWorkspaceAndArchives(flexibleFixture, imported.asset.id);
+  assert.deepEqual(await fileManifest(source), sourceOriginal);
+  if (report.textureStress?.status === "failed")
+    throw new Error(
+      `Aperçu >512 Mio indisponible : ${report.textureStress.error}`,
+    );
   report.status = "passed";
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {

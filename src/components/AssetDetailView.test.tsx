@@ -163,6 +163,85 @@ function renderDetail() {
 }
 
 describe("versions, aperçu et dépendances", () => {
+  it("choisit indépendamment l’aperçu, le principal et la source d’export", async () => {
+    vi.mocked(api.getVariant).mockResolvedValue({
+      ...variant,
+      files: [
+        ...variant.files,
+        { path: "alternate.blend", kind: "file", hash: "blend2", size: 20 },
+        { path: "other.glb", kind: "file", hash: "glb2", size: 30 },
+      ],
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : {
+            ...generatedPreview,
+            sourceFile:
+              request.kind === "preview" && request.previewFile
+                ? request.previewFile
+                : "drone.blend",
+          },
+    );
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.selectOptions(
+      screen.getByLabelText("Source de l’aperçu"),
+      "alternate.blend",
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "preview",
+          previewFile: "alternate.blend",
+        }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+    expect(screen.getByLabelText("Source de l’aperçu")).toHaveValue(
+      "alternate.blend",
+    );
+    expect(api.updateConfig).not.toHaveBeenCalled();
+    await userEvent.selectOptions(
+      screen.getByLabelText("Source de l’export"),
+      "other.glb",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Exporter .glb" }),
+    );
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "export", sourceFile: "other.glb" }),
+      ),
+    );
+    await userEvent.selectOptions(
+      screen.getByLabelText("Fichier principal"),
+      "alternate.blend",
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenCalledWith(
+        "variant-1",
+        expect.objectContaining({
+          primaryFile: "alternate.blend",
+          generatedGlbFile: null,
+        }),
+      ),
+    );
+  });
+
+  it("permet de relancer la détection automatique du principal", async () => {
+    renderDetail();
+    await screen.findByLabelText("Aperçu 3D interactif");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Re-détecter automatiquement" }),
+    );
+    await waitFor(() =>
+      expect(api.updateConfig).toHaveBeenCalledWith(
+        "variant-1",
+        expect.objectContaining({ primaryFile: null, generatedGlbFile: null }),
+      ),
+    );
+  });
   it("conserve les filtres au rafraîchissement et les réinitialise pour une autre version", async () => {
     const props = {
       id: "asset-1",
@@ -245,8 +324,8 @@ describe("versions, aperçu et dépendances", () => {
       await within(screen.getByRole("tabpanel")).findByText("10 o"),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("combobox", { name: "Fichier principal" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("combobox", { name: "Fichier principal" }),
+    ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Ouvrir dans Blender" }),
     ).toBeDisabled();
@@ -480,11 +559,14 @@ describe("versions, aperçu et dépendances", () => {
     );
     await screen.findByText("Cette version");
     await waitFor(() =>
-      expect(run).toHaveBeenCalledWith({
-        kind: "preview",
-        variantId: "variant-1",
-        snapshotId: "snapshot-1",
-      }),
+      expect(run).toHaveBeenCalledWith(
+        {
+          kind: "preview",
+          variantId: "variant-1",
+          snapshotId: "snapshot-1",
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
     );
     await act(async () =>
       finishSnapshot({
