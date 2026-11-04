@@ -94,6 +94,7 @@ export interface LibraryInfo {
   root: string;
   assetCount: number;
   physicalBytes: number;
+  physicalBytesComplete?: boolean;
   recoveryNotices: string[];
 }
 export interface AssetFilter {
@@ -197,6 +198,7 @@ export type JobRequest =
       expectedHead: string;
       expectedBackup: string;
     }
+  | { kind: "discardChanges"; variantId: string; expectedHead: string }
   | { kind: "thumbnail"; assetId: string }
   | { kind: "import"; source: string; name: string; config: ExportConfig }
   | { kind: "create"; name: string }
@@ -238,6 +240,13 @@ export interface ArchiveDeletionPlan {
   variantCount: number;
   snapshotCount: number;
   workspaceBytes: number;
+  workspaceBytesComplete?: boolean;
+  warnings: string[];
+}
+export interface WorkspaceDiscardReport {
+  variantId: string;
+  headSnapshotId: string;
+  cleanupPending: boolean;
   warnings: string[];
 }
 export interface ArchiveDeletionReport {

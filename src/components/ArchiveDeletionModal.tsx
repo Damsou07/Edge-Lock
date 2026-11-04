@@ -80,8 +80,9 @@ export function ArchiveDeletionModal({
         )}
         <p>
           Cette action est définitive : les fichiers, variantes et versions des
-          assets concernés seront supprimés. Enregistrez et fermez leurs
-          fichiers dans Blender avant de confirmer.
+          assets concernés seront retirés de la bibliothèque. Les fichiers
+          bloqués seront conservés pour un nettoyage ultérieur. Fermez les
+          applications qui les modifient avant de confirmer.
         </p>
         {!plan && !error && <p role="status">Analyse des archives…</p>}
         {plan && !result && (
@@ -90,7 +91,9 @@ export function ArchiveDeletionModal({
               {plan.assetCount} asset{plan.assetCount > 1 ? "s" : ""},{" "}
               {plan.variantCount} variante{plan.variantCount > 1 ? "s" : ""} et{" "}
               {plan.snapshotCount} version{plan.snapshotCount > 1 ? "s" : ""}.
-              Dossiers de travail : {formatBytes(plan.workspaceBytes)}.
+              Dossiers de travail :{" "}
+              {plan.workspaceBytesComplete === false ? "au moins " : ""}
+              {formatBytes(plan.workspaceBytes)}.
             </p>
             <ul className="storage-version-list">
               {plan.assets.map((asset) => (
@@ -102,12 +105,12 @@ export function ArchiveDeletionModal({
         {result && (
           <p role="status">
             {result.cleanupPending
-              ? "Nettoyage à terminer : des fichiers restent à supprimer. Une reprise sera tentée à la réouverture de la bibliothèque."
+              ? "Archives supprimées ; nettoyage de certains fichiers différé. Une reprise sera tentée à la réouverture de la bibliothèque."
               : `Suppression terminée. Espace libéré : ${formatBytes(result.releasedBytes)}.`}
           </p>
         )}
         {(result ?? plan)?.warnings.map((warning, index) => (
-          <p className="inline-error" key={index}>
+          <p className="field-help" key={index}>
             {warning}
           </p>
         ))}

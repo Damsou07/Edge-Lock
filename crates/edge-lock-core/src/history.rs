@@ -270,6 +270,7 @@ impl Library {
 
     pub(super) fn check_storage_integrity(&self) -> Result<()> {
         ensure_no_restore(&self.root)?;
+        discard::ensure_no_discard(&self.root, &*self.db()?)?;
         // Unknown/interrupted imports may own otherwise unreferenced objects. Fail closed.
         for item in fs::read_dir(&self.store.staging)? {
             let item = item?;
@@ -1014,7 +1015,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 }

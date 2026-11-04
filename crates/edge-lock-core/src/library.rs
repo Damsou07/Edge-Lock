@@ -21,8 +21,11 @@ pub use history::StorageAction;
 #[path = "archives.rs"]
 mod archives;
 pub use archives::{ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport};
+#[path = "discard.rs"]
+mod discard;
+pub use discard::WorkspaceDiscardReport;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r#"
 CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES categories(id));
 CREATE TABLE games(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
@@ -149,6 +152,7 @@ impl Library {
             return Err(CoreError::Inconsistent("Le catalogue contient des références manquantes. Restaurez une sauvegarde de la bibliothèque.".into()));
         }
         let mut notices = history::recover_restores(&root, &mut connection)?;
+        notices.extend(discard::recover_discards(&root, &mut connection)?);
         notices.extend(archives::recover_deletions(&root, &mut connection)?);
         for entry in fs::read_dir(root.join("staging"))? {
             let entry = entry?;
@@ -219,7 +223,8 @@ impl Library {
             .lock()
             .map_err(|_| CoreError::Inconsistent("Verrou d’écriture indisponible.".into()))?;
         history::ensure_no_restore(&self.root)?;
-        archives::ensure_no_deletion(&self.root)?;
+        discard::ensure_no_discard(&self.root, &*self.db()?)?;
+        archives::ensure_no_deletion(&self.root, &*self.db()?)?;
         Ok(guard)
     }
 
@@ -231,10 +236,22 @@ impl Library {
         if let Err(error) = history::ensure_no_restore(&self.root) {
             recovery_notices.push(error.to_string());
         }
+        if let Err(error) = discard::ensure_no_discard(&self.root, &*self.db()?) {
+            recovery_notices.push(error.to_string());
+        }
+        let (physical_bytes, physical_bytes_complete) =
+            crate::files::directory_bytes_best_effort(&self.root);
+        if !physical_bytes_complete {
+            recovery_notices.push(
+                "Taille sur disque partielle : certains fichiers ou dossiers sont inaccessibles."
+                    .into(),
+            );
+        }
         Ok(LibraryInfo {
             root: dunce::simplified(&self.root).to_string_lossy().into_owned(),
             asset_count,
-            physical_bytes: directory_bytes(&self.root)?,
+            physical_bytes,
+            physical_bytes_complete,
             recovery_notices,
         })
     }
@@ -1108,6 +1125,9 @@ fn apply_migrations(
     }
     if version < 4 {
         transaction.execute_batch("CREATE TABLE glb_backup_owners(variant_id TEXT NOT NULL REFERENCES variants(id),hash TEXT NOT NULL,PRIMARY KEY(variant_id,hash)); CREATE TABLE archive_deletions(id TEXT PRIMARY KEY,journal_hash TEXT NOT NULL); PRAGMA user_version=4;")?;
+    }
+    if version < 5 {
+        transaction.execute_batch("CREATE TABLE workspace_discards(id TEXT PRIMARY KEY,journal_hash TEXT NOT NULL); PRAGMA user_version=5;")?;
     }
     transaction.commit()?;
     Ok(())

@@ -48,6 +48,10 @@ pub enum JobRequest {
         expected_head: String,
         expected_backup: String,
     },
+    DiscardChanges {
+        variant_id: String,
+        expected_head: String,
+    },
     Import {
         source: String,
         name: String,
@@ -97,6 +101,7 @@ impl JobRequest {
             Self::StoragePlan { .. } => "storagePlan",
             Self::StorageApply { .. } => "storageApply",
             Self::Restore { .. } => "restore",
+            Self::DiscardChanges { .. } => "discardChanges",
             Self::Import { .. } => "import",
             Self::Create { .. } => "create",
             Self::Snapshot { .. } => "snapshot",
@@ -191,6 +196,7 @@ pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppRe
                 .collect(),
             (JobRequest::Snapshot { variant_id, .. }, Ok(_)) => vec![variant_id.clone()],
             (JobRequest::Restore { variant_id, .. }, _) => vec![variant_id.clone()],
+            (JobRequest::DiscardChanges { variant_id, .. }, _) => vec![variant_id.clone()],
             _ => Vec::new(),
         };
         update_job(&app, &state, &job_id, |job| match result {
@@ -360,6 +366,14 @@ fn run(
             variant_id,
             expected_head,
             expected_backup,
+            ctx,
+        )?)?),
+        JobRequest::DiscardChanges {
+            variant_id,
+            expected_head,
+        } => Ok(serde_json::to_value(library.discard_changes(
+            variant_id,
+            expected_head,
             ctx,
         )?)?),
         JobRequest::Import {
@@ -947,6 +961,50 @@ mod tests {
         let thumbnail: JobRequest =
             serde_json::from_value(json!({"kind":"thumbnail","assetId":"asset"})).unwrap();
         assert!(matches!(thumbnail, JobRequest::Thumbnail {asset_id} if asset_id == "asset"));
+        let discard: JobRequest = serde_json::from_value(
+            json!({"kind":"discardChanges","variantId":"variant","expectedHead":"head"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(discard, JobRequest::DiscardChanges {variant_id,expected_head} if variant_id == "variant" && expected_head == "head")
+        );
+    }
+
+    #[test]
+    fn discard_job_restores_saved_sources_without_a_blender_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"saved source").unwrap();
+        let library = Arc::new(Library::open(temp.path().join("library")).unwrap());
+        let asset = library
+            .import_folder(
+                &source,
+                "Asset",
+                ExportConfig::default(),
+                &OperationContext::default(),
+            )
+            .unwrap();
+        let variant = &asset.variants[0];
+        fs::write(
+            Path::new(&variant.workspace_path).join("main.blend"),
+            b"local edits",
+        )
+        .unwrap();
+        let state = test_state(library.clone());
+        let request = JobRequest::DiscardChanges {
+            variant_id: variant.id.clone(),
+            expected_head: variant.head_snapshot_id.clone(),
+        };
+        let report = run(&state, &library, &request, &OperationContext::default()).unwrap();
+        assert_eq!(report["variantId"], variant.id);
+        assert_eq!(report["headSnapshotId"], variant.head_snapshot_id);
+        assert_eq!(report["cleanupPending"], false);
+        assert_eq!(report["warnings"], json!([]));
+        assert_eq!(
+            fs::read(Path::new(&variant.workspace_path).join("main.blend")).unwrap(),
+            b"saved source"
+        );
     }
 
     #[test]

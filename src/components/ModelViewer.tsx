@@ -27,6 +27,9 @@ export default function ModelViewer({
   url: string;
   label: string;
 }) {
+  const viewer = useRef<HTMLDivElement>(null);
+  const fullscreenButton = useRef<HTMLButtonElement>(null);
+  const fullscreenPending = useRef(false);
   const host = useRef<HTMLDivElement>(null);
   const runtime = useRef<ViewerRuntime | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "empty" | "error">(
@@ -37,6 +40,63 @@ export default function ModelViewer({
   const [clip, setClip] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenError, setFullscreenError] = useState("");
+
+  useEffect(() => {
+    const element = viewer.current;
+    let owned = false;
+    const changed = () => {
+      const active = document.fullscreenElement === element;
+      setFullscreen(active);
+      if (owned && !active) fullscreenButton.current?.focus();
+      owned = active;
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        document.fullscreenElement !== element
+      )
+        return;
+      event.preventDefault();
+      setFullscreenError("");
+      void document.exitFullscreen().catch((reason: unknown) => {
+        if (
+          viewer.current === element &&
+          document.fullscreenElement === element
+        )
+          setFullscreenError(errorMessage(reason));
+      });
+    };
+    document.addEventListener("fullscreenchange", changed);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("fullscreenchange", changed);
+      document.removeEventListener("keydown", escape);
+      if (document.fullscreenElement === element)
+        void document.exitFullscreen().catch(() => {
+          /* Leaving the viewer must remain possible after a native exit. */
+        });
+    };
+  }, []);
+
+  const toggleFullscreen = async () => {
+    const element = viewer.current;
+    if (!element || fullscreenPending.current) return;
+    fullscreenPending.current = true;
+    setFullscreenError("");
+    try {
+      if (document.fullscreenElement === element)
+        await document.exitFullscreen();
+      else if (element.requestFullscreen) await element.requestFullscreen();
+      else throw new Error("Le plein écran n’est pas disponible.");
+    } catch (reason) {
+      if (viewer.current === element) setFullscreenError(errorMessage(reason));
+    } finally {
+      fullscreenPending.current = false;
+    }
+  };
 
   useEffect(() => {
     const container = host.current;
@@ -217,24 +277,46 @@ export default function ModelViewer({
   }, [url]);
 
   return (
-    <div className="model-viewer">
+    <div className="model-viewer" ref={viewer}>
       <div className="viewer-canvas" ref={host} />
       <div className="viewer-top">
         <span className="viewer-badge">
           <span className="live-dot" />
           {label}
         </span>
-        <button
-          type="button"
-          className="icon-button viewer-control"
-          title="Recentrer"
-          aria-label="Recentrer le modèle"
-          disabled={status !== "ready"}
-          onClick={() => runtime.current?.frame()}
-        >
-          <Icon name="focus" />
-        </button>
+        <div className="viewer-controls">
+          <button
+            type="button"
+            className="icon-button viewer-control"
+            title="Recentrer"
+            aria-label="Recentrer le modèle"
+            disabled={status !== "ready"}
+            onClick={() => runtime.current?.frame()}
+          >
+            <Icon name="focus" />
+          </button>
+          <button
+            ref={fullscreenButton}
+            type="button"
+            className="icon-button viewer-control"
+            title={fullscreen ? "Quitter le plein écran" : "Plein écran"}
+            aria-label={
+              fullscreen
+                ? "Quitter le plein écran"
+                : "Afficher l’aperçu en plein écran"
+            }
+            aria-pressed={fullscreen}
+            onClick={() => void toggleFullscreen()}
+          >
+            <Icon name={fullscreen ? "minimize" : "maximize"} />
+          </button>
+        </div>
       </div>
+      {fullscreenError && (
+        <p className="viewer-fullscreen-error" role="alert">
+          {fullscreenError}
+        </p>
+      )}
       {status !== "ready" && (
         <div className="viewer-overlay">
           <Icon

@@ -45,7 +45,10 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           <p>
             L’aperçu n’impose plus de plafond de taille GLB, de géométrie ou de
             textures. Les ressources réelles de la machine et les fonctions glTF
-            prises en charge restent déterminantes.
+            prises en charge restent déterminantes. Le sélecteur compact se
+            trouve sous l’aperçu, entre sa provenance et Actualiser. L’icône
+            près de Recentrer affiche l’aperçu en plein écran ; utilisez cette
+            icône ou Échap pour revenir à la fiche.
           </p>
         </section>
         <section>
@@ -67,9 +70,13 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             variantes et versions attribuables à un asset. Vider les archives
             concerne toutes les archives, même filtrées, après confirmation. Les
             objets partagés restent conservés pour les autres assets ; les
-            anciennes sauvegardes communes non attribuables sont signalées et
-            préservées. Enregistrez et fermez les fichiers concernés dans
-            Blender.
+            anciennes sauvegardes communes non attribuables sont ignorées et
+            préservées sans alerte. Les fichiers bloqués par Windows sont
+            conservés pour un nettoyage ultérieur, sans bloquer le retrait du
+            catalogue ni les autres opérations. Une reprise est tentée à la
+            réouverture ; les dossiers modifiés ou impossibles à identifier
+            restent préservés pour intervention manuelle. Fermez les
+            applications qui modifient les fichiers concernés.
           </p>
           <p>
             Supprimer une catégorie retire aussi ses sous-catégories et archive
@@ -127,6 +134,15 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
             Pour restaurer un backup, enregistrez et fermez le projet dans
             Blender, puis confirmez. Le workspace est remplacé et son état
             précédent devient le nouveau backup.
+          </p>
+          <p>
+            Annuler les modifications, sous Créer une version, rétablit la
+            dernière version créée de la variante active, fichiers et réglages
+            compris. Après fermeture des applications d’écriture et
+            confirmation, les ajouts et modifications non versionnés sont
+            définitivement supprimés et les fichiers supprimés sont rétablis.
+            Aucun nouveau backup ni aucune version n’est créé. Cette action
+            reste disponible en cas d’échec de synchronisation.
           </p>
           <p>
             Optimisation du stockage regroupe un diagnostic manuel, la

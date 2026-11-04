@@ -92,6 +92,18 @@ beforeEach(() => {
 });
 
 describe("bibliothèque Edge Lock", () => {
+  it("signale une taille partielle sans empêcher l’ouverture de la bibliothèque", async () => {
+    vi.mocked(api.bootstrap).mockResolvedValue({
+      ...openedLibrary,
+      library: { ...openedLibrary.library!, physicalBytesComplete: false },
+    });
+    render(<App />);
+    expect(
+      await screen.findByText("Au moins 2 Ko sur disque"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Archives/ })).toBeEnabled();
+  });
+
   it("propose le vidage global uniquement dans les archives", async () => {
     vi.mocked(api.bootstrap).mockResolvedValue(openedLibrary);
     render(<App />);

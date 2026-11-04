@@ -637,7 +637,7 @@ export default function App() {
             <div>
               <strong>
                 {library
-                  ? `${formatBytes(library.physicalBytes)} sur disque`
+                  ? `${library.physicalBytesComplete === false ? "Au moins " : ""}${formatBytes(library.physicalBytes)} sur disque`
                   : "Votre espace, vos fichiers."}
               </strong>
               <span>

@@ -11,6 +11,7 @@ import {
   realpath,
   lstat,
   copyFile,
+  unlink,
 } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
@@ -93,7 +94,13 @@ child.stderr.on(
   (value) => (driverLog = (driverLog + value).slice(-50_000)),
 );
 let session;
-const report = { testRoot, startedAt: new Date().toISOString(), checks: [] };
+const report = {
+  testRoot,
+  executable,
+  executableSha256: await fileHash(executable),
+  startedAt: new Date().toISOString(),
+  checks: [],
+};
 const canonicalConfig = {
   primaryFile: null,
   scene: null,
@@ -595,6 +602,100 @@ async function testVisualRefreshAndCanonicalRules() {
   );
 }
 
+async function testPreviewLayoutAndFullscreen() {
+  report.previewLayout = {};
+  await installNavigationAudit();
+  await script(`
+    const canvas = document.querySelector('.viewer-canvas canvas');
+    window.__edgeLockFullscreenCanvas = canvas;
+    window.__edgeLockFullscreenContext = canvas.getContext('webgl2');
+  `);
+  await clickSelector('[aria-label="Lire l’animation"]');
+  await until(() =>
+    script(`
+    return Number(document.querySelector('[aria-label="Position dans l’animation"]').value) > 0.05;
+  `),
+  );
+  await clickSelector('[aria-label="Mettre en pause"]');
+  const animationTime = await script(`
+    return document.querySelector('[aria-label="Position dans l’animation"]').value;
+  `);
+  for (const [width, height] of [
+    [1440, 940],
+    [1024, 700],
+  ]) {
+    await viewport(width, height);
+    await script(
+      "document.querySelector('.preview-panel').scrollIntoView({block:'center'});",
+    );
+    const layout = await script(`
+      const viewer = document.querySelector('.model-viewer').getBoundingClientRect();
+      const caption = document.querySelector('.preview-caption');
+      const [source, select, refresh] = caption.children;
+      const sourceBox = source.getBoundingClientRect();
+      const selectBox = select.getBoundingClientRect();
+      const refreshBox = refresh.getBoundingClientRect();
+      return {
+        height: viewer.height,
+        selectorHeight: selectBox.height,
+        selectorInsideCaption: select.matches('[aria-label="Source de l’aperçu"]'),
+        ordered: sourceBox.right <= selectBox.left && selectBox.right <= refreshBox.left,
+        overflow: document.documentElement.scrollWidth > innerWidth,
+      };
+    `);
+    assert.ok(layout.height >= 420, JSON.stringify(layout));
+    assert.ok(layout.selectorHeight <= 34, JSON.stringify(layout));
+    assert.equal(layout.selectorInsideCaption, true);
+    assert.equal(layout.ordered, true);
+    assert.equal(layout.overflow, false);
+    report.previewLayout[width] = layout;
+    await screenshot(`preview-toolbar-${width}.png`);
+    await clickSelector('[aria-label="Afficher l’aperçu en plein écran"]');
+    await until(() =>
+      script(`
+      return document.fullscreenElement === document.querySelector('.model-viewer');
+    `),
+    );
+    await until(() => invoke("plugin:window|is_fullscreen", { label: "main" }));
+    const fullscreen = await script(`
+      const viewer = document.querySelector('.model-viewer').getBoundingClientRect();
+      const canvas = document.querySelector('.viewer-canvas canvas');
+      return {
+        fillsViewport: Math.abs(viewer.width - innerWidth) <= 1 && Math.abs(viewer.height - innerHeight) <= 1,
+        sameCanvas: canvas === window.__edgeLockFullscreenCanvas,
+        sameContext: canvas.getContext('webgl2') === window.__edgeLockFullscreenContext,
+        animationTime: document.querySelector('[aria-label="Position dans l’animation"]').value,
+      };
+    `);
+    assert.equal(fullscreen.fillsViewport, true);
+    assert.equal(fullscreen.sameCanvas, true);
+    assert.equal(fullscreen.sameContext, true);
+    assert.equal(fullscreen.animationTime, animationTime);
+    await screenshot(`preview-fullscreen-${width}.png`);
+    if (width === 1440)
+      await clickSelector('[aria-label="Quitter le plein écran"]');
+    else await keyPress("\uE00C");
+    await until(() => script("return document.fullscreenElement === null;"));
+    await until(
+      async () =>
+        !(await invoke("plugin:window|is_fullscreen", { label: "main" })),
+    );
+    const audit = await navigationSnapshot();
+    assert.equal(audit.contexts, 1);
+    assert.equal(audit.createdContexts, 1);
+    assert.equal(
+      await script(`
+      return document.querySelector('.viewer-canvas canvas') === window.__edgeLockFullscreenCanvas;
+    `),
+      true,
+    );
+  }
+  await viewport(1440, 940);
+  report.checks.push(
+    "Aperçu agrandi et source compacte entre provenance et actualisation à 1440/1024 px ; plein écran par icône, sortie par icône/Échap, même canvas/contexte WebGL et position d’animation conservés",
+  );
+}
+
 async function testAutomaticMirror(variant) {
   assertWithin(await realpath(testRoot), await realpath(variant.workspacePath));
   await until(() =>
@@ -777,11 +878,11 @@ async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
   await clickText("Principal");
   await waitForModel("principal.edge-lock.glb");
   for (const selected of ["choix.glb", "nested/alternative.blend"]) {
-    await setFilter(".preview-source-choice select", selected);
+    await setFilter('[aria-label="Source de l’aperçu"]', selected);
     await waitForModel(selected);
     assert.equal(
       await script(
-        "return document.querySelector('.preview-source-choice select').value;",
+        "return document.querySelector('[aria-label=\"Source de l’aperçu\"]').value;",
       ),
       selected,
     );
@@ -853,11 +954,14 @@ async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
       await until(
         () =>
           script(
-            "return [...document.querySelectorAll('.preview-source-choice option')].some(option=>option.value==='stress-textures.glb');",
+            "return [...document.querySelectorAll('.preview-caption option')].some(option=>option.value==='stress-textures.glb');",
           ),
         300_000,
       );
-      await setFilter(".preview-source-choice select", "stress-textures.glb");
+      await setFilter(
+        '[aria-label="Source de l’aperçu"]',
+        "stress-textures.glb",
+      );
       await waitForModel("stress-textures.glb");
       assert.equal(
         await script(
@@ -869,7 +973,7 @@ async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
       report.textureStress.workingSetRendered = await desktopWorkingSet();
       report.textureStress.status = "passed";
       report.textureStress.elapsedMs = Math.round(performance.now() - started);
-      await setFilter(".preview-source-choice select", "choix.glb");
+      await setFilter('[aria-label="Source de l’aperçu"]', "choix.glb");
       await waitForModel("choix.glb");
     } catch (error) {
       report.textureStress.status = "failed";
@@ -936,7 +1040,7 @@ async function testFlexibleWorkspaceAndArchives(fixture, survivorId) {
     );
     assert.equal(
       await script(
-        "return [...document.querySelectorAll('.config-form select,.preview-source-choice select')].every(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;});",
+        "return [...document.querySelectorAll('.config-form select,.preview-caption select')].every(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;});",
       ),
       true,
     );
@@ -1951,6 +2055,119 @@ async function testCharacterMorphs() {
   }
 }
 
+async function testWorkspaceDiscard() {
+  const imported = await job({
+    kind: "import",
+    source,
+    name: "Annulation E2E",
+    config: canonicalConfig,
+  });
+  const variant = imported.variants[0];
+  const working = variant.workspacePath;
+  await writeFile(join(working, "discard-modified.txt"), "saved content");
+  await writeFile(join(working, "discard-deleted.txt"), "restore this file");
+  const saved = await job({
+    kind: "snapshot",
+    variantId: variant.id,
+    message: "Référence avant annulation E2E",
+  });
+  const before = (await invoke("get_variant", { id: variant.id })).variant;
+  const history = await invoke("list_snapshots", {
+    variantId: variant.id,
+    offset: 0,
+    limit: 100,
+  });
+  const contents = (entries) =>
+    entries.map(({ modifiedAt, ...entry }) => entry);
+  const baseline = contents(await fileManifest(working));
+  await writeFile(join(working, "discard-modified.txt"), "unsaved edit");
+  await unlink(join(working, "discard-deleted.txt"));
+  await writeFile(join(working, "discard-added.txt"), "remove this addition");
+  await mkdir(join(working, "discard-added-empty"));
+  await invoke("update_config", {
+    variantId: variant.id,
+    config: { ...before.config, applyModifiers: !before.config.applyModifiers },
+  });
+  await script("window.location.reload();return true;");
+  await until(() =>
+    script(
+      "return [...document.querySelectorAll('.asset-card')].some(card=>card.textContent.includes('Annulation E2E'));",
+    ),
+  );
+  await clickText("Annulation E2E");
+  await until(() =>
+    script(
+      "return !!document.querySelector('.discard-changes-button:not(:disabled)');",
+    ),
+  );
+  for (const [width, height] of [
+    [1440, 940],
+    [1024, 700],
+  ]) {
+    await viewport(width, height);
+    await script(
+      "document.querySelector('.discard-changes-button').scrollIntoView({block:'center'});",
+    );
+    const positioned = await script(`
+      const discard = document.querySelector('.discard-changes-button').getBoundingClientRect();
+      const create = document.querySelector('.version-actions .primary').getBoundingClientRect();
+      return discard.top >= create.bottom && discard.right <= innerWidth && discard.left >= 0;
+    `);
+    assert.equal(positioned, true);
+    await clickText("Annuler les modifications");
+    await until(() =>
+      script(
+        "return document.querySelector('dialog[open]')?.textContent.includes('Référence avant annulation E2E');",
+      ),
+    );
+    await screenshot(`discard-confirmation-${width}.png`);
+    await clickText("Conserver mes modifications");
+    assert.equal(
+      await readFile(join(working, "discard-modified.txt"), "utf8"),
+      "unsaved edit",
+    );
+  }
+  await clickText("Annuler les modifications");
+  await until(() =>
+    script(
+      "return !!document.querySelector('dialog[open] input[type=checkbox]');",
+    ),
+  );
+  await clickSelector('dialog[open] input[type="checkbox"]');
+  await clickText("Supprimer les modifications");
+  await until(
+    () => script("return !document.querySelector('dialog[open]');"),
+    300_000,
+  );
+  await until(
+    async () =>
+      (await invoke("get_workspace_status", { variantId: variant.id }))
+        .state === "ready",
+    300_000,
+  );
+  const restored = (await invoke("get_variant", { id: variant.id })).variant;
+  assert.equal(restored.headSnapshotId, saved.id);
+  assert.equal(restored.backupSnapshotId, before.backupSnapshotId);
+  assert.deepEqual(restored.config, before.config);
+  assert.deepEqual(contents(await fileManifest(working)), baseline);
+  assert.equal(
+    (
+      await invoke("list_snapshots", {
+        variantId: variant.id,
+        offset: 0,
+        limit: 100,
+      })
+    ).total,
+    history.total,
+  );
+  await screenshot("discard-restored.png");
+  await viewport(1440, 940);
+  await clickText("Retour à la bibliothèque");
+  report.checks.push(
+    "Annulation confirmée : ajouts/modifications/suppressions et réglages rétablis, tête/backup/historique inchangés, confirmation annulable à1440 et1024px",
+  );
+}
+
 async function testEmptyLibraryStorage() {
   const stableManifest = async () =>
     fileManifest(
@@ -2358,6 +2575,7 @@ try {
     ".viewer-canvas",
     "03-viewer.png",
   );
+  await testPreviewLayoutAndFullscreen();
   await testVisualRefreshAndCanonicalRules();
   await testFileFilters();
   await testAutomaticMirror(main);
@@ -2634,6 +2852,7 @@ try {
     sourceOriginal,
     "The imported source folder must remain unchanged throughout the desktop scenarios",
   );
+  await testWorkspaceDiscard();
   await testHistoryStorage();
   await testFlexibleWorkspaceAndArchives(flexibleFixture, imported.asset.id);
   assert.deepEqual(await fileManifest(source), sourceOriginal);

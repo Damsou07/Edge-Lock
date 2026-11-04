@@ -17,6 +17,7 @@ import type {
   Snapshot,
   StorageAction,
   Taxonomy,
+  Variant,
   VariantDetail,
 } from "../contracts";
 import { defaultExportConfig } from "../contracts";
@@ -34,6 +35,7 @@ import { MetadataModal } from "./AssetForms";
 import { Modal } from "./Modal";
 import { HistoryStorageModal, RestoreBackupModal } from "./HistoryStorageModal";
 import { AssetFilesPanel } from "./AssetFilesPanel";
+import { WorkspaceDiscardModal } from "./WorkspaceDiscardModal";
 
 const ModelViewer = lazy(() => import("./ModelViewer"));
 
@@ -196,6 +198,7 @@ export function AssetDetailView({
     snapshotId?: string;
   } | null>(null);
   const [restoreOpen, setRestoreOpen] = useState(false);
+  const [discardTarget, setDiscardTarget] = useState<Variant | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleted, setDeleted] = useState(false);
   const selection = [id, variantId, snapshotId ?? "current"].join(":");
@@ -789,17 +792,40 @@ export function AssetDetailView({
                 </span>
               </div>
             )}
-            {preview && (
+            {(preview || sourceChoices.length > 0) && (
               <div className="preview-caption">
-                <span title={preview.sourceFile}>
+                <span title={preview?.sourceFile}>
                   {syncBusy && !snapshotId
                     ? "Synchronisation du modèle…"
-                    : `${preview.sourceLabel} · ${preview.sourceFile}`}
+                    : preview
+                      ? `${preview.sourceLabel} · ${preview.sourceFile}`
+                      : "Choisir la source de l’aperçu"}
                 </span>
+                {sourceChoices.length > 0 && (
+                  <select
+                    aria-label="Source de l’aperçu"
+                    title={previewFile || "Source de l’aperçu"}
+                    value={previewFile}
+                    onChange={(event) =>
+                      void generatePreview(event.target.value)
+                    }
+                  >
+                    <option value="" disabled>
+                      Choisir une source
+                    </option>
+                    {sourceChoices.map((candidate) => (
+                      <option key={candidate} value={candidate}>
+                        {candidate}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <button
                   className="text-button"
                   disabled={
-                    previewBusy || (!snapshotId && status?.state !== "ready")
+                    previewBusy ||
+                    (!snapshotId && status?.state !== "ready") ||
+                    (!previewFile && previewCandidates.length > 0)
                   }
                   onClick={() => void generatePreview(previewFile)}
                 >
@@ -813,26 +839,6 @@ export function AssetDetailView({
               </div>
             )}
           </div>
-          {sourceChoices.length > 0 && (
-            <div className="preview-source-choice">
-              <label>
-                Source de l’aperçu
-                <select
-                  value={previewFile}
-                  onChange={(event) => void generatePreview(event.target.value)}
-                >
-                  <option value="" disabled>
-                    Choisir une source
-                  </option>
-                  {sourceChoices.map((candidate) => (
-                    <option key={candidate} value={candidate}>
-                      {candidate}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          )}
           {previewError && (
             <div className="inline-error preview-notice" role="alert">
               <strong>Aperçu indisponible</strong>
@@ -1035,14 +1041,29 @@ export function AssetDetailView({
               </p>
             </div>
           </div>
-          <button
-            className="button primary full-width"
-            disabled={!canCreateSnapshot}
-            onClick={() => setModal("snapshot")}
-          >
-            <Icon name="save" />
-            Créer une version
-          </button>
+          <div className="version-actions">
+            <button
+              className="button primary full-width"
+              disabled={!canCreateSnapshot}
+              onClick={() => setModal("snapshot")}
+            >
+              <Icon name="save" />
+              Créer une version
+            </button>
+            {!snapshotId && (
+              <button
+                type="button"
+                className="button secondary full-width discard-changes-button"
+                disabled={!variant?.headSnapshotId || configBusy || exportBusy}
+                onClick={() => {
+                  if (variant) setDiscardTarget(variant);
+                }}
+              >
+                <Icon name="history" />
+                Annuler les modifications
+              </button>
+            )}
+          </div>
         </aside>
       </div>
       {warnings.length > 0 && (
@@ -1356,6 +1377,31 @@ export function AssetDetailView({
             onChanged();
           }}
           onClose={() => setRestoreOpen(false)}
+        />
+      )}
+      {discardTarget && (
+        <WorkspaceDiscardModal
+          key={`${discardTarget.id}:${discardTarget.headSnapshotId}`}
+          variant={discardTarget}
+          runJob={runJob}
+          onClose={() => setDiscardTarget(null)}
+          onDiscarded={() => {
+            previewRequest.current += 1;
+            previewAbort.current?.abort();
+            autoPreviewAttempt.current = "";
+            previewChoices.current.delete(`${id}:${discardTarget.id}:current`);
+            previewChoice.current = "";
+            setPreviewFile("");
+            setPreviewCandidates([]);
+            setExportFile("");
+            setPreview(null);
+            displayedPreview.current = null;
+            setPreviewError("");
+            setPreviewBusy(false);
+            setSnapshotId(null);
+            setLocalRefresh((value) => value + 1);
+            onChanged();
+          }}
         />
       )}
       {(modal === "snapshot" || modal === "variant") && variant && (

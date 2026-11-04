@@ -267,6 +267,7 @@ pub struct LibraryInfo {
     pub root: String,
     pub asset_count: u64,
     pub physical_bytes: u64,
+    pub physical_bytes_complete: bool,
     pub recovery_notices: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

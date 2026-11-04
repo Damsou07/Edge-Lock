@@ -686,7 +686,7 @@ fn existing_schema_zero_is_backed_up_and_migrated_without_losing_records() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(preserved, "preserved");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let backup = fs::read_dir(root.join("backups"))
         .unwrap()
         .next()

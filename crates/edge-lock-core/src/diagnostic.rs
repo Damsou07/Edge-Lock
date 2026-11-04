@@ -41,6 +41,10 @@ const DETAILS: &[(&str, &str)] = &[
         "restorationRecovery",
         "Fichiers associés à un journal de restauration",
     ),
+    (
+        "discardRecovery",
+        "Fichiers associés à un abandon de modifications",
+    ),
     ("stagingOther", "Autres fichiers temporaires à examiner"),
     ("ignoredPaths", "Liens et fichiers spéciaux ignorés"),
     ("readErrors", "Chemins non lisibles"),
@@ -122,6 +126,7 @@ impl Scan<'_> {
     fn recovery(&mut self, path: &Path) -> Option<&'static str> {
         for (marker, key) in [
             ("restore.json", "restorationRecovery"),
+            ("discard.json", "discardRecovery"),
             ("operation.json", "publicationRecovery"),
         ] {
             let marker = path.join(marker);

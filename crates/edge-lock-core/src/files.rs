@@ -484,6 +484,43 @@ pub(crate) fn directory_bytes(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Informational measurement only: inaccessible leftovers must not hide the library.
+pub(crate) fn directory_bytes_best_effort(root: &Path) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut complete = true;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        for entry in entries {
+            let metadata = match entry.and_then(|entry| {
+                fs::symlink_metadata(entry.path()).map(|metadata| (entry.path(), metadata))
+            }) {
+                Ok(value) => value,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            let (path, metadata) = metadata;
+            if is_link(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    (total, complete)
+}
+
 pub(crate) fn list_files(root: &Path) -> Result<Vec<ManifestEntry>> {
     Ok(inventory(root, &OperationContext::default())?
         .into_iter()

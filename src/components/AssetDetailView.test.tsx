@@ -163,6 +163,127 @@ function renderDetail() {
 }
 
 describe("versions, aperçu et dépendances", () => {
+  it("garde le sélecteur dans la barre d’aperçu avant de résoudre une source ambiguë", async () => {
+    vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
+      variantId: "variant-1",
+      revision: 1,
+      state: "ready",
+      sourceChanged: true,
+      canCreateSnapshot: true,
+      artifactKey: null,
+      error: null,
+    });
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "preview" && !request.previewFile)
+        throw {
+          code: "preview_ambiguous",
+          details: { candidates: ["drone.blend", "alternate.glb"] },
+        };
+      return { ...generatedPreview, sourceFile: "alternate.glb" };
+    });
+    renderDetail();
+    const showPreview = await screen.findByRole("button", {
+      name: "Afficher l’aperçu 3D",
+    });
+    await waitFor(() => expect(showPreview).toBeEnabled());
+    await userEvent.click(showPreview);
+    await screen.findByRole("option", { name: "alternate.glb" });
+    const selector = screen.getByLabelText("Source de l’aperçu");
+    expect(selector.closest(".preview-caption")).not.toBeNull();
+    expect(
+      screen.queryByLabelText("Aperçu 3D interactif"),
+    ).not.toBeInTheDocument();
+    await userEvent.selectOptions(selector, "alternate.glb");
+    expect(
+      await screen.findByLabelText("Aperçu 3D interactif"),
+    ).toBeInTheDocument();
+    expect(selector).toHaveValue("alternate.glb");
+  });
+  it("propose l’annulation sous la création de version même si la synchronisation échoue", async () => {
+    vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
+      variantId: "variant-1",
+      revision: 1,
+      state: "failed",
+      sourceChanged: true,
+      canCreateSnapshot: false,
+      artifactKey: null,
+      error: { code: "sync_failed", message: "Source non conforme" },
+    });
+    renderDetail();
+    const discard = await screen.findByRole("button", {
+      name: "Annuler les modifications",
+    });
+    await waitFor(() => expect(discard).toBeEnabled());
+    const create = screen.getByRole("button", { name: "Créer une version" });
+    expect(
+      create.compareDocumentPosition(discard) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    await userEvent.click(discard);
+    await screen.findByRole("dialog", { name: "Annuler les modifications ?" });
+    expect(
+      run.mock.calls.some(([request]) => request.kind === "discardChanges"),
+    ).toBe(false);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Conserver mes modifications" }),
+    );
+    expect(
+      run.mock.calls.some(([request]) => request.kind === "discardChanges"),
+    ).toBe(false);
+  });
+
+  it("actualise le workspace après l’annulation confirmée sans créer de version", async () => {
+    run.mockImplementation(async (request) => {
+      if (request.kind === "changes") return changes;
+      if (request.kind === "discardChanges")
+        return {
+          variantId: "variant-1",
+          headSnapshotId: "snapshot-1",
+          cleanupPending: false,
+          warnings: [],
+        };
+      return generatedPreview;
+    });
+    renderDetail();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Annuler les modifications" }),
+    );
+    await screen.findByText("Première version");
+    const previousReads = vi.mocked(api.getVariant).mock.calls.length;
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Supprimer les modifications" }),
+    );
+    await waitFor(() =>
+      expect(vi.mocked(api.getVariant).mock.calls.length).toBeGreaterThan(
+        previousReads,
+      ),
+    );
+    expect(run).toHaveBeenCalledWith({
+      kind: "discardChanges",
+      variantId: "variant-1",
+      expectedHead: "snapshot-1",
+    });
+    expect(
+      run.mock.calls.some(([request]) => request.kind === "snapshot"),
+    ).toBe(false);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("masque l’annulation pendant la consultation d’une version historique", async () => {
+    renderDetail();
+    await screen.findByRole("button", { name: "Annuler les modifications" });
+    await userEvent.click(screen.getByRole("tab", { name: /Historique/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Consulter/ }),
+    );
+    await screen.findByText("Cette version");
+    expect(
+      screen.queryByRole("button", { name: "Annuler les modifications" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("choisit indépendamment l’aperçu, le principal et la source d’export", async () => {
     vi.mocked(api.getVariant).mockResolvedValue({
       ...variant,
@@ -185,6 +306,12 @@ describe("versions, aperçu et dépendances", () => {
     );
     renderDetail();
     await screen.findByLabelText("Aperçu 3D interactif");
+    const sourceSelect = screen.getByLabelText("Source de l’aperçu");
+    const toolbar = sourceSelect.closest(".preview-caption");
+    expect(toolbar).not.toBeNull();
+    expect(toolbar?.children[0]).toHaveTextContent("drone.blend");
+    expect(toolbar?.children[1]).toBe(sourceSelect);
+    expect(toolbar?.children[2]).toHaveTextContent("Actualiser");
     await userEvent.selectOptions(
       screen.getByLabelText("Source de l’aperçu"),
       "alternate.blend",

@@ -1,6 +1,38 @@
 # Validation d’Edge Lock
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le bilan du 4 novembre 2026 concerne Edge Lock 0.3.0. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas cette implémentation.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le premier bilan concerne les suppressions non bloquantes et l’annulation des modifications, avec le catalogue au schéma 5. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas ces modifications, même lorsque leur version applicative est également 0.3.0.
+
+## Suppression non bloquante, annulation et aperçu agrandi — 4 novembre 2026
+
+### TDD et conservation des données
+
+Les régressions ont été constatées en échec avant correction : fichier verrouillé avant l’analyse des archives, volume libéré perdu lorsqu’un autre nettoyage reste différé, abandon des modifications absent, confirmations et état partiel dans l’interface, placement du sélecteur et plein écran. La revue indépendante a ajouté une régression d’écriture tardive dans un fichier restant à nettoyer : il est désormais revérifié juste avant sa suppression et préservé s’il a changé.
+
+`cargo test --workspace --locked` réussit : **135 tests Rust**, aucun échec, 29 cas ignorés par la commande ordinaire. Ces derniers comprennent les intégrations Blender, le benchmark, le test opt-in de junction Windows et les helpers de sous-processus ; les tests parents exécutent effectivement les helpers d’arrêt brutal. Le nouveau test IPC d’annulation fonctionne sans Blender configuré. Les journaux de commandes locaux sont `.test-data/rust-workspace-tests.log` et `.test-data/rust-clippy.log`.
+
+La suppression couvre les verrous de fichiers et de dossiers, l’inventaire inaccessible, les mesures partielles, les écritures suivantes, les références partagées, les modifications après suppression, les dossiers recréés, l’authentification v1/v2 et les journaux commités endommagés. L’annulation couvre les fichiers ajoutés/modifiés/supprimés, dossiers vides, fichiers cachés et secondaires, configuration et principal, isolement des variantes, absence de nouvelle version/backup, corruption, tête périmée, concurrence et reprise après interruption à cinq frontières, y compris un nettoyage partiel.
+
+La migration 4→5 sauvegarde d’abord SQLite et ajoute seulement la table des reçus d’annulation. Les tests vérifient les têtes, backups, configurations et versions préexistantes. Toutes les bibliothèques de test et leurs temporaires sont isolés sous `.test-data` ; aucune bibliothèque personnelle n’est utilisée.
+
+Les **cinq tests Node des fixtures passent**, y compris la création et la sauvegarde réelle d’un Mirror avec Blender 5.1.1. Les intégrations Blender opt-in complètes, le benchmark et l’installation en VM ne sont pas réexécutés pour cette évolution. Aucun installateur n’est produit et aucune installation personnelle n’est modifiée.
+
+### Interface et construction
+
+**156 tests frontend passent dans 18 fichiers**, avec `npm test -- --maxWorkers=2`. Ils couvrent notamment l’annulation confirmée ou abandonnée, les erreurs et nouvelles tentatives, la disponibilité malgré un échec de synchronisation, le nettoyage différé, les mesures partielles, les sources ambiguës et le plein écran. La régression Échap a été observée en échec puis corrigée par un listener limité à la visionneuse qui possède le plein écran ; les huit tests de `ModelViewer` passent sans recréation du renderer.
+
+ESLint, TypeScript, Prettier, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, la syntaxe du harness et `git diff --check` passent. Les builds Vite et Tauri debug sans bundle avec dépendances verrouillées réussissent. Les avertissements de hardlinks du cache incrémental Rust utilisent une copie de repli et n’affectent pas le résultat.
+
+Le binaire final inspecté est `target/debug/edge-lock.exe`, PE **x64 (`0x8664`)**, version fichier et produit **0.3.0**, **25 700 352 octets**, SHA-256 **`B1C2AD8158A60D6E5CA4FA436816EC2B85A08F64B9CA0528651C5696F6F894A0`**. Le harness enregistre désormais le chemin et l’empreinte de l’exécutable effectivement testé dans son rapport.
+
+### Parcours Windows et captures
+
+Le rapport `.test-data/desktop-OPEGeE/report.json` est **`passed` pour 19 groupes de vérifications**, sur le binaire final identifié ci-dessus, avec bibliothèque, réglages et profil WebView2 jetables. Il conserve les parcours d’import, synchronisation Blender réelle, textures, animation, navigation, versions/variantes, exports, historique Zstd, redémarrage et suppression des archives. L’annulation de la confirmation conserve les modifications ; sa validation rétablit les fichiers et réglages avec tête, backup et nombre de versions inchangés.
+
+Le sélecteur d’aperçu mesure **30 px** de haut et se trouve entre provenance et actualisation, sans débordement. La visionneuse mesure **545,2 px** à 1440 × 940 et **420 px** à 1024 × 700. Le plein écran est vérifié à la fois par le DOM et par l’état natif de la fenêtre Tauri. Entrée, sortie par icône et Échap conservent le même canvas, contexte WebGL et temps d’animation. Les dix cycles bibliothèque/fiche gardent au maximum un contexte, aucun dans la galerie et aucune URL blob active.
+
+Les captures `preview-toolbar-1440.png`, `preview-toolbar-1024.png`, `preview-fullscreen-1440.png`, `discard-confirmation-1024.png` et `discard-restored.png` ont été inspectées. Le premier lancement du pilote local dans le sandbox n’a pas pu joindre localhost ; l’exécution autorisée hors sandbox a ensuite révélé l’absence de sortie Échap native dans WebView2. Après le correctif et la reconstruction, le parcours complet final réussit, y compris les confirmations à 1440 et 1024 px.
+
+Le benchmark séparé des 50 imports est explicitement omis avec `EDGE_LOCK_E2E_SKIP_GALLERY_BENCHMARK=1`. Les scénarios personnels Kitsune/personnage et la fixture GPU de plus de 512 Mio ne sont pas activés pour ce passage. Les sources utilisées restent exclusivement synthétiques ; leurs contenus originaux sont vérifiés inchangés par le harness.
 
 ## Sources multiples et suppression des archives — 4 novembre 2026
 

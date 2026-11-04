@@ -10,6 +10,7 @@ const names: Record<Job["kind"], string> = {
   storagePlan: "Analyse du stockage",
   storageApply: "Optimisation du stockage",
   restore: "Restauration du backup",
+  discardChanges: "Annulation des modifications",
   thumbnail: "Préparation de la vignette",
   import: "Import du dossier",
   create: "Création de l’asset",

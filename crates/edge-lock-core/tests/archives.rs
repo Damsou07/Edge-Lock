@@ -193,7 +193,7 @@ fn owned_glb_backups_are_released_only_after_their_last_asset_owner() {
     let plan = library
         .plan_archive_deletion(Some(&b.asset.id), &ctx)
         .unwrap();
-    assert!(!plan.warnings.is_empty());
+    assert!(plan.warnings.is_empty());
     library
         .apply_archive_deletion(Some(&b.asset.id), &plan.plan_token, &ctx)
         .unwrap();
@@ -263,7 +263,7 @@ fn schema_three_upgrade_preserves_asset_history_and_unattributed_backup_files() 
     drop(library);
     let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
     db.execute_batch(
-        "DROP TABLE glb_backup_owners; DROP TABLE archive_deletions; PRAGMA user_version=3;",
+        "DROP TABLE glb_backup_owners; DROP TABLE archive_deletions; DROP TABLE workspace_discards; PRAGMA user_version=3;",
     )
     .unwrap();
     drop(db);
@@ -291,7 +291,7 @@ fn schema_three_upgrade_preserves_asset_history_and_unattributed_backup_files() 
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     let backup = fs::read_dir(root.join("backups"))
         .unwrap()
@@ -466,26 +466,34 @@ fn every_archive_deletion_boundary_recovers_after_process_exit() {
 
 #[cfg(windows)]
 #[test]
-fn locked_workspace_refuses_deletion_without_altering_catalog_or_files() {
+fn locked_workspace_is_removed_logically_without_blocking_other_writes() {
     use std::os::windows::fs::OpenOptionsExt;
     let temp = tempfile::tempdir().unwrap();
     let library = Library::open(temp.path().join("library")).unwrap();
     let a = import(&library, temp.path(), "A", b"locked");
     archive(&library, &a);
     let ctx = OperationContext::default();
-    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
     let handle = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
         .open(Path::new(&a.variants[0].workspace_path).join("main.blend"))
         .unwrap();
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    let report = library
+        .apply_archive_deletion(None, &plan.plan_token, &ctx)
+        .unwrap();
+    assert!(report.cleanup_pending);
     assert!(
-        library
-            .apply_archive_deletion(None, &plan.plan_token, &ctx)
-            .is_err()
+        report.released_bytes > 0,
+        "Successful object cleanup must be counted even while the workspace is locked"
     );
+    assert!(library.get_asset(&a.asset.id).is_err());
+    library.save_category(None, "Still writable", None).unwrap();
+    assert_eq!(library.info().unwrap().asset_count, 0);
     drop(handle);
-    assert!(library.get_asset(&a.asset.id).unwrap().asset.archived);
+    let root = library.root().to_path_buf();
+    drop(library);
+    let library = Library::open(root).unwrap();
     assert_eq!(
         fs::read_dir(library.root().join("staging"))
             .unwrap()
@@ -539,7 +547,7 @@ fn committed_deletion_reports_pending_cleanup_and_retries_idempotently_after_reo
     assert!(
         library
             .plan_archive_deletion(None, &OperationContext::default())
-            .is_err()
+            .is_ok()
     );
     drop(library);
     let library = Library::open(&root).unwrap();
@@ -628,12 +636,15 @@ fn modified_committed_deletion_journal_is_preserved_until_original_is_restored()
     fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
     let library = Library::open(&root).unwrap();
     assert!(!library.info().unwrap().recovery_notices.is_empty());
-    assert!(directory.join(&asset.asset.id).is_dir());
+    assert!(root.join("workspaces").join(&asset.asset.id).is_dir());
     assert!(
         library
             .plan_archive_deletion(None, &OperationContext::default())
-            .is_err()
+            .is_ok()
     );
+    library
+        .save_category(None, "Unrelated write", None)
+        .unwrap();
     drop(library);
     fs::write(path, original).unwrap();
     let library = Library::open(&root).unwrap();
@@ -667,7 +678,14 @@ fn recreated_workspace_after_committed_crash_preserves_new_work_and_staged_origi
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let journal = fs::read_dir(root.join("staging"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let recreated = root.join("workspaces").join(&asset.asset.id);
+    fs::rename(&recreated, journal.join(&asset.asset.id)).unwrap();
     fs::create_dir_all(&recreated).unwrap();
     fs::write(recreated.join("new.txt"), b"new user work").unwrap();
     let library = Library::open(&root).unwrap();
@@ -692,4 +710,218 @@ fn recreated_workspace_after_committed_crash_preserves_new_work_and_staged_origi
         b"new user work"
     );
     assert!(!journal.exists());
+}
+
+#[test]
+fn unrelated_legacy_backup_storage_is_ignored_entirely() {
+    let temp = tempfile::tempdir().unwrap();
+    let library = Library::open(temp.path().join("library")).unwrap();
+    let asset = import(&library, temp.path(), "Asset", b"owned");
+    archive(&library, &asset);
+    fs::create_dir_all(library.root().join("backups")).unwrap();
+    let legacy = library.root().join("backups/glb");
+    fs::write(&legacy, b"unrelated old storage").unwrap();
+    let ctx = OperationContext::default();
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    assert!(plan.warnings.is_empty());
+    let report = library
+        .apply_archive_deletion(None, &plan.plan_token, &ctx)
+        .unwrap();
+    assert!(!report.cleanup_pending);
+    assert_eq!(fs::read(legacy).unwrap(), b"unrelated old storage");
+}
+
+#[cfg(windows)]
+fn prevent_workspace_rename(path: &Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(0x02000000)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_original_directory_does_not_block_other_archive_deletions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("library");
+    let library = Library::open(&root).unwrap();
+    let first = import(&library, temp.path(), "First", b"first");
+    archive(&library, &first);
+    let original = root.join("workspaces").join(&first.asset.id);
+    let handle = prevent_workspace_rename(&original);
+    let ctx = OperationContext::default();
+    let plan = library
+        .plan_archive_deletion(Some(&first.asset.id), &ctx)
+        .unwrap();
+    assert!(plan.workspace_bytes_complete);
+    let report = library
+        .apply_archive_deletion(Some(&first.asset.id), &plan.plan_token, &ctx)
+        .unwrap();
+    assert!(report.cleanup_pending);
+    assert!(original.is_dir());
+    let second = import(&library, temp.path(), "Second", b"second");
+    archive(&library, &second);
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    let report = library
+        .apply_archive_deletion(None, &plan.plan_token, &ctx)
+        .unwrap();
+    assert_eq!(report.deleted_asset_ids, vec![second.asset.id]);
+    assert!(!report.cleanup_pending);
+    assert_eq!(library.info().unwrap().asset_count, 0);
+    drop(handle);
+    drop(library);
+    let library = Library::open(&root).unwrap();
+    assert!(library.info().unwrap().recovery_notices.is_empty());
+    assert!(!original.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn recreated_original_workspace_is_never_cleaned_after_a_locked_deletion() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("library");
+    let library = Library::open(&root).unwrap();
+    let asset = import(&library, temp.path(), "Asset", b"original");
+    archive(&library, &asset);
+    let original = root.join("workspaces").join(&asset.asset.id);
+    let handle = prevent_workspace_rename(&original);
+    let ctx = OperationContext::default();
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    assert!(
+        library
+            .apply_archive_deletion(None, &plan.plan_token, &ctx)
+            .unwrap()
+            .cleanup_pending
+    );
+    drop(handle);
+    drop(library);
+    fs::rename(&original, temp.path().join("recovered-original")).unwrap();
+    fs::create_dir(&original).unwrap();
+    fs::write(original.join("new.txt"), b"new work").unwrap();
+    let library = Library::open(&root).unwrap();
+    assert_eq!(fs::read(original.join("new.txt")).unwrap(), b"new work");
+    assert!(!library.info().unwrap().recovery_notices.is_empty());
+    library.save_category(None, "Still writable", None).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn uninspectable_workspace_is_removed_logically_and_kept_for_manual_recovery() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("library");
+    let library = Library::open(&root).unwrap();
+    let asset = import(&library, temp.path(), "Asset", b"preserved");
+    archive(&library, &asset);
+    let original = root.join("workspaces").join(&asset.asset.id);
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x02000000)
+        .open(&original)
+        .unwrap();
+    let ctx = OperationContext::default();
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    assert!(!plan.workspace_bytes_complete);
+    assert!(
+        library
+            .apply_archive_deletion(None, &plan.plan_token, &ctx)
+            .unwrap()
+            .cleanup_pending
+    );
+    let info = library.info().unwrap();
+    assert_eq!(info.asset_count, 0);
+    assert!(!info.physical_bytes_complete);
+    library
+        .save_category(None, "Unrelated write", None)
+        .unwrap();
+    drop(handle);
+    drop(library);
+    let library = Library::open(&root).unwrap();
+    assert!(original.is_dir());
+    assert!(!library.info().unwrap().recovery_notices.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn edits_to_a_retained_workspace_are_preserved_on_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("library");
+    let library = Library::open(&root).unwrap();
+    let asset = import(&library, temp.path(), "Asset", b"original");
+    archive(&library, &asset);
+    let original = root.join("workspaces").join(&asset.asset.id);
+    let handle = prevent_workspace_rename(&original);
+    let ctx = OperationContext::default();
+    let plan = library.plan_archive_deletion(None, &ctx).unwrap();
+    assert!(
+        library
+            .apply_archive_deletion(None, &plan.plan_token, &ctx)
+            .unwrap()
+            .cleanup_pending
+    );
+    drop(handle);
+    let file = Path::new(&asset.variants[0].workspace_path).join("main.blend");
+    fs::write(&file, b"new work after deletion").unwrap();
+    drop(library);
+    let library = Library::open(&root).unwrap();
+    assert_eq!(fs::read(file).unwrap(), b"new work after deletion");
+    assert!(!library.info().unwrap().recovery_notices.is_empty());
+}
+
+#[test]
+fn committed_v1_journal_remains_authenticated_and_cleans_staged_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("library");
+    let library = Library::open(&root).unwrap();
+    let asset = import(&library, temp.path(), "Asset", b"legacy owned files");
+    archive(&library, &asset);
+    drop(library);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "archive_crash_helper",
+            "--nocapture",
+        ])
+        .env("EDGE_LOCK_DELETE_ROOT", &root)
+        .env("EDGE_LOCK_DELETE_PHASE", "Suppression : catalogue publié")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(92));
+    let directory = fs::read_dir(root.join("staging"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::rename(
+        root.join("workspaces").join(&asset.asset.id),
+        directory.join(&asset.asset.id),
+    )
+    .unwrap();
+    let path = directory.join("delete.json");
+    let mut journal: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    journal["version"] = serde_json::json!(1);
+    for target in journal["targets"].as_array_mut().unwrap() {
+        target.as_object_mut().unwrap().remove("workspace_evidence");
+    }
+    let bytes = serde_json::to_vec(&journal).unwrap();
+    fs::write(path, &bytes).unwrap();
+    let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE archive_deletions SET journal_hash=?1 WHERE id=?2",
+        rusqlite::params![
+            blake3::hash(&bytes).to_hex().to_string(),
+            journal["id"].as_str().unwrap()
+        ],
+    )
+    .unwrap();
+    drop(db);
+    let library = Library::open(&root).unwrap();
+    assert!(library.info().unwrap().recovery_notices.is_empty());
+    assert!(!directory.exists());
 }

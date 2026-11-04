@@ -65,7 +65,7 @@ it("analyse toutes les archives et attend une confirmation avant suppression", a
   );
   expect(deleted).toHaveBeenCalledTimes(1);
 });
-it("signale un nettoyage incomplet sans annoncer une suppression totale", async () => {
+it("confirme le retrait des archives avec un nettoyage différé informatif", async () => {
   const run = vi.fn(async (request: JobRequest) =>
     request.kind === "archiveDeletionPlan"
       ? plan
@@ -89,9 +89,35 @@ it("signale un nettoyage incomplet sans annoncer une suppression totale", async 
   await userEvent.click(
     screen.getByRole("button", { name: "Supprimer définitivement" }),
   );
-  expect(await screen.findByText(/Nettoyage à terminer/)).toBeInTheDocument();
+  expect(
+    await screen.findByText(
+      /Archives supprimées ; nettoyage de certains fichiers différé/,
+    ),
+  ).toHaveAttribute("role", "status");
   expect(screen.getByText("Fichier verrouillé")).toBeInTheDocument();
+  expect(screen.getByText("Fichier verrouillé")).not.toHaveClass(
+    "inline-error",
+  );
   expect(
     screen.queryByRole("button", { name: "Supprimer définitivement" }),
   ).not.toBeInTheDocument();
+});
+
+it("présente une estimation partielle sans empêcher la confirmation", async () => {
+  const run = vi
+    .fn()
+    .mockResolvedValue({ ...plan, workspaceBytesComplete: false });
+  render(
+    <ArchiveDeletionModal
+      runJob={run as RunJob}
+      onClose={vi.fn()}
+      onDeleted={vi.fn()}
+    />,
+  );
+  expect(
+    await screen.findByText(/Dossiers de travail : au moins/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Supprimer définitivement" }),
+  ).toBeEnabled();
 });

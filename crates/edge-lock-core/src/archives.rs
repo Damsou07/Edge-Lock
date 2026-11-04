@@ -1,6 +1,9 @@
 //! Explicit deletion of archived assets, with recoverable filesystem publication.
 use super::*;
 use serde::{Deserialize, Serialize};
+#[path = "deletion_evidence.rs"]
+mod evidence;
+use evidence::WorkspaceEvidence;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +23,7 @@ pub struct ArchiveDeletionPlan {
     pub variant_count: u64,
     pub snapshot_count: u64,
     pub workspace_bytes: u64,
+    pub workspace_bytes_complete: bool,
     pub warnings: Vec<String>,
 }
 
@@ -39,6 +43,8 @@ struct Target {
     workspace: String,
     variant_ids: Vec<String>,
     backup_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_evidence: Option<WorkspaceEvidence>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,7 +59,27 @@ struct Prepared {
     plan: ArchiveDeletionPlan,
     targets: Vec<Target>,
     candidates: BTreeMap<String, u64>,
-    entries: BTreeMap<String, Vec<ManifestEntry>>,
+}
+
+#[derive(Default)]
+struct CleanupOutcome {
+    released_bytes: u64,
+    warnings: Vec<String>,
+}
+
+impl CleanupOutcome {
+    fn record(&mut self, result: Result<u64>) -> bool {
+        match result {
+            Ok(bytes) => {
+                self.released_bytes = self.released_bytes.saturating_add(bytes);
+                true
+            }
+            Err(error) => {
+                self.warnings.push(error.to_string());
+                false
+            }
+        }
+    }
 }
 
 fn ordinary_file(path: &Path) -> Result<bool> {
@@ -93,10 +119,19 @@ fn known_hash(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn ensure_no_deletion(root: &Path) -> Result<()> {
+pub(super) fn ensure_no_deletion(root: &Path, db: &Connection) -> Result<()> {
     for entry in fs::read_dir(root.join("staging"))? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("delete-") {
+        let name = entry.file_name();
+        if let Some(id) = name.to_str().and_then(|name| name.strip_prefix("delete-")) {
+            let committed: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_deletions WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if committed {
+                continue;
+            }
             return Err(CoreError::Busy("Une suppression attend son nettoyage. Fermez les fichiers concernés puis rouvrez la bibliothèque.".into()));
         }
     }
@@ -172,7 +207,6 @@ impl Library {
     ) -> Result<Prepared> {
         ctx.check_cancelled()?;
         let mut targets = Vec::new();
-        let mut entries = BTreeMap::new();
         let mut candidates = BTreeMap::new();
         let mut state = Vec::new();
         let mut plan = ArchiveDeletionPlan {
@@ -184,6 +218,7 @@ impl Library {
             variant_count: 0,
             snapshot_count: 0,
             workspace_bytes: 0,
+            workspace_bytes_complete: true,
             warnings: vec![],
         };
         let db = self.db()?;
@@ -265,30 +300,36 @@ impl Library {
                 workspace,
                 variant_ids,
                 backup_hashes,
+                workspace_evidence: None,
             });
         }
         drop(db);
         ensure_real_directory(&self.root.join("workspaces"))?;
-        for target in &targets {
+        for target in &mut targets {
             let path = self.root.join(safe_relative(&target.workspace)?);
-            let manifest = match fs::symlink_metadata(&path) {
-                Ok(_) => self.store.capture(&path, false, ctx)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
-                Err(error) => return Err(error.into()),
-            };
-            plan.workspace_bytes = plan
-                .workspace_bytes
-                .saturating_add(manifest.iter().map(|e| e.size).sum::<u64>());
-            entries.insert(target.asset_id.clone(), manifest);
+            ctx.check_cancelled()?;
+            match WorkspaceEvidence::capture(&path) {
+                Ok(evidence) => {
+                    plan.workspace_bytes = plan.workspace_bytes.saturating_add(evidence.bytes());
+                    target.workspace_evidence = Some(evidence);
+                }
+                Err(CoreError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && fs::symlink_metadata(&path)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => {
+                    plan.workspace_bytes_complete = false;
+                    plan.warnings.push(format!("Workspace non vérifiable ; les fichiers inaccessibles seront conservés pour récupération : {} ({error})", path.display()));
+                }
+            }
         }
         plan.asset_count = targets.len() as u64;
         plan.variant_count = plan.variant_ids.len() as u64;
-        plan.warnings = legacy_backup_warnings(&self.root, &*self.db()?)?;
         plan.plan_token = blake3::hash(&serde_json::to_vec(&(
             self.root.to_string_lossy(),
             asset_id,
             state,
-            &entries,
+            &targets,
         ))?)
         .to_hex()
         .to_string();
@@ -296,7 +337,6 @@ impl Library {
             plan,
             targets,
             candidates,
-            entries,
         })
     }
 
@@ -331,7 +371,7 @@ impl Library {
             .prefix(".delete-preparing-")
             .tempdir_in(&self.store.staging)?;
         let journal = DeletionJournal {
-            version: 1,
+            version: 2,
             id,
             targets: prepared.targets,
             candidates: prepared.candidates,
@@ -348,35 +388,9 @@ impl Library {
         fs::rename(preparing.path(), &directory)?;
         ctx.report("Suppression : journal publié", 1, Some(4));
         let result = (|| -> Result<()> {
-            // Readers cannot observe renamed workspaces with an uncommitted catalogue.
+            // V2 publishes the catalogue before touching workspaces: locks only defer cleanup.
             let mut db = self.db()?;
             let tx = db.transaction()?;
-            for target in &journal.targets {
-                ctx.check_cancelled()?;
-                let source = self.root.join(safe_relative(&target.workspace)?);
-                let destination = directory.join(&target.asset_id);
-                if source.exists() {
-                    ensure_real_directory(&source)?;
-                    #[cfg(windows)]
-                    for entry in &prepared.entries[&target.asset_id] {
-                        if entry.kind == "file" {
-                            use std::os::windows::fs::OpenOptionsExt;
-                            let _handle = OpenOptions::new()
-                                .read(true)
-                                .share_mode(0)
-                                .open(source.join(safe_relative(&entry.path)?))?;
-                        }
-                    }
-                    fs::rename(source, &destination)?;
-                    if self.store.capture(&destination, false, ctx)?
-                        != prepared.entries[&target.asset_id]
-                    {
-                        return Err(CoreError::Busy(
-                            "Les fichiers ont changé pendant la suppression.".into(),
-                        ));
-                    }
-                }
-            }
             ctx.report("Suppression : dossiers préservés", 2, Some(4));
             ctx.check_cancelled()?;
             for (hash, size) in &journal.candidates {
@@ -421,7 +435,11 @@ impl Library {
         }
         ctx.report("Suppression : catalogue publié", 3, Some(4));
         match recover_one(&self.root, &mut *self.db()?, &directory) {
-            Ok(bytes) => report.released_bytes = bytes,
+            Ok(outcome) => {
+                report.released_bytes = outcome.released_bytes;
+                report.cleanup_pending = !outcome.warnings.is_empty();
+                report.warnings.extend(outcome.warnings);
+            }
             Err(error) => {
                 report.cleanup_pending = true;
                 report.warnings.push(format!(
@@ -442,42 +460,7 @@ impl Library {
     }
 }
 
-fn legacy_backup_warnings(root: &Path, db: &Connection) -> Result<Vec<String>> {
-    let directory = root.join("backups/glb");
-    if !directory.exists() {
-        return Ok(vec![]);
-    }
-    ensure_real_directory(&root.join("backups"))?;
-    ensure_real_directory(&directory)?;
-    let mut count = 0;
-    for item in fs::read_dir(directory)? {
-        let path = item?.path();
-        if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("glb"))
-            && ordinary_file(&path)?
-        {
-            let hash = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-            let owned: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM glb_backup_owners WHERE hash=?1)",
-                [hash],
-                |r| r.get(0),
-            )?;
-            if !owned {
-                count += 1;
-            }
-        }
-    }
-    Ok(if count == 0 {
-        vec![]
-    } else {
-        vec![format!(
-            "{count} sauvegarde(s) GLB ancienne(s) sans propriétaire identifié seront conservées."
-        )]
-    })
-}
-
-fn read_journal(root: &Path, directory: &Path) -> Result<DeletionJournal> {
+fn read_journal(root: &Path, directory: &Path) -> Result<(DeletionJournal, String)> {
     ensure_real_directory(directory)?;
     let path = directory.join("delete.json");
     if !ordinary_file(&path)? || fs::metadata(&path)?.len() > 64 * 1024 * 1024 {
@@ -485,8 +468,9 @@ fn read_journal(root: &Path, directory: &Path) -> Result<DeletionJournal> {
             "Journal de suppression invalide.".into(),
         ));
     }
-    let journal: DeletionJournal = serde_json::from_slice(&fs::read(path)?)?;
-    if journal.version != 1
+    let bytes = fs::read(path)?;
+    let journal: DeletionJournal = serde_json::from_slice(&bytes)?;
+    if !matches!(journal.version, 1 | 2)
         || directory.file_name().and_then(|n| n.to_str()) != Some(&format!("delete-{}", journal.id))
         || directory.parent() != Some(root.join("staging").as_path())
         || journal.targets.is_empty()
@@ -508,14 +492,17 @@ fn read_journal(root: &Path, directory: &Path) -> Result<DeletionJournal> {
         for hash in &target.backup_hashes {
             known_hash(hash)?;
         }
+        if let Some(evidence) = &target.workspace_evidence {
+            evidence.validate()?;
+        }
     }
     for hash in journal.candidates.keys() {
         known_hash(hash)?;
     }
-    Ok(journal)
+    Ok((journal, blake3::hash(&bytes).to_hex().to_string()))
 }
 
-fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64> {
+fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<CleanupOutcome> {
     ensure_real_directory(directory)?;
     if !directory.join("delete.json").exists() && fs::read_dir(directory)?.next().is_none() {
         // The final directory removal can be interrupted after the journal unlink.
@@ -527,9 +514,9 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64
         {
             db.execute("DELETE FROM archive_deletions WHERE id=?1", [id])?;
         }
-        return Ok(0);
+        return Ok(CleanupOutcome::default());
     }
-    let journal = read_journal(root, directory)?;
+    let (journal, digest) = read_journal(root, directory)?;
     let mut present = 0;
     for target in &journal.targets {
         if db.query_row(
@@ -553,9 +540,6 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64
         )
         .optional()?;
     if present == 0 {
-        let digest = blake3::hash(&serde_json::to_vec(&journal)?)
-            .to_hex()
-            .to_string();
         if receipt.as_deref() != Some(&digest) {
             return Err(CoreError::Inconsistent(
                 "Journal de suppression modifié ou sans reçu du catalogue ; fichiers préservés."
@@ -584,6 +568,9 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64
                 ));
             }
         }
+    }
+    if journal.version == 2 {
+        return recover_v2(root, db, directory, &journal, present == 0);
     }
     let mut released = 0;
     ensure_real_directory(&root.join("workspaces"))?;
@@ -624,7 +611,7 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64
         }
     }
     if present == 0 {
-        released += cleanup_caches(root, db, &journal.targets)?;
+        cleanup_caches(root, db, &journal.targets, &mut released)?;
         let store = FileStore {
             objects: root.join("objects"),
             staging: root.join("staging"),
@@ -667,7 +654,177 @@ fn recover_one(root: &Path, db: &mut Connection, directory: &Path) -> Result<u64
     fs::remove_file(directory.join("delete.json"))?;
     fs::remove_dir(directory)?;
     db.execute("DELETE FROM archive_deletions WHERE id=?1", [&journal.id])?;
-    Ok(released)
+    Ok(CleanupOutcome {
+        released_bytes: released,
+        warnings: vec![],
+    })
+}
+
+fn path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_v2_workspace(
+    root: &Path,
+    directory: &Path,
+    target: &Target,
+    outcome: &mut CleanupOutcome,
+) -> Result<()> {
+    ensure_real_directory(&root.join("workspaces"))?;
+    let original = root.join(safe_relative(&target.workspace)?);
+    let staged = directory.join(&target.asset_id);
+    if path_present(&staged)? && path_present(&original)? {
+        return Err(CoreError::Inconsistent(
+            "Deux dossiers de travail présents ; fichiers conservés pour récupération.".into(),
+        ));
+    }
+    if !path_present(&staged)? && path_present(&original)? {
+        let evidence = target.workspace_evidence.as_ref().ok_or_else(|| {
+            CoreError::Busy(format!(
+                "Workspace non identifiable ; récupération manuelle requise : {}",
+                original.display()
+            ))
+        })?;
+        evidence.verify(&original, false)?;
+        fs::rename(&original, &staged)?;
+    }
+    if path_present(&staged)? {
+        let evidence = target.workspace_evidence.as_ref().ok_or_else(|| {
+            CoreError::Inconsistent(
+                "Workspace de suppression sans preuve de propriété ; fichiers préservés.".into(),
+            )
+        })?;
+        // Verify again after the rename, including crash recovery and partial deletion.
+        let current = evidence.verify(&staged, true)?;
+        for entry in current.entries.iter().filter(|entry| !entry.directory) {
+            outcome.record(evidence.remove_file(&staged, entry));
+        }
+        let mut directories = current
+            .entries
+            .iter()
+            .filter(|entry| entry.directory)
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|entry| std::cmp::Reverse(entry.path.split('/').count()));
+        for entry in directories {
+            if let Err(error) = fs::remove_dir(staged.join(safe_relative(&entry.path)?))
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                outcome.warnings.push(error.to_string());
+            }
+        }
+        if let Err(error) = fs::remove_dir(&staged)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            outcome.warnings.push(error.to_string());
+        }
+    }
+    if path_present(&original)? {
+        return Err(CoreError::Inconsistent(format!(
+            "Un workspace est encore présent ; fichiers conservés : {}",
+            original.display()
+        )));
+    }
+    Ok(())
+}
+
+fn recover_v2(
+    root: &Path,
+    db: &mut Connection,
+    directory: &Path,
+    journal: &DeletionJournal,
+    committed: bool,
+) -> Result<CleanupOutcome> {
+    if !committed {
+        // V2 never moves any workspace before publishing its catalogue receipt.
+        for target in &journal.targets {
+            if path_present(&directory.join(&target.asset_id))? {
+                return Err(CoreError::Inconsistent(
+                    "Dossier déplacé sans reçu de suppression ; fichiers préservés.".into(),
+                ));
+            }
+        }
+        fs::remove_file(directory.join("delete.json"))?;
+        fs::remove_dir(directory)?;
+        return Ok(CleanupOutcome::default());
+    }
+    let mut outcome = CleanupOutcome::default();
+    for target in &journal.targets {
+        if let Err(error) = cleanup_v2_workspace(root, directory, target, &mut outcome) {
+            outcome.warnings.push(error.to_string());
+        }
+    }
+    if let Err(error) = cleanup_caches(root, db, &journal.targets, &mut outcome.released_bytes) {
+        outcome.warnings.push(error.to_string());
+    }
+    let store = FileStore {
+        objects: root.join("objects"),
+        staging: root.join("staging"),
+    };
+    for hash in journal.candidates.keys() {
+        let result = (|| -> Result<()> {
+            let referenced: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM snapshot_entries WHERE hash=?1)",
+                [hash],
+                |r| r.get(0),
+            )?;
+            if referenced {
+                return Ok(());
+            }
+            let path = store.object_path(hash)?;
+            let raw_removed = outcome.record(remove_file_if_regular(&path));
+            let compressed_removed =
+                outcome.record(remove_file_if_regular(&path.with_extension("zst")));
+            if raw_removed && compressed_removed {
+                db.execute("DELETE FROM garbage_candidates WHERE hash=?1", [hash])?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            outcome.warnings.push(error.to_string());
+        }
+    }
+    for hash in journal
+        .targets
+        .iter()
+        .flat_map(|target| &target.backup_hashes)
+        .collect::<BTreeSet<_>>()
+    {
+        let result = (|| -> Result<u64> {
+            let referenced: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM glb_backup_owners WHERE hash=?1)",
+                [hash],
+                |r| r.get(0),
+            )?;
+            if referenced {
+                return Ok(0);
+            }
+            let backups = root.join("backups/glb");
+            if !path_present(&backups)? {
+                return Ok(0);
+            }
+            ensure_real_directory(&root.join("backups"))?;
+            ensure_real_directory(&backups)?;
+            remove_file_if_regular(&backups.join(format!("{hash}.glb")))
+        })();
+        outcome.record(result);
+    }
+    if outcome.warnings.is_empty() {
+        let finalized = (|| -> Result<()> {
+            fs::remove_file(directory.join("delete.json"))?;
+            fs::remove_dir(directory)?;
+            db.execute("DELETE FROM archive_deletions WHERE id=?1", [&journal.id])?;
+            Ok(())
+        })();
+        if let Err(error) = finalized {
+            outcome.warnings.push(error.to_string());
+        }
+    }
+    outcome.warnings.truncate(8);
+    Ok(outcome)
 }
 
 fn remove_file_if_regular(path: &Path) -> Result<u64> {
@@ -683,10 +840,16 @@ pub(super) fn recover_deletions(root: &Path, db: &mut Connection) -> Result<Vec<
     let mut notices = Vec::new();
     for entry in fs::read_dir(root.join("staging"))? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("delete-")
-            && let Err(error) = recover_one(root, db, &entry.path())
-        {
-            notices.push(format!("Suppression à récupérer : {error}"));
+        if entry.file_name().to_string_lossy().starts_with("delete-") {
+            match recover_one(root, db, &entry.path()) {
+                Ok(outcome) => notices.extend(
+                    outcome
+                        .warnings
+                        .into_iter()
+                        .map(|warning| format!("Suppression à récupérer : {warning}")),
+                ),
+                Err(error) => notices.push(format!("Suppression à récupérer : {error}")),
+            }
         }
     }
     let receipts: Vec<String> = db
@@ -697,22 +860,30 @@ pub(super) fn recover_deletions(root: &Path, db: &mut Connection) -> Result<Vec<
         if safe_relative(&id)?.components().count() != 1 {
             continue;
         }
-        if !root.join("staging").join(format!("delete-{id}")).exists() {
-            db.execute("DELETE FROM archive_deletions WHERE id=?1", [id])?;
+        match path_present(&root.join("staging").join(format!("delete-{id}"))) {
+            Ok(false) => {
+                db.execute("DELETE FROM archive_deletions WHERE id=?1", [id])?;
+            }
+            Ok(true) => {}
+            Err(error) => notices.push(format!("Suppression à récupérer : {error}")),
         }
     }
     Ok(notices)
 }
 
 /// Cache files are disposable, but shared images/artifacts retain their live indexes.
-fn cleanup_caches(root: &Path, _db: &Connection, targets: &[Target]) -> Result<u64> {
+fn cleanup_caches(
+    root: &Path,
+    _db: &Connection,
+    targets: &[Target],
+    released: &mut u64,
+) -> Result<()> {
     let cache = root.join("cache");
     if !cache.exists() {
-        return Ok(0);
+        return Ok(());
     }
     ensure_real_directory(&cache)?;
     let variants: Vec<_> = targets.iter().flat_map(|t| &t.variant_ids).collect();
-    let mut released = 0;
     for folder in ["sync", "previews", "thumbnails", "canonical", "exports"] {
         let directory = cache.join(folder);
         if !directory.exists() {
@@ -727,7 +898,7 @@ fn cleanup_caches(root: &Path, _db: &Connection, targets: &[Target]) -> Result<u
                     "previews" => format!("choice-{key}.json"),
                     _ => format!("index-{key}.json"),
                 };
-                released += remove_file_if_regular(&directory.join(name))?;
+                *released += remove_file_if_regular(&directory.join(name))?;
                 if folder == "previews" {
                     let prefix = format!("choice-{key}-");
                     for item in fs::read_dir(&directory)? {
@@ -738,7 +909,7 @@ fn cleanup_caches(root: &Path, _db: &Connection, targets: &[Target]) -> Result<u
                             .and_then(|name| name.strip_suffix(".json"))
                             .is_some_and(|hash| known_hash(hash).is_ok())
                         {
-                            released += remove_file_if_regular(&path)?;
+                            *released += remove_file_if_regular(&path)?;
                         }
                     }
                 }
@@ -775,7 +946,7 @@ fn cleanup_caches(root: &Path, _db: &Connection, targets: &[Target]) -> Result<u
                     })
                 });
                 if owned {
-                    released += remove_file_if_regular(&path)?;
+                    *released += remove_file_if_regular(&path)?;
                 }
             }
         }
@@ -833,12 +1004,12 @@ fn cleanup_caches(root: &Path, _db: &Connection, targets: &[Target]) -> Result<u
                 _ => name.len() == 68 && name.ends_with(".glb"),
             };
             if generated && !live.contains(hash) {
-                released += remove_file_if_regular(&path)?;
+                *released += remove_file_if_regular(&path)?;
                 if folder == "exports" {
-                    released += remove_file_if_regular(&path.with_extension("json"))?;
+                    *released += remove_file_if_regular(&path.with_extension("json"))?;
                 }
             }
         }
     }
-    Ok(released)
+    Ok(())
 }

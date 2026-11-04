@@ -1,4 +1,10 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import type { GLTF } from "three/addons/loaders/GLTFLoader.js";
@@ -8,6 +14,21 @@ import {
   disposePreviewRenderer,
 } from "./viewer-runtime";
 import ModelViewer from "./ModelViewer";
+
+let fullscreenElement: Element | null = null;
+function enterFullscreen(element: Element) {
+  fullscreenElement = element;
+  document.dispatchEvent(new Event("fullscreenchange"));
+  return Promise.resolve();
+}
+const requestFullscreen = vi.fn(function (this: Element) {
+  return enterFullscreen(this);
+});
+const exitFullscreen = vi.fn(() => {
+  fullscreenElement = null;
+  document.dispatchEvent(new Event("fullscreenchange"));
+  return Promise.resolve();
+});
 
 vi.mock("three/addons/controls/OrbitControls.js", () => ({
   OrbitControls: class {
@@ -37,6 +58,22 @@ vi.mock("./viewer-runtime", async (importOriginal) => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  fullscreenElement = null;
+  requestFullscreen.mockImplementation(function (this: Element) {
+    return enterFullscreen(this);
+  });
+  Object.defineProperty(document, "fullscreenElement", {
+    configurable: true,
+    get: () => fullscreenElement,
+  });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
+  Object.defineProperty(document, "exitFullscreen", {
+    configurable: true,
+    value: exitFullscreen,
+  });
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -44,6 +81,102 @@ beforeEach(() => {
       disconnect() {}
     },
   );
+});
+
+function readyModel() {
+  const scene = new THREE.Group();
+  scene.add(
+    new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()),
+  );
+  vi.mocked(loadPreviewModel).mockResolvedValue({
+    scene,
+    scenes: [scene],
+    animations: [],
+  } as unknown as GLTF);
+}
+
+it("bascule en plein écran sans recharger le modèle ni remplacer son canvas", async () => {
+  readyModel();
+  const rendered = render(<ModelViewer url="model.glb" label="TRAVAIL" />);
+  await screen.findByText(/Glisser pour tourner/);
+  const canvas = screen.getByLabelText("Aperçu 3D interactif");
+  const button = screen.getByRole("button", {
+    name: "Afficher l’aperçu en plein écran",
+  });
+  button.focus();
+  fireEvent.click(button);
+  expect(
+    await screen.findByRole("button", { name: "Quitter le plein écran" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(fullscreenElement).toBe(canvas.closest(".model-viewer"));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Quitter le plein écran" }),
+  );
+  await waitFor(() => expect(exitFullscreen).toHaveBeenCalledTimes(1));
+  expect(screen.getByLabelText("Aperçu 3D interactif")).toBe(canvas);
+  expect(loadPreviewModel).toHaveBeenCalledTimes(1);
+  expect(disposePreviewRenderer).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  ).toHaveFocus();
+  rendered.unmount();
+});
+
+it("suit la sortie native du plein écran et le quitte au démontage", async () => {
+  readyModel();
+  const rendered = render(<ModelViewer url="model.glb" label="TRAVAIL" />);
+  await screen.findByText(/Glisser pour tourner/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  );
+  await screen.findByRole("button", { name: "Quitter le plein écran" });
+  act(() => {
+    fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+  });
+  expect(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  ).toHaveAttribute("aria-pressed", "false");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  );
+  await screen.findByRole("button", { name: "Quitter le plein écran" });
+  rendered.unmount();
+  expect(exitFullscreen).toHaveBeenCalledTimes(1);
+  expect(disposePreviewRenderer).toHaveBeenCalledTimes(1);
+});
+
+it("quitte le plein écran avec Échap sans recréer la visionneuse", async () => {
+  readyModel();
+  render(<ModelViewer url="model.glb" label="TRAVAIL" />);
+  await screen.findByText(/Glisser pour tourner/);
+  const canvas = screen.getByLabelText("Aperçu 3D interactif");
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(exitFullscreen).not.toHaveBeenCalled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  );
+  await screen.findByRole("button", { name: "Quitter le plein écran" });
+  fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() => expect(exitFullscreen).toHaveBeenCalledTimes(1));
+  expect(fullscreenElement).toBeNull();
+  expect(screen.getByLabelText("Aperçu 3D interactif")).toBe(canvas);
+  expect(loadPreviewModel).toHaveBeenCalledTimes(1);
+  expect(disposePreviewRenderer).not.toHaveBeenCalled();
+});
+
+it("signale un refus de plein écran sans interrompre l’aperçu", async () => {
+  readyModel();
+  requestFullscreen.mockRejectedValueOnce(new Error("Accès refusé"));
+  render(<ModelViewer url="model.glb" label="TRAVAIL" />);
+  await screen.findByText(/Glisser pour tourner/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Afficher l’aperçu en plein écran" }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent("Accès refusé");
+  expect(screen.getByText(/Glisser pour tourner/)).toBeInTheDocument();
+  expect(loadPreviewModel).toHaveBeenCalledTimes(1);
+  expect(disposePreviewRenderer).not.toHaveBeenCalled();
 });
 
 it.each([false, true])(

@@ -11,4 +11,5 @@ pub mod sync;
 pub use domain::*;
 pub use library::{
     ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, Library, StorageAction,
+    WorkspaceDiscardReport,
 };
