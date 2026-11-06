@@ -1,6 +1,20 @@
 # Validation d’Edge Lock
 
-Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le premier bilan concerne les GLB manuels, les renommages, la suppression de variantes et les sélections persistantes, avec le catalogue au schéma 6. Les bilans précédents sont conservés comme historique ; leurs binaires et empreintes ne contiennent pas ces modifications, même lorsque leur version applicative est également 0.3.0.
+Ce document distingue les contrôles exécutés des procédures restant à exécuter. Le bilan le plus récent couvre l’aperçu des morphs avec modificateurs et la reprise des annulations Windows au schéma 7. Les bilans historiques identifient leurs propres binaires et empreintes, même lorsque la version applicative est également 0.3.0.
+
+## Aperçu évalué et annulation différée — 6 novembre 2026
+
+Les régressions TDD ont d’abord reproduit le refus d’aperçu `SOLIDIFY` + `ARMATURE`, le refus Windows `os error 32` avec un lecteur ouvert et l’échec de lecture d’un cache valide à cause d’un temporaire verrouillé. Blender vérifie la forme évaluée à l’image enregistrée, l’épaisseur, le skin, les animations du rig et les morphs du maillage compatible. Les fixtures avec objets directs et instanciés vérifient l’absence de canaux `weights` orphelins et la conservation des sources et du dernier GLB en cas de refus strict.
+
+Les tests Windows utilisent de vrais handles. Un lecteur peut autoriser la suppression du fichier alors que Windows refuse encore le déplacement du dossier parent. La demande est alors différée. Les régressions couvrent la reprise après déverrouillage et redémarrage, les écritures conservant taille et date, le remplacement du dossier, le contenu initial illisible, la suppression de variante, la migration 6→7 et l’interruption autour du commit. Les tests du cache vérifient l’intégrité du dernier aperçu, l’isolation de sa configuration et l’accès à un aperçu historique lorsque le dossier de travail est indisponible.
+
+La suite Rust compte **166 tests réussis** et 31 cas ignorés en mode ordinaire. Les **175 tests frontend** et les **5 tests de fixtures Node** passent. Prettier, ESLint, TypeScript, `cargo fmt --all --check` et Clippy avec `-D warnings` passent. Les tests Rust utilisent des temporaires sous `.test-data` pour les opérations de renommage.
+
+Les **23 intégrations Blender 5.1.1** passent avec les fixtures jetables, dont 17 pour le worker, 4 pour le cache d’aperçu et 2 pour la synchronisation historique.
+
+Les builds Vite et Tauri debug réussissent. Le binaire `target/debug/edge-lock.exe` est un PE Windows x64, produit **Edge Lock 0.3.0**, de **25 976 320 octets**. Son SHA-256 est `D569D5A413F5953F81719226FD6898E3545B95E85AC16FF768418B010288840A`.
+
+Les **20 groupes de vérifications WebView2** passent sur ce binaire, avec la bibliothèque et le profil jetables du rapport `.test-data/desktop-o5i7jf/report.json`. Le parcours maintient un modèle chargé pendant le verrou, ferme la modale en état d’attente et vérifie la restauration automatique des fichiers et réglages après libération. La capture `discard-waiting.png` montre le modèle et le statut d’attente. Le parcours utilise la détection du runtime installé et le pilote local hors sandbox. Le benchmark séparé de 50 imports et les fixtures personnelles optionnelles sont omis. Le build validé est le binaire debug sans bundle.
 
 ## GLB manuels, variantes et sélections persistantes — 4 novembre 2026
 

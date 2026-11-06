@@ -32,6 +32,8 @@ const snapshot: Snapshot = {
 const report: WorkspaceDiscardReport = {
   variantId: "variant",
   headSnapshotId: "head",
+  pending: false,
+  reconfirmationRequired: false,
   cleanupPending: false,
   warnings: [],
 };
@@ -162,6 +164,35 @@ it("affiche le nettoyage différé après une annulation réussie", async () => 
     screen.queryByRole("button", { name: "Supprimer les modifications" }),
   ).not.toBeInTheDocument();
 });
+
+it.each([
+  [{ pending: true }, "Demande d’annulation enregistrée"],
+  [{ reconfirmationRequired: true }, "Confirmez de nouveau"],
+])(
+  "distingue une demande qui n’a pas restauré les fichiers",
+  async (state, message) => {
+    const onDiscarded = vi.fn();
+    const onClose = vi.fn();
+    render(
+      <WorkspaceDiscardModal
+        variant={variant}
+        runJob={vi.fn().mockResolvedValue({ ...report, ...state }) as RunJob}
+        onClose={onClose}
+        onDiscarded={onDiscarded}
+      />,
+    );
+    await screen.findByText("Textures validées");
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Supprimer les modifications" }),
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent(message);
+    expect(onDiscarded).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByText("Fermer", { selector: "button" }));
+    expect(onClose).toHaveBeenCalledOnce();
+  },
+);
 
 it("refuse de confirmer si la version cible ne peut pas être chargée", async () => {
   vi.mocked(api.getSnapshot).mockRejectedValue(

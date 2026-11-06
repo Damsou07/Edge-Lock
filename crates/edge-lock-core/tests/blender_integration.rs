@@ -847,47 +847,126 @@ bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False
 
 #[test]
 #[ignore = "requires explicitly configured Blender; uses disposable fixture only"]
-fn rejects_active_geometric_modifiers_on_morphs_including_instanced_collections() {
+fn previews_evaluated_solidify_with_morphs_and_keeps_strict_exports() {
     for instanced_only in [false, true] {
         let root = test_directory();
         let workspace = fixture_with_shapes(root.path(), false, false, true);
+        let runner = BlenderRunner::new(executable());
+        let context = OperationContext::default();
+        let config = ExportConfig::default();
+        let previous_glb = workspace.join("main.glb");
+        runner
+            .generate_glb(&workspace, &workspace, &config, &previous_glb, &context)
+            .unwrap();
+        let previous_bytes = fs::read(&previous_glb).unwrap();
         let setup = format!(
             r#"
 import bpy, sys
 from pathlib import Path
 root=Path(sys.argv[-1]); bpy.ops.wm.open_mainfile(filepath=str(root/'main.blend'),use_scripts=False)
-cube=bpy.data.objects['TexturedCube']; cube.modifiers.new('Unsupported Mirror','MIRROR')
+cube=bpy.data.objects['TexturedCube']
+cube.data.shape_keys.key_blocks['Smile'].data[0].co.z+=2.0
+child=cube.copy(); child.name='PreservedMorph'; child.parent=cube; child.modifiers.clear()
+cube.users_collection[0].objects.link(child)
+solidify=cube.modifiers.new('Épaisseur','SOLIDIFY'); solidify.thickness=0.2
+cube.modifiers.move(1,0)
 if {instanced_only}:
     source=bpy.data.collections.new('InstanceSource')
-    for col in list(cube.users_collection): col.objects.unlink(cube)
-    source.objects.link(cube); cube.parent=None
+    for obj in (cube,child):
+        for col in list(obj.users_collection): col.objects.unlink(obj)
+        source.objects.link(obj)
+    cube.parent=None
     instance=bpy.data.objects.new('Instance',None); instance.instance_type='COLLECTION'; instance.instance_collection=source
     bpy.context.scene.collection.objects.link(instance)
     assert cube.name not in bpy.context.scene.objects
+bpy.context.scene.frame_set(10)
 bpy.ops.wm.save_as_mainfile(filepath=str(root/'main.blend'),check_existing=False)
 "#,
             instanced_only = if instanced_only { "True" } else { "False" }
         );
         edit_fixture(root.path(), &workspace, &setup);
         let original = fs::read(workspace.join("main.blend")).unwrap();
-        let runner = BlenderRunner::new(executable());
-        for operation in ["export", "generate", "preview"] {
-            let output = root.path().join(format!("{operation}.glb"));
-            let context = OperationContext::default();
-            let config = ExportConfig::default();
-            let result = match operation {
-                "export" => runner.export_glb(&workspace, &config, &output, &context),
-                "generate" => {
-                    runner.generate_glb(&workspace, &workspace, &config, &output, &context)
-                }
-                _ => runner.preview_glb(&workspace, &workspace, &config, &output, &context),
-            };
-            let error = result.unwrap_err();
-            assert!(error.to_string().contains("TexturedCube"), "{error}");
-            assert!(error.to_string().contains("Mirror"), "{error}");
-            assert!(!output.exists());
-            assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+        let preview = root.path().join("preview.glb");
+        let inspection = runner
+            .preview_glb(&workspace, &workspace, &config, &preview, &context)
+            .unwrap();
+        assert!(
+            inspection.warnings.iter().any(|warning| {
+                warning.contains("TexturedCube") && warning.contains("Épaisseur")
+            })
+        );
+        assert!(guard_preview(&preview).is_ok());
+        let (document, _) = glb_document(&preview);
+        let nodes = document["nodes"].as_array().unwrap();
+        let (degraded_index, degraded) = nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node["name"] == "TexturedCube")
+            .unwrap();
+        assert!(degraded["skin"].is_u64());
+        let mesh = &document["meshes"][degraded["mesh"].as_u64().unwrap() as usize];
+        assert!(mesh["weights"].is_null());
+        assert!(mesh["extras"]["targetNames"].is_null());
+        let mut triangles = 0;
+        let mut max_y = f64::NEG_INFINITY;
+        for primitive in mesh["primitives"].as_array().unwrap() {
+            assert!(primitive["targets"].is_null());
+            assert!(primitive["attributes"]["JOINTS_0"].is_u64());
+            assert!(primitive["attributes"]["WEIGHTS_0"].is_u64());
+            let positions = primitive["attributes"]["POSITION"].as_u64().unwrap() as usize;
+            let indices = primitive["indices"].as_u64().unwrap() as usize;
+            max_y = max_y.max(document["accessors"][positions]["max"][1].as_f64().unwrap());
+            triangles += document["accessors"][indices]["count"].as_u64().unwrap() / 3;
         }
+        assert_eq!(triangles, 24, "Solidify must preserve both surfaces");
+        assert!(max_y > 1.1, "saved morph pose was lost: {max_y}");
+        let (preserved_index, preserved) = nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node["name"] == "PreservedMorph")
+            .unwrap();
+        let preserved_mesh = &document["meshes"][preserved["mesh"].as_u64().unwrap() as usize];
+        assert_eq!(
+            preserved_mesh["extras"]["targetNames"],
+            serde_json::json!(["Smile"])
+        );
+        let mut has_morph_animation = false;
+        let mut has_bone_animation = false;
+        for animation in document["animations"].as_array().unwrap() {
+            let channels = animation["channels"].as_array().unwrap();
+            assert!(!channels.is_empty());
+            let mut used_samplers = std::collections::BTreeSet::new();
+            for channel in channels {
+                used_samplers.insert(channel["sampler"].as_u64().unwrap());
+                has_bone_animation |= channel["target"]["path"] == "rotation";
+                if channel["target"]["path"] == "weights" {
+                    assert_ne!(channel["target"]["node"], degraded_index);
+                    has_morph_animation |= channel["target"]["node"] == preserved_index;
+                }
+            }
+            assert_eq!(
+                used_samplers.len(),
+                animation["samplers"].as_array().unwrap().len()
+            );
+        }
+        assert!(has_morph_animation && has_bone_animation);
+
+        let exported = root.path().join("export.glb");
+        let generated = root.path().join("generate.glb");
+        for error in [
+            runner
+                .export_glb(&workspace, &config, &exported, &context)
+                .unwrap_err(),
+            runner
+                .generate_glb(&workspace, &workspace, &config, &generated, &context)
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("TexturedCube"), "{error}");
+            assert!(error.to_string().contains("Épaisseur"), "{error}");
+        }
+        assert!(!exported.exists() && !generated.exists());
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), original);
+        assert_eq!(fs::read(previous_glb).unwrap(), previous_bytes);
     }
 }
 

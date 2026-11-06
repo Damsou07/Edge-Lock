@@ -119,11 +119,13 @@ La cible est matérialisée et vérifiée avant remplacement ; le manifeste cour
 
 Sans reçu commité, la récupération remet le précédent dossier en place en préservant les écritures externes ambiguës. Avec un reçu authentifié, elle ne touche plus au workspace vivant et termine seulement le nettoyage des fichiers abandonnés. Un nettoyage différé est signalé sans bloquer les opérations suivantes. Les reprises acceptent les fichiers déjà supprimés, refusent les nouveaux chemins ou contenus modifiés et ne suivent aucun lien. Après retour à la dernière version, la synchronisation et l’aperçu sont réconciliés normalement.
 
+Un verrou Windows avant publication peut différer le remplacement. `pending_workspace_discards` conserve une demande par variante, avec la tête attendue et, si le workspace est lisible, une empreinte BLAKE3 de l’identité de son dossier, de sa configuration et des hashes de son contenu. La reprise automatique vérifie cette empreinte après libération du verrou. Si la tête ou l’empreinte a changé, ou si le contenu initial était illisible, une nouvelle confirmation est nécessaire. Le commit qui publie la restauration retire la demande, tout comme la suppression de la variante. Une demande en attente ne bloque pas les autres mutations de la bibliothèque.
+
 Supprimer une catégorie retire sa branche et archive ses assets en retirant leur catégorie. Supprimer un projet de jeu archive tous ses assets, conserve leurs autres projets et retire uniquement les liens au projet supprimé. Ces opérations gardent les fichiers et versions.
 
 ## Migrations et compatibilité
 
-Le marqueur reste `edge-lock-library-v1` et le catalogue courant utilise `PRAGMA user_version=6`. Les migrations précédentes restent en place ; 5→6 ajoute `variants.deleted_name` et la table des choix de fichiers par variante/contexte. Une sauvegarde SQLite `backups/catalog-schema-<version>-<id>.sqlite3` précède toute migration d’un catalogue existant. Aucune version ni aucun fichier n’est réécrit. Un schéma plus récent est refusé sans réinitialisation ni rétrogradation.
+Le marqueur reste `edge-lock-library-v1` et le catalogue courant utilise `PRAGMA user_version=7`. La migration 5→6 ajoute `variants.deleted_name` et les choix de fichiers par variante et contexte. La migration 6→7 ajoute `pending_workspace_discards`. Une sauvegarde SQLite `backups/catalog-schema-<version>-<id>.sqlite3` précède toute migration d’un catalogue existant. Les versions et les fichiers sont conservés. Un schéma plus récent est refusé sans réinitialisation ni rétrogradation.
 
 Les tests de migration utilisent des catalogues synthétiques de versions 0 et 1 avec réglages, tags, historique et objets bruts préexistants. Ils vérifient leur conservation, la sauvegarde du catalogue et la restitution exacte après recompression explicite. Les futures migrations doivent conserver le contrat de sauvegarde préalable et ajouter leurs propres fixtures représentatives.
 

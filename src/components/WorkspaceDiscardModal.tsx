@@ -17,7 +17,7 @@ export function WorkspaceDiscardModal({
   onDiscarded: (report: WorkspaceDiscardReport) => void;
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [closed, setClosed] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<WorkspaceDiscardReport | null>(null);
@@ -41,7 +41,7 @@ export function WorkspaceDiscardModal({
   }, [variant.headSnapshotId]);
 
   const discard = async () => {
-    if (!snapshot || !closed || busy || result) return;
+    if (!snapshot || !confirmed || busy || result) return;
     setBusy(true);
     setError("");
     try {
@@ -52,6 +52,7 @@ export function WorkspaceDiscardModal({
       });
       if (!alive.current) return;
       setResult(report);
+      if (report.pending || report.reconfirmationRequired) return;
       onDiscarded(report);
       if (!report.cleanupPending) onClose();
     } catch (reason) {
@@ -85,20 +86,19 @@ export function WorkspaceDiscardModal({
           !error && <p role="status">Chargement de la version…</p>
         )}
         <p>
-          Fermez Blender et les autres applications qui modifient ce dossier.
-          Les changements encore en mémoire dans ces applications et les
-          ressources externes au dossier ne sont pas gérés par Edge Lock.
+          Terminez vos écritures dans Blender et les autres applications. Si un
+          fichier est verrouillé, Edge Lock peut reprendre la demande après sa
+          libération.
         </p>
         {!result && (
           <label className="checkbox-label">
             <input
               type="checkbox"
-              checked={closed}
+              checked={confirmed}
               disabled={busy}
-              onChange={(event) => setClosed(event.target.checked)}
+              onChange={(event) => setConfirmed(event.target.checked)}
             />{" "}
-            J’ai fermé les applications qui modifient ce dossier et je confirme
-            la perte des modifications non versionnées.
+            Je confirme la perte des modifications non versionnées.
           </label>
         )}
         {error && (
@@ -106,11 +106,23 @@ export function WorkspaceDiscardModal({
             {error}
           </p>
         )}
-        {result && (
+        {result?.pending && (
           <p role="status">
-            Modifications annulées ; le nettoyage de certains fichiers est
-            différé. Une reprise sera tentée à la réouverture de la
-            bibliothèque.
+            Demande d’annulation enregistrée. Edge Lock vérifiera le dossier
+            après la libération du verrou. Vous pouvez suivre la demande dans la
+            fiche.
+          </p>
+        )}
+        {result?.reconfirmationRequired && (
+          <p role="status">
+            Les fichiers ont été préservés. Confirmez de nouveau l’annulation
+            depuis la fiche.
+          </p>
+        )}
+        {result?.cleanupPending && (
+          <p role="status">
+            Modifications annulées. Le nettoyage de certains fichiers reprendra
+            à la réouverture de la bibliothèque.
           </p>
         )}
         {result?.warnings.map((warning, index) => (
@@ -131,7 +143,7 @@ export function WorkspaceDiscardModal({
             <button
               type="button"
               className="button danger"
-              disabled={!snapshot || !closed || busy}
+              disabled={!snapshot || !confirmed || busy}
               onClick={() => void discard()}
             >
               {busy

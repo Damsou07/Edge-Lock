@@ -153,6 +153,7 @@ export interface Inspection {
 export interface PreviewResult {
   url: string;
   artifactKey?: string;
+  stale?: boolean;
   inspection: Inspection;
   sourceLabel: string;
   sourceFile: string;
@@ -178,6 +179,8 @@ export interface WorkspaceStatus {
   canCreateSnapshot: boolean;
   artifactKey: string | null;
   error: AppError | null;
+  discardState?: "pending" | "reconfirmationRequired" | null;
+  discardCleanupPending?: boolean;
 }
 export type JobRequest =
   | { kind: "variantDeletionPlan"; variantId: string }
@@ -262,6 +265,8 @@ export interface VariantDeletionPlan {
 export interface WorkspaceDiscardReport {
   variantId: string;
   headSnapshotId: string;
+  pending: boolean;
+  reconfirmationRequired: boolean;
   cleanupPending: boolean;
   warnings: string[];
 }

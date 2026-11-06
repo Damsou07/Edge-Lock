@@ -182,7 +182,7 @@ fn schema_five_upgrade_preserves_existing_files_history_and_configuration() {
     drop(library);
     {
         let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
-        db.execute_batch("DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; PRAGMA user_version=5;").unwrap();
+        db.execute_batch("DROP TABLE pending_workspace_discards; DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; PRAGMA user_version=5;").unwrap();
     }
     let library = Library::open(&root).unwrap();
     assert_eq!(
@@ -225,6 +225,6 @@ fn schema_five_upgrade_preserves_existing_files_history_and_configuration() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
 }

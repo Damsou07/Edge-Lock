@@ -2115,6 +2115,70 @@ async function testCharacterMorphs() {
   }
 }
 
+async function withWorkspaceRenameLock(directory, check) {
+  assertWithin(await realpath(testRoot), await realpath(directory));
+  const command = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class EdgeLockWorkspaceHandle {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFile(string name, uint access, uint share,
+        System.IntPtr security, uint creation, uint flags, System.IntPtr template);
+}
+'@
+$handle = [EdgeLockWorkspaceHandle]::CreateFile($env:EDGE_LOCK_TEST_WORKSPACE,
+    [uint32]2147483648, 3, [IntPtr]::Zero, 3, 33554432, [IntPtr]::Zero)
+if ($handle.IsInvalid) {
+    throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+}
+try {
+    [Console]::WriteLine('locked')
+    [void][Console]::In.ReadLine()
+} finally {
+    $handle.Dispose()
+}
+`;
+  const locker = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      Buffer.from(command, "utf16le").toString("base64"),
+    ],
+    {
+      windowsHide: true,
+      env: { ...process.env, EDGE_LOCK_TEST_WORKSPACE: directory },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  let output = "";
+  let errors = "";
+  locker.stdout.on("data", (data) => (output += data));
+  locker.stderr.on("data", (data) => (errors += data));
+  locker.on("error", (error) => (errors += error.message));
+  const ended = new Promise((resolve) => locker.once("close", resolve));
+  try {
+    try {
+      await until(() => /^locked\r?$/m.test(output) || locker.exitCode !== null);
+    } catch {
+      throw new Error(`Windows lock holder did not start. ${errors}`);
+    }
+    assert.match(output, /^locked\r?$/m, errors);
+    await check();
+  } finally {
+    locker.stdin.end();
+    const timeout = setTimeout(() => locker.kill(), 5_000);
+    try {
+      await ended;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 async function testWorkspaceDiscard() {
   const imported = await job({
     kind: "import",
@@ -2160,6 +2224,7 @@ async function testWorkspaceDiscard() {
       "return !!document.querySelector('.discard-changes-button:not(:disabled)');",
     ),
   );
+  await waitForModel("model.glb");
   for (const [width, height] of [
     [1440, 940],
     [1024, 700],
@@ -2187,22 +2252,38 @@ async function testWorkspaceDiscard() {
       "unsaved edit",
     );
   }
-  await clickText("Annuler les modifications");
-  await until(() =>
-    script(
-      "return !!document.querySelector('dialog[open] input[type=checkbox]');",
-    ),
-  );
-  await clickSelector('dialog[open] input[type="checkbox"]');
-  await clickText("Supprimer les modifications");
+  await withWorkspaceRenameLock(working, async () => {
+    await clickText("Annuler les modifications");
+    await until(() =>
+      script(
+        "return !!document.querySelector('dialog[open] input[type=checkbox]');",
+      ),
+    );
+    await clickSelector('dialog[open] input[type="checkbox"]');
+    await clickText("Supprimer les modifications");
+    await until(() =>
+      script(
+        "return document.querySelector('dialog[open]')?.textContent.includes('Demande d’annulation enregistrée');",
+      ),
+    );
+    assert.equal(
+      await readFile(join(working, "discard-modified.txt"), "utf8"),
+      "unsaved edit",
+    );
+    await clickText("Fermer");
+    await until(
+      async () =>
+        (await invoke("get_workspace_status", { variantId: variant.id }))
+          .discardState === "pending",
+    );
+    await waitForModel("model.glb");
+    await screenshot("discard-waiting.png");
+  });
   await until(
-    () => script("return !document.querySelector('dialog[open]');"),
-    300_000,
-  );
-  await until(
-    async () =>
-      (await invoke("get_workspace_status", { variantId: variant.id }))
-        .state === "ready",
+    async () => {
+      const status = await invoke("get_workspace_status", { variantId: variant.id });
+      return status.state === "ready" && !status.discardState && !status.sourceChanged;
+    },
     300_000,
   );
   const restored = (await invoke("get_variant", { id: variant.id })).variant;
@@ -2224,7 +2305,7 @@ async function testWorkspaceDiscard() {
   await viewport(1440, 940);
   await clickText("Retour à la bibliothèque");
   report.checks.push(
-    "Annulation confirmée : ajouts/modifications/suppressions et réglages rétablis, tête/backup/historique inchangés, confirmation annulable à1440 et1024px",
+    "Annulation différée sous verrou Windows puis reprise automatique. Fichiers et réglages rétablis, tête, backup et historique conservés, confirmation annulable à 1440 et 1024 px",
   );
 }
 

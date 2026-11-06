@@ -833,6 +833,38 @@ describe("versions, aperçu et dépendances", () => {
     expect(api.releasePreviewResources).not.toHaveBeenCalled();
   });
 
+  it("signale l’aperçu précédent et les morphs figés près du modèle", async () => {
+    const warning = "Morphs figés à l’image enregistrée pour Manteau.";
+    vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
+      variantId: "variant-1",
+      revision: 1,
+      state: "failed",
+      sourceChanged: false,
+      canCreateSnapshot: false,
+      artifactKey: null,
+      error: { code: "operation_failed", message: "Fichier verrouillé" },
+    });
+    run.mockImplementation(async (request) =>
+      request.kind === "changes"
+        ? changes
+        : {
+            ...generatedPreview,
+            stale: true,
+            inspection: { ...sourceInspection, warnings: [warning] },
+          },
+    );
+    renderDetail();
+
+    const viewer = await screen.findByLabelText("Aperçu 3D interactif");
+    const previewColumn = within(viewer.closest(".preview-column")!);
+    expect(previewColumn.getByText(/dernier aperçu valide/i)).toBeVisible();
+    expect(previewColumn.getByText(warning)).toBeVisible();
+    expect(screen.queryByText("Aperçu indisponible")).not.toBeInTheDocument();
+    expect(
+      previewColumn.getByRole("button", { name: "Actualiser" }),
+    ).toBeEnabled();
+  });
+
   it("affiche les arêtes et ignore les dépendances secondaires dans les alertes", async () => {
     run.mockImplementation(async (request) => {
       if (request.kind === "changes") return changes;

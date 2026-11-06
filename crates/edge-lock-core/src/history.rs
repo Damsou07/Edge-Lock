@@ -1019,7 +1019,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            SCHEMA_VERSION
         );
     }
 }

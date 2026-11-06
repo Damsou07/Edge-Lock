@@ -1,6 +1,8 @@
 //! Library-wide, trailing-edge checks of editable project files.
 use crate::state::*;
-use edge_lock_core::{AssetFilter, Library, OperationContext, sync};
+use edge_lock_core::{
+    AssetFilter, Library, OperationContext, WorkspaceDiscardReport, WorkspaceDiscardState, sync,
+};
 use notify::Watcher;
 use serde::Serialize;
 use std::{
@@ -12,6 +14,8 @@ use std::{
 use tauri::{AppHandle, Emitter};
 
 const SAVE_DELAY: Duration = Duration::from_millis(500);
+const DISCARD_RETRY_MIN: Duration = Duration::from_secs(2);
+const DISCARD_RETRY_MAX: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +27,8 @@ pub struct WorkspaceStatus {
     pub can_create_snapshot: bool,
     pub artifact_key: Option<String>,
     pub error: Option<AppError>,
+    pub discard_state: Option<WorkspaceDiscardState>,
+    pub discard_cleanup_pending: bool,
 }
 
 pub struct WorkspaceEntry {
@@ -43,6 +49,8 @@ impl WorkspaceEntry {
                 can_create_snapshot: false,
                 artifact_key: None,
                 error: None,
+                discard_state: None,
+                discard_cleanup_pending: false,
             },
             requested: Instant::now(),
             sequence: 0,
@@ -91,20 +99,56 @@ pub fn request(
     state: &Arc<AppState>,
     variant_id: &str,
 ) -> AppResult<WorkspaceStatus> {
-    schedule(app, state, variant_id, true)
+    schedule(app, state, variant_id, WorkspaceRequest::Changed)
+}
+
+enum WorkspaceRequest<'a> {
+    Changed,
+    Reconcile,
+    Discard {
+        library: &'a Arc<Library>,
+        cleanup_pending: bool,
+    },
+}
+
+pub fn refresh_discard(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    library: &Arc<Library>,
+    variant_id: &str,
+    cleanup_pending: bool,
+) -> AppResult<WorkspaceStatus> {
+    schedule(
+        app,
+        state,
+        variant_id,
+        WorkspaceRequest::Discard {
+            library,
+            cleanup_pending,
+        },
+    )
 }
 
 fn schedule(
     app: &AppHandle,
     state: &Arc<AppState>,
     variant_id: &str,
-    invalidate_running: bool,
+    reason: WorkspaceRequest<'_>,
 ) -> AppResult<WorkspaceStatus> {
     let _lifecycle = lock(&state.lifecycle_gate)?;
     state.ensure_running()?;
     let library = state.library()?;
+    if let WorkspaceRequest::Discard { library: owner, .. } = &reason
+        && !Arc::ptr_eq(owner, &library)
+    {
+        return Err(AppError::new(
+            "library_changed",
+            "La bibliothèque a changé.",
+        ));
+    }
     // Validate identifiers before admitting background work or allocating status entries.
     library.workspace_path(variant_id)?;
+    let discard_state = library.discard_status(variant_id)?;
     let generation = state.watcher_generation.load(Ordering::SeqCst);
     let status = {
         let mut workspaces = lock(&state.workspaces)?;
@@ -112,8 +156,15 @@ fn schedule(
             .entry(variant_id.into())
             .or_insert_with(|| WorkspaceEntry::new(variant_id));
         // Reconciliation must not perpetually invalidate a conversion slower than its poll interval.
-        if !entry.schedule(invalidate_running) {
+        if !entry.schedule(!matches!(reason, WorkspaceRequest::Reconcile)) {
             return Ok(entry.status.clone());
+        }
+        entry.status.discard_state = discard_state;
+        if let WorkspaceRequest::Discard {
+            cleanup_pending, ..
+        } = reason
+        {
+            entry.status.discard_cleanup_pending |= cleanup_pending;
         }
         entry.status.clone()
     };
@@ -314,9 +365,94 @@ pub fn reconcile(app: &AppHandle, state: &Arc<AppState>) {
         && let Ok(ids) = variants(&library)
     {
         for id in ids {
-            let _ = schedule(app, state, &id, false);
+            let _ = schedule(app, state, &id, WorkspaceRequest::Reconcile);
         }
     }
+}
+
+struct DiscardRetry {
+    library: Arc<Library>,
+    reports: Vec<WorkspaceDiscardReport>,
+    still_pending: bool,
+}
+
+fn retry_discards(state: &AppState, generation: u64) -> AppResult<Option<DiscardRetry>> {
+    let Ok(_gate) = state.operation_gate.try_lock() else {
+        return Ok(None);
+    };
+    let library = {
+        let _lifecycle = lock(&state.lifecycle_gate)?;
+        if state.closing.load(Ordering::SeqCst)
+            || state.watcher_generation.load(Ordering::SeqCst) != generation
+        {
+            return Ok(None);
+        }
+        let library = state.library()?;
+        if !library.has_pending_discards()? {
+            return Ok(Some(DiscardRetry {
+                library,
+                reports: Vec::new(),
+                still_pending: false,
+            }));
+        }
+        state.pending_syncs.fetch_add(1, Ordering::SeqCst);
+        library
+    };
+    let context = OperationContext {
+        cancelled: state.sync_cancelled.clone(),
+        ..Default::default()
+    };
+    let result = (|| -> AppResult<_> {
+        let reports = library.retry_pending_discards(&context)?;
+        let still_pending = library.has_pending_discards()?;
+        Ok(Some(DiscardRetry {
+            library,
+            reports,
+            still_pending,
+        }))
+    })();
+    state.pending_syncs.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+fn schedule_discard_retries(app: &AppHandle, state: &Arc<AppState>, generation: u64) {
+    let app = app.clone();
+    let weak = Arc::downgrade(state);
+    std::thread::spawn(move || {
+        let mut backoff = DISCARD_RETRY_MIN;
+        while let Some(state) = weak.upgrade() {
+            if state.closing.load(Ordering::SeqCst)
+                || state.watcher_generation.load(Ordering::SeqCst) != generation
+            {
+                break;
+            }
+            let delay = match retry_discards(&state, generation) {
+                Ok(Some(retry)) => {
+                    for report in retry.reports {
+                        let _ = refresh_discard(
+                            &app,
+                            &state,
+                            &retry.library,
+                            &report.variant_id,
+                            report.cleanup_pending,
+                        );
+                    }
+                    if retry.still_pending {
+                        let delay = backoff;
+                        backoff = (backoff * 2).min(DISCARD_RETRY_MAX);
+                        delay
+                    } else {
+                        backoff = DISCARD_RETRY_MIN;
+                        DISCARD_RETRY_MIN
+                    }
+                }
+                Ok(None) => DISCARD_RETRY_MIN,
+                Err(_) => DISCARD_RETRY_MAX,
+            };
+            drop(state);
+            std::thread::sleep(delay);
+        }
+    });
 }
 
 fn affected(root: &Path, paths: &[std::path::PathBuf]) -> HashSet<String> {
@@ -401,12 +537,66 @@ pub fn install(app: &AppHandle, state: &Arc<AppState>) {
             });
         }
     }
+    schedule_discard_retries(app, state, generation);
     reconcile(app, state);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn discard_retry_respects_the_gate_and_library_generation() {
+        use std::{fs, os::windows::fs::OpenOptionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("main.blend"), b"saved").unwrap();
+        let library = Arc::new(Library::open(root.path().join("library")).unwrap());
+        let context = OperationContext::default();
+        let asset = library
+            .import_folder(
+                &source,
+                "Discard retry",
+                edge_lock_core::ExportConfig::default(),
+                &context,
+            )
+            .unwrap();
+        let variant = &asset.variants[0];
+        let workspace = Path::new(&variant.workspace_path);
+        fs::write(workspace.join("main.blend"), b"edited").unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x02000000)
+            .open(workspace)
+            .unwrap();
+        let queued = library
+            .discard_changes(&variant.id, &variant.head_snapshot_id, &context)
+            .unwrap();
+        assert!(queued.pending);
+
+        let state = test_state(library);
+        let gate = state.operation_gate.lock().unwrap();
+        assert!(retry_discards(&state, 0).unwrap().is_none());
+        drop(gate);
+        let waiting = retry_discards(&state, 0).unwrap().unwrap();
+        assert!(waiting.still_pending);
+        assert!(waiting.reports.is_empty());
+        assert!(!state.busy().unwrap());
+
+        drop(handle);
+        assert!(retry_discards(&state, 1).unwrap().is_none());
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), b"edited");
+        let completed = retry_discards(&state, 0).unwrap().unwrap();
+        assert!(!completed.still_pending);
+        assert_eq!(completed.reports.len(), 1);
+        assert_eq!(completed.reports[0].variant_id, variant.id);
+        assert_eq!(fs::read(workspace.join("main.blend")).unwrap(), b"saved");
+        assert!(!state.busy().unwrap());
+    }
 
     #[test]
     fn first_scan_invalidates_offline_edits_but_preserves_unchanged_metadata() {

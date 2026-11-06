@@ -275,13 +275,16 @@ class MorphSafeExport:
     """Keep native morphs/skins while evaluating modifiers on other meshes.
 
     Blender's apply option is global. Its native node hooks let us select the
-    original mesh only for the supported Armature/morph combination. The stack
-    matters because a node's closing hook runs after its children have exported.
+    original mesh for supported Armature/morph combinations and freeze other
+    morphs in previews. A node's closing hook runs after its children export.
     """
 
-    def __init__(self, objects):
+    def __init__(self, objects, preview=False):
         self.objects = export_source_objects(objects)
+        self.preview = preview
         self.meshes = {}
+        self.frozen = {}
+        self.frozen_nodes = set()
         self.stack = []
         self.checked = set()
         self.errors = []
@@ -315,6 +318,10 @@ class MorphSafeExport:
                     or armature.object.type != 'ARMATURE'):
                 details = ', '.join(f"{item.name} ({item.type}{', désactivé' if not item.show_viewport else ''})"
                                     for item in modifiers)
+                if self.preview:
+                    self.frozen[identity] = f"Aperçu simplifié pour {obj.name}. Les shape keys sont figées à l’image enregistrée avec les modificateurs {details}."
+                    self.meshes[identity] = None
+                    return None
                 raise ValueError(f"GLB impossible pour {obj.name} : les shape keys avec modificateurs nécessitent des clés relatives et une unique Armature active avec un rig valide. Modificateurs : {details}. Le fichier .blend et le dernier GLB restent intacts.")
         # Match Blender's native exclusions: Basis, muted keys and self-relative keys.
         names = [key.name for key in list(keys.key_blocks)[1:]
@@ -330,10 +337,12 @@ class MorphSafeExport:
         return description
 
     def gather_node_mesh_hook(self, _node, obj, settings):
-        self.stack.append((self.identity(obj), settings['gltf_apply']))
+        identity = self.identity(obj)
+        self.stack.append((identity, settings['gltf_apply'], settings['gltf_morph']))
         try:
             description = self.describe(obj)
             settings['gltf_apply'] = not (description and description[2])
+            settings['gltf_morph'] = identity not in self.frozen
         except Exception as error:
             # The exporter logs and swallows hook exceptions. Fail closed ourselves.
             self.errors.append(str(error))
@@ -342,6 +351,8 @@ class MorphSafeExport:
         identity = self.identity(obj)
         try:
             description = self.describe(obj)
+            if identity in self.frozen:
+                self.frozen_nodes.add(id(node))
             if description:
                 name, names, _, skin_expected = description
                 mesh = node.mesh
@@ -367,10 +378,30 @@ class MorphSafeExport:
             if not self.stack:
                 self.errors.append("Callbacks glTF incomplets : entrée de nœud absente.")
             else:
-                entered, previous = self.stack.pop()
-                settings['gltf_apply'] = previous
+                entered, settings['gltf_apply'], settings['gltf_morph'] = self.stack.pop()
                 if entered != identity:
                     self.errors.append("Callbacks glTF incohérents : ordre des nœuds inattendu.")
+
+    def gather_gltf_hook(self, _active_scene, _scenes, animations, _settings):
+        if not self.frozen_nodes:
+            return
+        # Animation gathering still sees the original keys after mesh evaluation.
+        try:
+            for animation in animations:
+                channels = [channel for channel in animation.channels
+                            if not (channel.target.path == 'weights'
+                                    and id(channel.target.node) in self.frozen_nodes)]
+                if len(channels) == len(animation.channels):
+                    continue
+                used = sorted({channel.sampler for channel in channels})
+                indices = {previous: current for current, previous in enumerate(used)}
+                animation.samplers = [animation.samplers[index] for index in used]
+                for channel in channels:
+                    channel.sampler = indices[channel.sampler]
+                animation.channels = channels
+            animations[:] = [animation for animation in animations if animation.channels]
+        except Exception as error:
+            self.errors.append(str(error))
 
     def validate(self):
         missing = [description[0] for identity, description in self.meshes.items()
@@ -382,9 +413,9 @@ class MorphSafeExport:
 
 
 @contextmanager
-def native_morph_export(objects):
+def native_morph_export(objects, preview=False):
     """Register trusted hooks only in this worker's memory; never save preferences."""
-    extension = MorphSafeExport(objects)
+    extension = MorphSafeExport(objects, preview)
     name = '_edge_lock_native_morph_export'
     module = ModuleType(name)
     module.glTF2ExportUserExtension = lambda: extension
@@ -445,13 +476,14 @@ def run(request):
                 replacement = bpy.data.images.new(image.name + ' (texture manquante)', width=2, height=2)
                 replacement.generated_color = (1, 0, 1, 1)
                 image.user_remap(replacement)
-    with native_morph_export(objects) as morphs:
+    with native_morph_export(objects, preview) as morphs:
         result_code = bpy.ops.export_scene.gltf(
             filepath=request["destination"], check_existing=False, export_format="GLB",
             use_active_scene=True, use_active_collection=collection is not None,
             use_active_collection_with_nested=True, use_selection=False,
             use_visible=False, use_renderable=False,
             export_animations=True, export_animation_mode="ACTIONS",
+            export_current_frame=bool(morphs.frozen),
             export_skins=True, export_morph=True, export_apply=True,
             export_materials="EXPORT", export_image_format="AUTO",
             export_cameras=False, export_lights=False,
@@ -462,6 +494,7 @@ def run(request):
         if "FINISHED" not in result_code or not Path(request["destination"]).is_file():
             raise RuntimeError("Blender n'a pas produit le fichier GLB attendu.")
         morphs.validate()
+    result["warnings"].extend(sorted(morphs.frozen.values()))
     return result
 
 

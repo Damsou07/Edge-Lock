@@ -65,6 +65,7 @@ export function useWorkspaceStatus(variantId: string) {
       if (
         !connected ||
         !current.current ||
+        current.current.discardState === "pending" ||
         current.current.state === "checking" ||
         current.current.state === "syncing"
       )

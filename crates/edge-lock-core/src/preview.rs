@@ -37,6 +37,7 @@ pub struct PreviewArtifact {
     pub source_file: String,
     pub source_kind: PreviewKind,
     pub updates_geometry: bool,
+    pub stale: bool,
 }
 
 pub enum PreviewOutcome {
@@ -61,6 +62,8 @@ pub(crate) struct SourceFingerprint {
 struct CacheRecord {
     version: u32,
     identity: String,
+    #[serde(default)]
+    source_identity: Option<String>,
     converter: Option<String>,
     artifact: String,
     artifact_hash: String,
@@ -68,6 +71,20 @@ struct CacheRecord {
     source_kind: PreviewKind,
     sources: Vec<SourceFingerprint>,
     inspection: Inspection,
+}
+
+impl CacheRecord {
+    fn into_outcome(self, path: PathBuf, updates_geometry: bool, stale: bool) -> PreviewOutcome {
+        PreviewOutcome::Ready(Box::new(PreviewArtifact {
+            path,
+            artifact_key: self.artifact,
+            inspection: self.inspection,
+            source_file: self.source_file,
+            source_kind: self.source_kind,
+            updates_geometry,
+            stale,
+        }))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -224,11 +241,31 @@ pub fn cleanup_temporary(root: &Path) -> Result<()> {
                 && fs::read(&marker).is_ok_and(|v| v == b"edge-lock-preview-v2")
                 && fs::canonicalize(&path)?.starts_with(fs::canonicalize(&cache)?)
             {
-                fs::remove_dir_all(&path)?;
+                // Housekeeping is independent of the requested preview.
+                let _ = remove_temporary(&path);
             }
         }
     }
     Ok(())
+}
+
+fn remove_temporary(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let _delete_access = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // A directory handle can deny deletion even if its children can be removed.
+        // Check before the ownership marker could be lost in a partial cleanup.
+        fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    fs::remove_dir_all(path)
 }
 
 pub(crate) fn hash_file(path: &Path, ctx: &OperationContext) -> Result<Option<String>> {
@@ -424,6 +461,18 @@ fn read_record(path: &Path) -> Option<CacheRecord> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+fn verified_cache_path(
+    cache: &Path,
+    record: &CacheRecord,
+    ctx: &OperationContext,
+) -> Option<PathBuf> {
+    let path = cache.join(format!("{}.glb", record.artifact));
+    (fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && !is_link(&m))
+        && glb::guard_preview(&path).is_ok()
+        && hash_file(&path, ctx).ok().flatten().as_deref() == Some(&record.artifact_hash))
+    .then_some(path)
+}
+
 pub(crate) fn atomic_json(path: &Path, value: &impl Serialize, staging: &Path) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(staging)?;
     temporary.write_all(&serde_json::to_vec(value)?)?;
@@ -515,7 +564,6 @@ fn prepare_preview_inner(
     remember_selection: bool,
 ) -> Result<PreviewOutcome> {
     ctx.check_cancelled()?;
-    let variant = library.get_variant(request.variant_id)?;
     let snapshot = request
         .snapshot_id
         .map(|id| library.get_snapshot(id))
@@ -530,10 +578,11 @@ fn prepare_preview_inner(
             snapshot.config.clone(),
         )
     } else {
+        let variant = library.get_variant(request.variant_id)?;
         (
             PathBuf::from(&variant.variant.workspace_path),
             variant.files,
-            variant.variant.config.clone(),
+            variant.variant.config,
         )
     };
     let logical_root = dunce::simplified(&logical_root).to_path_buf();
@@ -601,11 +650,15 @@ fn prepare_preview_inner(
     } else {
         None
     };
+    let source_config = (kind == PreviewKind::GeneratedGlb).then_some(&config);
+    let source_identity = blake3::hash(&serde_json::to_vec(&(kind, &source_file, source_config))?)
+        .to_hex()
+        .to_string();
     let identity = blake3::hash(&serde_json::to_vec(&(
         CACHE_VERSION,
         kind,
         &source_file,
-        (kind == PreviewKind::GeneratedGlb).then_some(&config),
+        source_config,
         blake3::hash(include_bytes!("../../../blender/edge_lock.py"))
             .to_hex()
             .to_string(),
@@ -620,7 +673,7 @@ fn prepare_preview_inner(
     .to_hex()
     .to_string();
     let cache = managed_cache(library.root())?;
-    cleanup_temporary(library.root())?;
+    let _ = cleanup_temporary(library.root());
     let remember_choice = || {
         if remember_selection && request.preview_file.is_some() {
             // This is disposable UI preference data; failure must not hide a valid preview.
@@ -639,38 +692,35 @@ fn prepare_preview_inner(
     };
     let record_path = cache.join(format!("index-{index}.json"));
     let manifest = snapshot.as_ref().map(|s| s.entries.as_slice());
-    if let Some(record) = read_record(&record_path)
-        && record.version == CACHE_VERSION
-        && record.identity == identity
-        && (converter.is_none() || record.converter == converter)
-        && record.artifact.len() == 64
-        && record.artifact.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        let path = cache.join(format!("{}.glb", record.artifact));
+    let previous = read_record(&record_path).filter(|record| {
+        record.version == CACHE_VERSION
+            && record.source_file == source_file
+            && record.source_kind == kind
+            && (record.identity == identity
+                || record.source_identity.as_ref() == Some(&source_identity)
+                || (record.source_identity.is_none() && kind == PreviewKind::AssetGlb))
+            && record.artifact.len() == 64
+            && record.artifact.bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    let previous = if let Some(record) = previous {
         let paths: Vec<_> = record.sources.iter().map(|s| s.path.clone()).collect();
-        let unchanged = match fingerprints(&paths, &logical_root, manifest, ctx) {
-            Ok(sources) => sources == record.sources,
-            Err(CoreError::Inconsistent(_)) => false,
-            Err(error) => return Err(error),
-        };
-        if unchanged
-            && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && !is_link(&m))
-            && glb::guard_preview(&path).is_ok()
-            && hash_file(&path, ctx)?.as_deref() == Some(&record.artifact_hash)
+        if record.identity == identity
+            && (converter.is_none() || record.converter == converter)
+            && fingerprints(&paths, &logical_root, manifest, ctx)
+                .is_ok_and(|sources| sources == record.sources)
+            && let Some(path) = verified_cache_path(&cache, &record, ctx)
         {
+            ctx.check_cancelled()?;
             ctx.report("Aperçu en cache", 1, Some(1));
             remember_choice();
-            return Ok(PreviewOutcome::Ready(Box::new(PreviewArtifact {
-                path,
-                artifact_key: record.artifact,
-                inspection: record.inspection,
-                source_file,
-                source_kind: kind,
-                updates_geometry,
-            })));
+            return Ok(record.into_outcome(path, updates_geometry, false));
         }
-    }
+        Some(record)
+    } else {
+        None
+    };
     for attempt in 0..2 {
+        ctx.check_cancelled()?;
         let result = (|| -> Result<PreviewOutcome> {
             let temporary = tempfile::Builder::new()
                 .prefix(".preview-tmp-")
@@ -757,6 +807,7 @@ fn prepare_preview_inner(
             let record = CacheRecord {
                 version: CACHE_VERSION,
                 identity: identity.clone(),
+                source_identity: Some(source_identity.clone()),
                 converter: converter.clone(),
                 artifact,
                 artifact_hash,
@@ -767,18 +818,23 @@ fn prepare_preview_inner(
             };
             atomic_json(&record_path, &record, temporary.path())?;
             remember_choice();
-            Ok(PreviewOutcome::Ready(Box::new(PreviewArtifact {
-                path,
-                artifact_key: record.artifact,
-                inspection: record.inspection,
-                source_file: source_file.clone(),
-                source_kind: kind,
-                updates_geometry,
-            })))
+            Ok(record.into_outcome(path, updates_geometry, false))
         })();
         match result {
             Err(CoreError::Inconsistent(_)) if attempt == 0 => continue,
-            result => return result,
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            Err(error) => {
+                if let Some(record) = previous
+                    && let Some(path) = verified_cache_path(&cache, &record, ctx)
+                {
+                    ctx.check_cancelled()?;
+                    ctx.report("Dernier aperçu valide", 1, Some(1));
+                    return Ok(record.into_outcome(path, false, true));
+                }
+                ctx.check_cancelled()?;
+                return Err(error);
+            }
+            Ok(outcome) => return Ok(outcome),
         }
     }
     unreachable!()

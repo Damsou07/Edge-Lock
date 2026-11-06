@@ -53,3 +53,22 @@ it("récupère la fin d’une synchronisation dont l’événement a été perdu
     vi.useRealTimers();
   }
 });
+
+it("récupère l’état d’une annulation différée sans événement", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.mocked(api.getWorkspaceStatus)
+      .mockResolvedValueOnce({ ...ready, discardState: "pending" })
+      .mockResolvedValue({ ...ready, revision: 2, discardState: null });
+    const { result, unmount } = renderHook(() => useWorkspaceStatus("one"));
+    await act(async () => {});
+    expect(result.current.status?.discardState).toBe("pending");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(result.current.status?.discardState).toBeNull();
+    unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});

@@ -28,9 +28,9 @@ mod file_selections;
 pub use file_selections::{FileSelectionKind, FileSelections};
 #[path = "discard.rs"]
 mod discard;
-pub use discard::WorkspaceDiscardReport;
+pub use discard::{WorkspaceDiscardReport, WorkspaceDiscardState};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = r#"
 CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES categories(id));
 CREATE TABLE games(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
@@ -1266,6 +1266,17 @@ fn apply_migrations(
     }
     if version < 6 {
         transaction.execute_batch("ALTER TABLE variants ADD COLUMN deleted_name TEXT; CREATE TABLE file_selections(variant_id TEXT NOT NULL REFERENCES variants(id),context_key TEXT NOT NULL,preview_file TEXT,export_file TEXT,PRIMARY KEY(variant_id,context_key)); PRAGMA user_version=6;")?;
+    }
+    if version < 7 {
+        transaction.execute_batch(
+            "CREATE TABLE pending_workspace_discards(
+                variant_id TEXT PRIMARY KEY REFERENCES variants(id) ON DELETE CASCADE,
+                expected_head TEXT NOT NULL,
+                fingerprint TEXT,
+                reconfirmation_required INTEGER NOT NULL DEFAULT 0 CHECK(reconfirmation_required IN (0,1))
+            );
+            PRAGMA user_version=7;",
+        )?;
     }
     transaction.commit()?;
     Ok(())

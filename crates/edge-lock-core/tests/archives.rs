@@ -263,7 +263,7 @@ fn schema_three_upgrade_preserves_asset_history_and_unattributed_backup_files() 
     drop(library);
     let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
     db.execute_batch(
-        "DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; DROP TABLE glb_backup_owners; DROP TABLE archive_deletions; DROP TABLE workspace_discards; PRAGMA user_version=3;",
+        "DROP TABLE pending_workspace_discards; DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; DROP TABLE glb_backup_owners; DROP TABLE archive_deletions; DROP TABLE workspace_discards; PRAGMA user_version=3;",
     )
     .unwrap();
     drop(db);
@@ -291,7 +291,7 @@ fn schema_three_upgrade_preserves_asset_history_and_unattributed_backup_files() 
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     let backup = fs::read_dir(root.join("backups"))
         .unwrap()

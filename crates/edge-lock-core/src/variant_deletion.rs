@@ -210,6 +210,7 @@ impl Library {
             let internal_name = format!("\u{1f}deleted:{variant_id}");
             tx.execute("UPDATE variants SET deleted_name=name,name=?2,backup_snapshot_id=NULL,working_bytes=0,triangles=NULL WHERE id=?1", params![variant_id, internal_name])?;
             tx.execute("DELETE FROM file_selections WHERE variant_id=?1", [variant_id])?;
+            tx.execute("DELETE FROM pending_workspace_discards WHERE variant_id=?1", [variant_id])?;
             tx.execute("DELETE FROM glb_backup_owners WHERE variant_id=?1", [variant_id])?;
             for id in &prepared.retired {
                 tx.execute("DELETE FROM file_selections WHERE context_key=?1", [id])?;

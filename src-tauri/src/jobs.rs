@@ -205,13 +205,31 @@ pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppRe
                 .collect(),
             (JobRequest::Snapshot { variant_id, .. }, Ok(_)) => vec![variant_id.clone()],
             (JobRequest::Restore { variant_id, .. }, _) => vec![variant_id.clone()],
-            (JobRequest::DiscardChanges { variant_id, .. }, _) => vec![variant_id.clone()],
             _ => Vec::new(),
+        };
+        let discard_refresh = if let JobRequest::DiscardChanges { variant_id, .. } = &request {
+            let cleanup_pending = result
+                .as_ref()
+                .is_ok_and(|value| value["cleanupPending"] == true);
+            Some((variant_id, cleanup_pending))
+        } else {
+            None
         };
         update_job(&app, &state, &job_id, |job| match result {
             Ok(value) => {
                 job.status = "completed".into();
-                job.phase = "Terminé".into();
+                job.phase = match &request {
+                    JobRequest::DiscardChanges { .. } if value["pending"] == true => {
+                        "Demande d’annulation enregistrée"
+                    }
+                    JobRequest::DiscardChanges { .. }
+                        if value["reconfirmationRequired"] == true =>
+                    {
+                        "Nouvelle confirmation requise"
+                    }
+                    _ => "Terminé",
+                }
+                .into();
                 job.result = value;
             }
             Err(error) => {
@@ -227,6 +245,15 @@ pub fn start(app: AppHandle, state: Arc<AppState>, request: JobRequest) -> AppRe
         });
         for variant_id in refresh_variants {
             let _ = crate::workspace::request(&app, &state, &variant_id);
+        }
+        if let Some((variant_id, cleanup_pending)) = discard_refresh {
+            let _ = crate::workspace::refresh_discard(
+                &app,
+                &state,
+                &library,
+                variant_id,
+                cleanup_pending,
+            );
         }
     });
     Ok(id)
@@ -483,7 +510,7 @@ fn run(
             )?;
             trim_cache(&library.root().join("cache"), &artifact.path, state);
             Ok(
-                json!({ "url": resource.url, "resourceToken":resource.resource_token,"artifactKey":artifact.artifact_key,"inspection": artifact.inspection,
+                json!({ "url": resource.url, "resourceToken":resource.resource_token,"artifactKey":artifact.artifact_key,"inspection": artifact.inspection,"stale":artifact.stale,
                     "sourceLabel": if snapshot_id.is_some() { "Version enregistrée" } else { "Travail enregistré sur disque" },
                     "sourceFile": artifact.source_file, "sourceKind": artifact.source_kind }),
             )
@@ -499,7 +526,9 @@ fn run(
                 })?;
             let artifact = current_preview(state, library, &variant.id, ctx)?;
             ctx.check_cancelled()?;
-            library.set_geometry(&variant.id, artifact.inspection.geometry.triangles)?;
+            if !artifact.stale {
+                library.set_geometry(&variant.id, artifact.inspection.geometry.triangles)?;
+            }
             let source = ThumbnailSource {
                 variant_id: variant.id,
                 artifact_key: artifact.artifact_key.clone(),
@@ -528,7 +557,7 @@ fn run(
             Ok(
                 json!({"state":"render","resourceToken":resource.resource_token,"preview":{
                     "url":resource.url,"resourceToken":resource.resource_token,"artifactKey":artifact.artifact_key,
-                    "inspection":artifact.inspection,"sourceLabel":"Travail enregistré sur disque",
+                    "inspection":artifact.inspection,"sourceLabel":"Travail enregistré sur disque","stale":artifact.stale,
                     "sourceFile":artifact.source_file,"sourceKind":artifact.source_kind
                 }}),
             )
@@ -1106,6 +1135,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(library.get_variant(id).unwrap().variant.triangles, Some(0));
+
+        library.set_geometry(id, 123).unwrap();
+        let workspace = Path::new(&asset.variants[0].workspace_path);
+        fs::write(workspace.join("a.glb"), b"unfinished GLB").unwrap();
+        fs::write(workspace.join("z.glb"), b"unfinished GLB").unwrap();
+        let previous = run(
+            &state,
+            &library,
+            &JobRequest::Preview {
+                variant_id: id.clone(),
+                snapshot_id: None,
+                preview_file: Some("z.glb".into()),
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(previous["stale"], true);
+        assert_eq!(previous["artifactKey"], selected["artifactKey"]);
+        let previous_thumbnail = run(
+            &state,
+            &library,
+            &JobRequest::Thumbnail {
+                asset_id: asset.asset.id,
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(previous_thumbnail["preview"]["stale"], true);
+        assert_eq!(
+            library.get_variant(id).unwrap().variant.triangles,
+            Some(123)
+        );
     }
 
     #[test]
@@ -1297,6 +1358,8 @@ mod tests {
         let report = run(&state, &library, &request, &OperationContext::default()).unwrap();
         assert_eq!(report["variantId"], variant.id);
         assert_eq!(report["headSnapshotId"], variant.head_snapshot_id);
+        assert_eq!(report["pending"], false);
+        assert_eq!(report["reconfirmationRequired"], false);
         assert_eq!(report["cleanupPending"], false);
         assert_eq!(report["warnings"], json!([]));
         assert_eq!(

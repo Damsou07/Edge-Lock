@@ -1,4 +1,6 @@
-use edge_lock_core::{ExportConfig, Library, OperationContext};
+#[cfg(windows)]
+use edge_lock_core::WorkspaceDiscardState;
+use edge_lock_core::{ExportConfig, FileSelectionKind, Library, OperationContext};
 use std::{fs, path::PathBuf, sync::Arc};
 
 fn fixture() -> (tempfile::TempDir, Library, String, PathBuf) {
@@ -38,7 +40,7 @@ fn schema_four_upgrade_keeps_versions_config_and_creates_a_catalog_backup() {
     drop(library);
     let root = temp.path().join("library");
     let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
-    db.execute_batch("DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; DROP TABLE workspace_discards; PRAGMA user_version=4;")
+    db.execute_batch("DROP TABLE pending_workspace_discards; DROP TABLE file_selections; ALTER TABLE variants DROP COLUMN deleted_name; DROP TABLE workspace_discards; PRAGMA user_version=4;")
         .unwrap();
     drop(db);
     let upgraded = Library::open(&root).unwrap();
@@ -59,6 +61,56 @@ fn schema_four_upgrade_keeps_versions_config_and_creates_a_catalog_backup() {
             .to_string_lossy()
             .starts_with("catalog-schema-4-")
     }));
+}
+
+#[test]
+fn schema_six_upgrade_preserves_versions_selections_and_live_edits() {
+    let (temp, library, id, work) = fixture();
+    let head = library.get_variant(&id).unwrap().variant.head_snapshot_id;
+    let saved = library.get_snapshot(&head).unwrap();
+    library
+        .set_file_selection(&id, None, FileSelectionKind::Preview, Some("other.blend"))
+        .unwrap();
+    fs::write(work.join("main.blend"), b"unsaved source").unwrap();
+    drop(library);
+    let root = temp.path().join("library");
+    let db = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
+    db.execute_batch("DROP TABLE pending_workspace_discards; PRAGMA user_version=6;")
+        .unwrap();
+    drop(db);
+
+    let upgraded = Library::open(&root).unwrap();
+    assert!(!upgraded.has_pending_discards().unwrap());
+    assert_eq!(upgraded.get_snapshot(&head).unwrap().entries, saved.entries);
+    assert_eq!(
+        upgraded
+            .get_file_selections(&id, None)
+            .unwrap()
+            .preview_file
+            .as_deref(),
+        Some("other.blend")
+    );
+    assert_eq!(
+        fs::read(work.join("main.blend")).unwrap(),
+        b"unsaved source"
+    );
+    let backup = fs::read_dir(root.join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("catalog-schema-6-")
+        })
+        .unwrap();
+    let backup = rusqlite::Connection::open(backup).unwrap();
+    assert_eq!(
+        backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        6
+    );
 }
 
 #[test]
@@ -145,6 +197,227 @@ fn cleanup_preserves_a_later_file_changed_after_the_first_file_was_removed() {
         b"new external write after cleanup started"
     );
     library.update_config(&id, before.config).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn discard_accepts_a_reader_that_shares_delete_access() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let (_temp, library, id, work) = fixture();
+    let before = library.get_variant(&id).unwrap().variant;
+    let file = work.join("main.blend");
+    fs::write(&file, b"discarded source").unwrap();
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&file)
+        .unwrap();
+    let report = library
+        .discard_changes(&id, &before.head_snapshot_id, &OperationContext::default())
+        .unwrap();
+    assert!(!report.reconfirmation_required);
+    drop(reader);
+    if report.pending {
+        let reports = library
+            .retry_pending_discards(&OperationContext::default())
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].reconfirmation_required);
+    }
+    assert_eq!(fs::read(&file).unwrap(), b"saved source");
+}
+
+#[cfg(windows)]
+fn lock_workspace_rename(path: &std::path::Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn discard_waits_for_a_blocking_rename_and_survives_library_reopen() {
+    let (temp, library, id, work) = fixture();
+    let before = library.get_variant(&id).unwrap();
+    let head = &before.variant.head_snapshot_id;
+    let ctx = OperationContext::default();
+    fs::write(work.join("main.blend"), b"unsaved source").unwrap();
+    let locked = lock_workspace_rename(&work);
+    let report = library.discard_changes(&id, head, &ctx).unwrap();
+    assert!(report.pending);
+    assert!(!report.cleanup_pending);
+    assert!(library.has_pending_discards().unwrap());
+    assert!(library.retry_pending_discards(&ctx).unwrap().is_empty());
+    assert_eq!(
+        fs::read(work.join("main.blend")).unwrap(),
+        b"unsaved source"
+    );
+    library.save_category(None, "Still writable", None).unwrap();
+
+    drop(library);
+    let library = Library::open(temp.path().join("library")).unwrap();
+    assert_eq!(
+        library.discard_status(&id).unwrap(),
+        Some(WorkspaceDiscardState::Pending)
+    );
+    drop(locked);
+    let reports = library.retry_pending_discards(&ctx).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(!reports[0].pending);
+    assert!(!reports[0].reconfirmation_required);
+    assert!(!reports[0].cleanup_pending);
+    assert_eq!(library.discard_status(&id).unwrap(), None);
+    assert!(!library.has_pending_discards().unwrap());
+    assert_eq!(fs::read(work.join("main.blend")).unwrap(), b"saved source");
+    let after = library.get_variant(&id).unwrap();
+    assert_eq!(after.variant.head_snapshot_id, *head);
+    assert_eq!(
+        after.variant.backup_snapshot_id,
+        before.variant.backup_snapshot_id
+    );
+    assert_eq!(after.snapshots.len(), before.snapshots.len());
+}
+
+#[cfg(windows)]
+#[test]
+fn deleting_a_variant_drops_its_pending_discard() {
+    let (_temp, library, id, _work) = fixture();
+    let ctx = OperationContext::default();
+    let head = library.get_variant(&id).unwrap().variant.head_snapshot_id;
+    let fork = library.create_variant(&head, "Fork", &ctx).unwrap();
+    let work = PathBuf::from(&fork.workspace_path);
+    fs::write(work.join("main.blend"), b"unsaved source").unwrap();
+    let locked = lock_workspace_rename(&work);
+    assert!(
+        library
+            .discard_changes(&fork.id, &fork.head_snapshot_id, &ctx)
+            .unwrap()
+            .pending
+    );
+    let plan = library.plan_variant_deletion(&fork.id, &ctx).unwrap();
+    assert!(
+        library
+            .apply_variant_deletion(&fork.id, &plan.plan_token, &ctx)
+            .unwrap()
+            .cleanup_pending
+    );
+    assert_eq!(library.discard_status(&fork.id).unwrap(), None);
+    assert!(library.retry_pending_discards(&ctx).unwrap().is_empty());
+    drop(locked);
+}
+
+#[cfg(windows)]
+#[test]
+fn unreadable_workspace_requires_a_new_confirmation_after_unlock() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_temp, library, id, work) = fixture();
+    let head = library.get_variant(&id).unwrap().variant.head_snapshot_id;
+    let ctx = OperationContext::default();
+    let file = work.join("main.blend");
+    fs::write(&file, b"unsaved source").unwrap();
+    let locked = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&file)
+        .unwrap();
+    assert!(library.discard_changes(&id, &head, &ctx).unwrap().pending);
+    assert!(library.retry_pending_discards(&ctx).unwrap().is_empty());
+    drop(locked);
+    let reports = library.retry_pending_discards(&ctx).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].reconfirmation_required);
+    assert_eq!(
+        library.discard_status(&id).unwrap(),
+        Some(WorkspaceDiscardState::ReconfirmationRequired)
+    );
+    assert!(!library.has_pending_discards().unwrap());
+    assert_eq!(fs::read(&file).unwrap(), b"unsaved source");
+    assert!(!library.discard_changes(&id, &head, &ctx).unwrap().pending);
+    assert_eq!(library.discard_status(&id).unwrap(), None);
+    assert_eq!(fs::read(&file).unwrap(), b"saved source");
+}
+
+#[cfg(windows)]
+#[test]
+fn pending_discard_preserves_new_bytes_config_and_replaced_workspace() {
+    for changed in ["bytes", "config", "workspace", "head"] {
+        let (temp, library, id, work) = fixture();
+        let before = library.get_variant(&id).unwrap().variant;
+        let ctx = OperationContext::default();
+        let file = work.join("main.blend");
+        fs::write(&file, b"old edits").unwrap();
+        let locked = lock_workspace_rename(&work);
+        assert!(
+            library
+                .discard_changes(&id, &before.head_snapshot_id, &ctx)
+                .unwrap()
+                .pending
+        );
+        drop(locked);
+        match changed {
+            "bytes" => {
+                let modified = fs::metadata(&file).unwrap().modified().unwrap();
+                fs::write(&file, b"new edits").unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+            "config" => {
+                let mut config = before.config;
+                config.primary_file = Some("other.blend".into());
+                library.update_config(&id, config).unwrap();
+            }
+            "workspace" => {
+                let moved = temp.path().join("previous");
+                fs::rename(&work, &moved).unwrap();
+                fs::create_dir(&work).unwrap();
+                for item in fs::read_dir(moved).unwrap() {
+                    let item = item.unwrap();
+                    if item.file_type().unwrap().is_dir() {
+                        fs::create_dir(work.join(item.file_name())).unwrap();
+                    } else {
+                        fs::copy(item.path(), work.join(item.file_name())).unwrap();
+                    }
+                }
+            }
+            "head" => {
+                library.create_snapshot(&id, "New head", &ctx).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let reports = library.retry_pending_discards(&ctx).unwrap();
+        assert_eq!(reports.len(), 1, "{changed}");
+        assert!(reports[0].reconfirmation_required, "{changed}");
+        assert_eq!(
+            fs::read(&file).unwrap().as_slice(),
+            if changed == "bytes" {
+                b"new edits"
+            } else {
+                b"old edits"
+            }
+        );
+        assert_eq!(
+            library.discard_status(&id).unwrap(),
+            Some(WorkspaceDiscardState::ReconfirmationRequired)
+        );
+        assert!(library.retry_pending_discards(&ctx).unwrap().is_empty());
+    }
 }
 
 #[cfg(windows)]
@@ -312,8 +585,80 @@ fn discard_crash_helper() {
         })),
         ..Default::default()
     };
-    library.discard_changes(&id, &head, &ctx).unwrap();
+    if std::env::var("EDGE_LOCK_DISCARD_RETRY").as_deref() == Ok("1") {
+        library.retry_pending_discards(&ctx).unwrap();
+    } else {
+        library.discard_changes(&id, &head, &ctx).unwrap();
+    }
     panic!("crash boundary not reached");
+}
+
+fn crash_at(root: &std::path::Path, variant_id: &str, phase: &str, retry: bool) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "discard_crash_helper",
+            "--nocapture",
+        ])
+        .env("EDGE_LOCK_DISCARD_ROOT", root)
+        .env("EDGE_LOCK_DISCARD_VARIANT", variant_id)
+        .env("EDGE_LOCK_DISCARD_PHASE", phase)
+        .env("EDGE_LOCK_DISCARD_RETRY", if retry { "1" } else { "0" })
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(91),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn pending_discard_is_consumed_atomically_with_the_workspace_swap() {
+    for (phase, committed) in [
+        ("Abandon : dossier remplacé", false),
+        ("Abandon : catalogue publié", true),
+    ] {
+        let (temp, library, id, work) = fixture();
+        let root = temp.path().join("library");
+        let ctx = OperationContext::default();
+        let head = library.get_variant(&id).unwrap().variant.head_snapshot_id;
+        let file = work.join("main.blend");
+        fs::write(&file, b"unsaved source").unwrap();
+        let locked = lock_workspace_rename(&work);
+        assert!(library.discard_changes(&id, &head, &ctx).unwrap().pending);
+        drop(locked);
+        drop(library);
+
+        crash_at(&root, &id, phase, true);
+        let reopened = Library::open(&root).unwrap();
+        assert!(
+            reopened.info().unwrap().recovery_notices.is_empty(),
+            "{phase}"
+        );
+        assert_eq!(
+            reopened.has_pending_discards().unwrap(),
+            !committed,
+            "{phase}"
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            if committed {
+                b"saved source".as_slice()
+            } else {
+                b"unsaved source"
+            },
+            "{phase}",
+        );
+        assert_eq!(
+            reopened.retry_pending_discards(&ctx).unwrap().len(),
+            usize::from(!committed)
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"saved source");
+    }
 }
 
 #[test]
@@ -330,24 +675,7 @@ fn every_discard_publication_boundary_recovers_without_new_history() {
         fs::write(work.join("main.blend"), b"unsaved source").unwrap();
         fs::write(work.join("added.txt"), b"unsaved addition").unwrap();
         drop(library);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "discard_crash_helper",
-                "--nocapture",
-            ])
-            .env("EDGE_LOCK_DISCARD_ROOT", temp.path().join("library"))
-            .env("EDGE_LOCK_DISCARD_VARIANT", &id)
-            .env("EDGE_LOCK_DISCARD_PHASE", phase)
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(91),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crash_at(&temp.path().join("library"), &id, phase, false);
         let reopened = Library::open(temp.path().join("library")).unwrap();
         assert!(
             reopened.info().unwrap().recovery_notices.is_empty(),

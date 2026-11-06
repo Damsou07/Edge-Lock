@@ -3,7 +3,7 @@ use super::*;
 use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct WorkspaceIdentity {
+pub(in crate::library) struct WorkspaceIdentity {
     volume: u64,
     index: u64,
     created: Option<u64>,
@@ -144,7 +144,7 @@ impl WorkspaceEvidence {
 }
 
 #[cfg(windows)]
-fn identity(path: &Path) -> Result<WorkspaceIdentity> {
+pub(in crate::library) fn identity(path: &Path) -> Result<WorkspaceIdentity> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -185,7 +185,7 @@ fn identity(path: &Path) -> Result<WorkspaceIdentity> {
 }
 
 #[cfg(unix)]
-fn identity(path: &Path) -> Result<WorkspaceIdentity> {
+pub(in crate::library) fn identity(path: &Path) -> Result<WorkspaceIdentity> {
     use std::os::unix::fs::MetadataExt;
     ensure_real_directory(path)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -201,7 +201,7 @@ fn identity(path: &Path) -> Result<WorkspaceIdentity> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn identity(_path: &Path) -> Result<WorkspaceIdentity> {
+pub(in crate::library) fn identity(_path: &Path) -> Result<WorkspaceIdentity> {
     Err(CoreError::Invalid(
         "Identité du workspace indisponible sur cette plateforme.".into(),
     ))

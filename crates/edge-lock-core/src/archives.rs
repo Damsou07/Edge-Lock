@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[path = "deletion_evidence.rs"]
 mod evidence;
 use evidence::WorkspaceEvidence;
+pub(super) use evidence::identity as workspace_identity;
 #[path = "variant_deletion.rs"]
 mod variants;
 pub use variants::VariantDeletionPlan;

@@ -76,7 +76,7 @@ export function Jobs({
               <p>
                 {job.error?.message ??
                   (job.status === "completed"
-                    ? "Terminé"
+                    ? job.phase || "Terminé"
                     : job.status === "cancelled"
                       ? "Annulé"
                       : job.phase || "En attente…")}

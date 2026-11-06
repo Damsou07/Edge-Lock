@@ -223,6 +223,7 @@ export function AssetDetailView({
   const workspace = useWorkspaceStatus(variantId);
   const currentWorkspaceStatus = workspace.current;
   const status = workspace.status;
+  const discardWaiting = status?.discardState === "pending";
   const settledRevision = workspace.settledRevision;
   const comparisonKey = [
     variantId,
@@ -375,7 +376,7 @@ export function AssetDetailView({
         }
       })
       .catch((reason) => {
-        if (active && changesRequest.current === request)
+        if (active && changesRequest.current === request && !discardWaiting)
           onError(errorMessage(reason));
       })
       .finally(() => {
@@ -390,6 +391,7 @@ export function AssetDetailView({
     localRefresh,
     settledRevision,
     comparisonKey,
+    discardWaiting,
     runJob,
     onError,
   ]);
@@ -541,7 +543,9 @@ export function AssetDetailView({
     ? selection
     : status?.state === "ready" && status.artifactKey
       ? [selection, status.artifactKey, settledRevision].join(":")
-      : "";
+      : status?.state === "failed" && !preview
+        ? [selection, "previous", settledRevision].join(":")
+        : "";
   useEffect(() => {
     if (
       !variantDetail ||
@@ -913,7 +917,7 @@ export function AssetDetailView({
                   disabled={
                     !variant ||
                     previewBusy ||
-                    (!snapshotId && status?.state !== "ready") ||
+                    (!snapshotId && syncBusy) ||
                     previewCandidates.length > 0
                   }
                   onClick={() => void generatePreview(previewFile)}
@@ -968,7 +972,7 @@ export function AssetDetailView({
                   className="text-button"
                   disabled={
                     previewBusy ||
-                    (!snapshotId && status?.state !== "ready") ||
+                    (!snapshotId && syncBusy) ||
                     (!previewFile && previewCandidates.length > 0)
                   }
                   onClick={() => void generatePreview(previewFile)}
@@ -985,20 +989,36 @@ export function AssetDetailView({
           </div>
           {previewError && (
             <div className="inline-error preview-notice" role="alert">
-              <strong>Aperçu indisponible</strong>
+              <strong>
+                {preview
+                  ? "Actualisation de l’aperçu impossible"
+                  : "Aperçu indisponible"}
+              </strong>
               <p>{previewError}</p>
               <p>
                 Le fichier source reste accessible depuis l’espace de travail.
               </p>
             </div>
           )}
-          {previewDegraded && (
+          {(previewDegraded || preview?.stale || warnings.length > 0) && (
             <div className="preview-notice preview-degraded" role="status">
               <Icon name="warning" size={16} />
-              <span>
-                Aperçu dégradé : certaines ressources de rendu sont absentes.
-                Consultez la section Dépendances.
-              </span>
+              <div>
+                {preview?.stale && (
+                  <p>
+                    Dernier aperçu valide affiché. L’actualisation a échoué.
+                  </p>
+                )}
+                {previewDegraded && (
+                  <p>
+                    Aperçu dégradé : certaines ressources de rendu sont
+                    absentes. Consultez la section Dépendances.
+                  </p>
+                )}
+                {warnings.map((warning) => (
+                  <p key={warning}>{warning}</p>
+                ))}
+              </div>
             </div>
           )}
           <div className="asset-metrics">
@@ -1178,7 +1198,7 @@ export function AssetDetailView({
                 : "Vérification des fichiers…"}
             </p>
           )}
-          {!snapshotId && syncError && (
+          {!snapshotId && syncError && !discardWaiting && (
             <div className="inline-error" role="alert">
               <p>{syncError}</p>
               {status?.state !== "nonconforming" && (
@@ -1216,7 +1236,12 @@ export function AssetDetailView({
               <button
                 type="button"
                 className="button secondary full-width discard-changes-button"
-                disabled={!variant?.headSnapshotId || configBusy || exportBusy}
+                disabled={
+                  !variant?.headSnapshotId ||
+                  configBusy ||
+                  exportBusy ||
+                  discardWaiting
+                }
                 onClick={() => {
                   if (variant) setDiscardTarget(variant);
                 }}
@@ -1225,23 +1250,28 @@ export function AssetDetailView({
                 Annuler les modifications
               </button>
             )}
+            {!snapshotId && discardWaiting && (
+              <p className="field-help" role="status">
+                Annulation en attente. Edge Lock reprendra la demande quand le
+                fichier sera libéré.
+              </p>
+            )}
+            {!snapshotId &&
+              status?.discardState === "reconfirmationRequired" && (
+                <p className="field-help" role="status">
+                  Les fichiers ont été préservés. Confirmez de nouveau
+                  l’annulation.
+                </p>
+              )}
+            {!snapshotId && status?.discardCleanupPending && (
+              <p className="field-help" role="status">
+                Modifications annulées. Le nettoyage reprendra à la réouverture
+                de la bibliothèque.
+              </p>
+            )}
           </div>
         </aside>
       </div>
-      {warnings.length > 0 && (
-        <section
-          className="inspection-warnings"
-          aria-label="Informations d’analyse"
-        >
-          <Icon name="warning" />
-          <div>
-            <h2>Informations d’analyse</h2>
-            {warnings.map((warning) => (
-              <p key={warning}>{warning}</p>
-            ))}
-          </div>
-        </section>
-      )}
       {dependencies.length > 0 && (
         <section className="inspection-warnings" aria-label="Dépendances">
           <Icon name="warning" />
@@ -1632,8 +1662,6 @@ export function AssetDetailView({
             previewChoice.current = fileSelections.previewFile ?? "";
             setPreviewFile(fileSelections.previewFile ?? "");
             setPreviewCandidates([]);
-            setPreview(null);
-            displayedPreview.current = null;
             setPreviewError("");
             setPreviewBusy(false);
             setSnapshotId(null);

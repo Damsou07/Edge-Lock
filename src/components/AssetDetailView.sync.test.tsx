@@ -164,6 +164,75 @@ it("propose les sources et garde les modificateurs évalués automatiquement", a
   ).not.toBeInTheDocument();
 });
 
+it("conserve l’aperçu pendant l’attente et permet une nouvelle confirmation", async () => {
+  renderDetail();
+  const viewer = await screen.findByLabelText("Aperçu 3D interactif");
+  const discard = screen.getByRole("button", {
+    name: "Annuler les modifications",
+  });
+  act(() =>
+    emitStatus({
+      ...ready,
+      revision: 2,
+      state: "failed",
+      error: { code: "operation_failed", message: "os error 32" },
+      discardState: "pending",
+    }),
+  );
+  expect(screen.getByText(/Annulation en attente/)).toBeInTheDocument();
+  expect(screen.queryByText("os error 32")).not.toBeInTheDocument();
+  expect(discard).toBeDisabled();
+  expect(screen.getByLabelText("Aperçu 3D interactif")).toBe(viewer);
+
+  act(() =>
+    emitStatus({
+      ...ready,
+      revision: 3,
+      discardState: "reconfirmationRequired",
+    }),
+  );
+  expect(screen.getByText(/Confirmez de nouveau/)).toBeInTheDocument();
+  expect(discard).toBeEnabled();
+});
+
+it("actualise l’aperçu après une annulation reprise en arrière-plan", async () => {
+  vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
+    ...ready,
+    discardState: "pending",
+  });
+  renderDetail();
+  expect(await screen.findByLabelText("Aperçu 3D interactif")).toHaveAttribute(
+    "data-url",
+    preview.url,
+  );
+  const restored = {
+    ...preview,
+    url: "http://edge-preview.localhost/restored",
+  };
+  run.mockImplementation(async (request) =>
+    request.kind === "changes" ? { ...changed, modified: [] } : restored,
+  );
+  await act(async () =>
+    emitStatus({
+      ...ready,
+      revision: 2,
+      discardState: null,
+      discardCleanupPending: true,
+      artifactKey: "restored",
+      sourceChanged: false,
+      canCreateSnapshot: false,
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.getByLabelText("Aperçu 3D interactif")).toHaveAttribute(
+      "data-url",
+      restored.url,
+    ),
+  );
+  expect(screen.queryByText(/Annulation en attente/)).not.toBeInTheDocument();
+  expect(screen.getByText(/Le nettoyage reprendra/)).toBeInTheDocument();
+});
+
 it("ne permet aucune version pour un changement GLB seul", async () => {
   vi.mocked(api.getWorkspaceStatus).mockResolvedValue({
     ...ready,

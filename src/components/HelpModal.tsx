@@ -149,11 +149,12 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
           <p>
             Annuler les modifications, sous Créer une version, rétablit la
             dernière version créée de la variante active, fichiers et réglages
-            compris. Après fermeture des applications d’écriture et
-            confirmation, les ajouts et modifications non versionnés sont
-            définitivement supprimés et les fichiers supprimés sont rétablis.
-            Aucun nouveau backup ni aucune version n’est créé. Cette action
-            reste disponible en cas d’échec de synchronisation.
+            compris. Après confirmation, les ajouts et modifications non
+            versionnés sont supprimés et les fichiers supprimés sont rétablis.
+            Si Windows retient un fichier, Edge Lock reprend la demande quand le
+            verrou est levé et que l’état confirmé est toujours vérifiable. La
+            fiche indique quand une nouvelle confirmation est nécessaire. Aucun
+            nouveau backup ni aucune version n’est créé.
           </p>
           <p>
             Optimisation du stockage regroupe un diagnostic manuel, la

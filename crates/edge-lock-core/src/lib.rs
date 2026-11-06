@@ -12,5 +12,5 @@ pub use domain::*;
 pub use library::{
     ArchiveDeletionAsset, ArchiveDeletionPlan, ArchiveDeletionReport, FileSelectionKind,
     FileSelections, Library, StorageAction, VariantDeletionPlan, WorkspaceCheck,
-    WorkspaceDiscardReport,
+    WorkspaceDiscardReport, WorkspaceDiscardState,
 };

@@ -107,6 +107,117 @@ fn sibling_glb_wins_without_blender_and_cache_survives_irrelevant_changes() {
 }
 
 #[test]
+fn refresh_uses_the_last_verified_preview_of_the_same_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("main.blend"), b"blend").unwrap();
+    triangle(&source.join("one.glb"));
+    triangle(&source.join("two.glb"));
+    let library = Library::open(dir.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&source, "Asset", ExportConfig::default(), &ctx)
+        .unwrap();
+    let variant = &asset.variants[0];
+    let workspace = Path::new(&variant.workspace_path);
+    let prepare = |source, context: &OperationContext| {
+        prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: &variant.id,
+                snapshot_id: None,
+                preview_file: Some(source),
+                blender_path: None,
+            },
+            context,
+        )
+    };
+    let PreviewOutcome::Ready(first) = prepare("one.glb", &ctx).unwrap() else {
+        panic!("expected preview")
+    };
+    let index_before = tree_hashes(&library.root().join("cache/previews"));
+    fs::write(workspace.join("one.glb"), b"unfinished GLB").unwrap();
+    fs::write(workspace.join("two.glb"), b"unfinished second source").unwrap();
+    let PreviewOutcome::Ready(previous) = prepare("one.glb", &ctx).unwrap() else {
+        panic!("expected previous preview")
+    };
+    assert_eq!(previous.path, first.path);
+    assert_eq!(previous.artifact_key, first.artifact_key);
+    assert_eq!(previous.source_file, "one.glb");
+    assert!(previous.stale);
+    assert!(!previous.updates_geometry);
+    assert_eq!(
+        tree_hashes(&library.root().join("cache/previews")),
+        index_before
+    );
+    assert_eq!(
+        fs::read(workspace.join("one.glb")).unwrap(),
+        b"unfinished GLB"
+    );
+    assert!(prepare("two.glb", &ctx).is_err());
+
+    let cancelled = OperationContext::default();
+    cancelled.cancelled.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        prepare("one.glb", &cancelled),
+        Err(edge_lock_core::CoreError::Cancelled)
+    ));
+    fs::write(&first.path, b"corrupt cached GLB").unwrap();
+    assert!(prepare("one.glb", &ctx).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_temporary_directory_does_not_block_a_cache_hit() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("main.blend"), b"blend").unwrap();
+    triangle(&source.join("main.glb"));
+    let library = Library::open(dir.path().join("library")).unwrap();
+    let ctx = OperationContext::default();
+    let asset = library
+        .import_folder(&source, "Asset", ExportConfig::default(), &ctx)
+        .unwrap();
+    let prepare = || {
+        prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: &asset.variants[0].id,
+                snapshot_id: None,
+                preview_file: None,
+                blender_path: None,
+            },
+            &ctx,
+        )
+    };
+    let PreviewOutcome::Ready(first) = prepare().unwrap() else {
+        panic!("expected preview")
+    };
+    let locked = library.root().join("cache/previews/.preview-tmp-locked");
+    fs::create_dir(&locked).unwrap();
+    let marker = locked.join(".edge-lock-preview-temporary");
+    fs::write(&marker, b"edge-lock-preview-v2").unwrap();
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(0x02000000)
+        .open(&locked)
+        .unwrap();
+    let PreviewOutcome::Ready(cached) = prepare().unwrap() else {
+        panic!("expected cached preview")
+    };
+    assert_eq!(cached.artifact_key, first.artifact_key);
+    assert!(locked.is_dir());
+    drop(handle);
+    prepare().unwrap();
+    assert!(!locked.exists());
+}
+
+#[test]
 fn ambiguous_glbs_require_explicit_asset_relative_choice() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
@@ -547,6 +658,43 @@ fn generated_cache_tracks_external_textures_repairs_corruption_and_preserves_sou
                 .to_string_lossy()
                 .starts_with(".preview-tmp-"))
     );
+
+    let blend = workspace.join("main.blend");
+    let saved = fs::read(&blend).unwrap();
+    fs::write(&blend, b"unfinished Blender save").unwrap();
+    let previous = generated_preview(&library, &variant.id, None, &ctx);
+    assert!(previous.stale);
+    assert!(!previous.updates_geometry);
+    assert_eq!(previous.artifact_key, repaired.artifact_key);
+    assert_eq!(fs::read(&previous.path).unwrap(), expected);
+
+    let changed_config = ExportConfig {
+        scene: Some("Other scene".into()),
+        ..variant.config.clone()
+    };
+    library.update_config(&variant.id, changed_config).unwrap();
+    assert!(
+        prepare_preview(
+            &library,
+            PreviewRequest {
+                variant_id: &variant.id,
+                snapshot_id: None,
+                preview_file: None,
+                blender_path: Some(&blender_executable()),
+            },
+            &ctx,
+        )
+        .is_err(),
+        "the previous preview belongs to a different scene configuration"
+    );
+
+    fs::write(&blend, saved).unwrap();
+    library
+        .update_config(&variant.id, variant.config.clone())
+        .unwrap();
+    let fresh = generated_preview(&library, &variant.id, None, &ctx);
+    assert!(!fresh.stale);
+    assert_eq!(fresh.artifact_key, repaired.artifact_key);
 }
 
 #[test]
@@ -614,6 +762,12 @@ fn historical_generated_preview_uses_immutable_internal_files_and_keeps_metadata
         fs::read(&second.path).unwrap(),
         fs::read(&first.path).unwrap()
     );
+    let detached = root.path().join("detached-workspace");
+    fs::rename(workspace, &detached).unwrap();
+    let historical = generated_preview(&library, &variant.id, Some(snapshot_id), &ctx);
+    assert!(!historical.stale);
+    assert_eq!(historical.artifact_key, first.artifact_key);
+    fs::rename(&detached, workspace).unwrap();
     assert_eq!(tree_hashes(workspace), workspace_after_manual_edit);
     assert_eq!(tree_hashes(&source), source_before);
     assert_eq!(tree_hashes(&library.root().join("objects")), objects_before);

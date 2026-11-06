@@ -1,14 +1,63 @@
 //! Explicitly discard local edits while keeping the saved head and backup unchanged.
+use super::archives::workspace_identity;
 use super::*;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceDiscardState {
+    Pending,
+    ReconfirmationRequired,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceDiscardReport {
     pub variant_id: String,
     pub head_snapshot_id: String,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub reconfirmation_required: bool,
     pub cleanup_pending: bool,
     pub warnings: Vec<String>,
+}
+
+impl WorkspaceDiscardReport {
+    fn new(variant_id: &str, head_snapshot_id: &str) -> Self {
+        Self {
+            variant_id: variant_id.into(),
+            head_snapshot_id: head_snapshot_id.into(),
+            pending: false,
+            reconfirmation_required: false,
+            cleanup_pending: false,
+            warnings: vec![],
+        }
+    }
+}
+
+struct PendingDiscard {
+    variant_id: String,
+    expected_head: String,
+    fingerprint: Option<String>,
+}
+
+#[cfg(windows)]
+fn is_sharing_violation(error: &CoreError) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    matches!(
+        error,
+        CoreError::Io(error)
+            if error.raw_os_error().is_some_and(|code| {
+                code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_LOCK_VIOLATION as i32
+            })
+    )
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_error: &CoreError) -> bool {
+    false
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +158,79 @@ pub(super) fn ensure_no_discard(root: &Path, db: &Connection) -> Result<()> {
 }
 
 impl Library {
+    pub fn discard_status(&self, variant_id: &str) -> Result<Option<WorkspaceDiscardState>> {
+        let state = self
+            .db()?
+            .query_row(
+                "SELECT reconfirmation_required FROM pending_workspace_discards WHERE variant_id=?1",
+                [variant_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(state.map(|required| {
+            if required {
+                WorkspaceDiscardState::ReconfirmationRequired
+            } else {
+                WorkspaceDiscardState::Pending
+            }
+        }))
+    }
+
+    pub fn has_pending_discards(&self) -> Result<bool> {
+        Ok(self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_workspace_discards WHERE reconfirmation_required=0)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Reattempt accepted requests. A still-locked workspace does not produce a report.
+    pub fn retry_pending_discards(
+        &self,
+        ctx: &OperationContext,
+    ) -> Result<Vec<WorkspaceDiscardReport>> {
+        if !self.has_pending_discards()? {
+            return Ok(vec![]);
+        }
+        let _guard = self.write_guard()?;
+        let pending = self
+            .db()?
+            .prepare("SELECT variant_id,expected_head,fingerprint FROM pending_workspace_discards WHERE reconfirmation_required=0 ORDER BY variant_id")?
+            .query_map([], |row| {
+                Ok(PendingDiscard {
+                    variant_id: row.get(0)?,
+                    expected_head: row.get(1)?,
+                    fingerprint: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reports = vec![];
+        for request in &pending {
+            ctx.check_cancelled()?;
+            match self.discard_changes_locked(
+                &request.variant_id,
+                &request.expected_head,
+                ctx,
+                Some(request),
+            ) {
+                Ok(report) if report.pending => {}
+                Ok(report) => reports.push(report),
+                Err(error @ CoreError::Cancelled) => return Err(error),
+                Err(error) => {
+                    // An interrupted swap must recover before the next mutation.
+                    ensure_no_discard(&self.root, &*self.db()?)?;
+                    let report =
+                        WorkspaceDiscardReport::new(&request.variant_id, &request.expected_head);
+                    reports.push(self.require_discard_confirmation(
+                        report,
+                        format!("Confirmez à nouveau l’abandon des modifications : {error}"),
+                    )?);
+                }
+            }
+        }
+        Ok(reports)
+    }
+
     pub fn discard_changes(
         &self,
         variant_id: &str,
@@ -116,22 +238,112 @@ impl Library {
         ctx: &OperationContext,
     ) -> Result<WorkspaceDiscardReport> {
         let _guard = self.write_guard()?;
+        self.discard_changes_locked(variant_id, expected_head, ctx, None)
+    }
+
+    fn defer_discard(
+        &self,
+        mut report: WorkspaceDiscardReport,
+        fingerprint: Option<&str>,
+        retry: bool,
+    ) -> Result<WorkspaceDiscardReport> {
+        if !retry {
+            self.db()?.execute(
+                "INSERT INTO pending_workspace_discards(variant_id,expected_head,fingerprint)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(variant_id) DO UPDATE SET expected_head=excluded.expected_head,
+                    fingerprint=excluded.fingerprint,reconfirmation_required=0",
+                params![report.variant_id, report.head_snapshot_id, fingerprint],
+            )?;
+        }
+        report.pending = true;
+        report.warnings.push(
+            "Un fichier ou dossier est utilisé ou inaccessible. L’annulation reprendra lorsque l’accès sera rétabli."
+                .into(),
+        );
+        Ok(report)
+    }
+
+    fn require_discard_confirmation(
+        &self,
+        mut report: WorkspaceDiscardReport,
+        warning: String,
+    ) -> Result<WorkspaceDiscardReport> {
+        self.db()?.execute(
+            "UPDATE pending_workspace_discards SET reconfirmation_required=1 WHERE variant_id=?1",
+            [&report.variant_id],
+        )?;
+        report.reconfirmation_required = true;
+        report.warnings.push(warning);
+        Ok(report)
+    }
+
+    fn discard_changes_locked(
+        &self,
+        variant_id: &str,
+        expected_head: &str,
+        ctx: &OperationContext,
+        pending: Option<&PendingDiscard>,
+    ) -> Result<WorkspaceDiscardReport> {
         ctx.check_cancelled()?;
-        let variant = self.get_variant(variant_id)?.variant;
+        let mut report = WorkspaceDiscardReport::new(variant_id, expected_head);
+        let variant = read_variant(&*self.db()?, &self.root, variant_id);
+        let variant = match variant {
+            Ok(variant) => variant,
+            Err(error) if is_sharing_violation(&error) => {
+                return self.defer_discard(report, None, pending.is_some());
+            }
+            Err(error) => return Err(error),
+        };
         if variant.head_snapshot_id != expected_head {
+            if pending.is_some() {
+                return self.require_discard_confirmation(
+                    report,
+                    "La version courante a changé. Confirmez à nouveau l’abandon des modifications."
+                        .into(),
+                );
+            }
             return Err(CoreError::Busy("La version courante a changé. Actualisez la fiche avant d’abandonner les modifications.".into()));
         }
         let target = self.get_snapshot(expected_head)?;
         history::require_full(&target)?;
         let workspace = PathBuf::from(&variant.workspace_path);
-        let before = self.store.capture(&workspace, false, ctx)?;
-        let mut report = WorkspaceDiscardReport {
-            variant_id: variant_id.into(),
-            head_snapshot_id: expected_head.into(),
-            cleanup_pending: false,
-            warnings: vec![],
+        let observe = || -> Result<_> {
+            let identity = workspace_identity(&workspace)?;
+            let entries = self.store.capture(&workspace, false, ctx)?;
+            if workspace_identity(&workspace)? != identity {
+                return Err(CoreError::Busy(
+                    "Le workspace a été remplacé pendant sa lecture.".into(),
+                ));
+            }
+            Ok((identity, entries))
         };
+        let (identity, before) = match observe() {
+            Ok(observation) => observation,
+            Err(error) if is_sharing_violation(&error) => {
+                return self.defer_discard(report, None, pending.is_some());
+            }
+            Err(error) => return Err(error),
+        };
+        let fingerprint =
+            blake3::hash(&serde_json::to_vec(&(&identity, &variant.config, &before))?)
+                .to_hex()
+                .to_string();
+        if let Some(request) = pending
+            && request.fingerprint.as_deref() != Some(&fingerprint)
+        {
+            let warning = if request.fingerprint.is_none() {
+                "Le workspace était illisible lors de la demande. Confirmez à nouveau l’abandon des modifications."
+            } else {
+                "Le workspace ou ses réglages ont changé. Confirmez à nouveau l’abandon des modifications."
+            };
+            return self.require_discard_confirmation(report, warning.into());
+        }
         if before == target.entries && variant.config == target.config {
+            self.db()?.execute(
+                "DELETE FROM pending_workspace_discards WHERE variant_id=?1",
+                [variant_id],
+            )?;
             return Ok(report);
         }
         let preparing = tempfile::Builder::new()
@@ -170,28 +382,26 @@ impl Library {
             progress: ctx.progress.clone(),
             ..Default::default()
         };
+        let mut workspace_rename_denied = false;
         let result = (|| -> Result<()> {
             let mut db = self.db()?;
             let tx = db.transaction()?;
-            if self.store.capture(&workspace, false, &committed)? != value.before {
+            if self.store.capture(&workspace, false, &committed)? != value.before
+                || workspace_identity(&workspace)? != identity
+            {
                 return Err(CoreError::Busy("Le workspace a changé pendant la préparation. Fermez les applications qui le modifient puis réessayez.".into()));
             }
-            #[cfg(windows)]
-            for entry in &value.before {
-                if entry.kind == "file" {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    let _handle = OpenOptions::new()
-                        .read(true)
-                        .share_mode(0)
-                        .open(workspace.join(safe_relative(&entry.path)?))?;
-                }
-            }
-            fs::rename(&workspace, directory.join("previous"))?;
+            fs::rename(&workspace, directory.join("previous")).inspect_err(|error| {
+                // Windows may return access denied when an open descendant prevents a directory move.
+                workspace_rename_denied =
+                    cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied;
+            })?;
             ctx.report("Abandon : précédent préservé", 2, Some(4));
             if self
                 .store
                 .capture(&directory.join("previous"), false, &committed)?
                 != value.before
+                || workspace_identity(&directory.join("previous"))? != identity
             {
                 return Err(CoreError::Busy(
                     "Écriture concurrente pendant l’abandon ; modifications préservées.".into(),
@@ -209,6 +419,10 @@ impl Library {
                 "INSERT INTO workspace_discards(id,journal_hash) VALUES(?1,?2)",
                 params![value.id, blake3::hash(&bytes).to_hex().to_string()],
             )?;
+            tx.execute(
+                "DELETE FROM pending_workspace_discards WHERE variant_id=?1",
+                [variant_id],
+            )?;
             tx.commit()?;
             Ok(())
         })();
@@ -216,6 +430,9 @@ impl Library {
             let published = receipt(&*self.db()?, &value.id)?;
             if published.as_deref() != Some(blake3::hash(&bytes).to_hex().as_ref()) {
                 recover_one(&self.root, &mut *self.db()?, &directory, &committed)?;
+                if workspace_rename_denied || is_sharing_violation(&error) {
+                    return self.defer_discard(report, Some(&fingerprint), pending.is_some());
+                }
                 return Err(error);
             }
         }
